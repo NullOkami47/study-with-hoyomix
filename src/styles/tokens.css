@@ -1,0 +1,330 @@
+:root {
+  --background-crossfade-duration: 400ms;
+  color-scheme: dark;
+  --colour-background: #07161c;
+  --colour-surface-opaque: #132a31;
+  --colour-surface-glass: rgb(19 42 49 / 82%);
+  --colour-text-primary: #f4fbfc;
+  --colour-text-muted: #c5d8db;
+  --colour-accent: #69e0cf;
+  --colour-accent-strong: #b8fff5;
+  --colour-focus: #a7fff2;
+  --glass-tint: rgb(26 36 52 / 42%);
+  --glass-edge: rgb(255 255 255 / 34%);
+  --glass-highlight: inset 0 1px 0 rgb(255 255 255 / 34%);
+  --glass-shade: inset 0 -1px 0 rgb(7 12 24 / 28%);
+  --glass-blur: 1.5rem;
+  --glass-border: 1px solid rgb(184 255 245 / 38%);
+  --glass-shadow: 0 0.75rem 2rem rgb(0 0 0 / 28%);
+  --focus-ring: 0 0 0 0.2rem rgb(7 22 28), 0 0 0 0.4rem var(--colour-focus);
+  --motion-duration: 180ms;
+  --control-hover-filter: brightness(1.15);
+  --control-active-filter: brightness(0.9);
+  --decorative-displacement: 0.5rem;
+  --radius-surface: 0.75rem;
+  --radius-control: 0.5rem;
+  --liquid-tint: rgb(30 31 39 / 64%);
+  --liquid-popover-tint: rgb(25 27 36 / 76%);
+  --liquid-blur: 1.5rem;
+  --liquid-saturation: 1.35;
+  --liquid-edge-light: rgb(255 255 255 / 22%);
+  --liquid-inner-light: inset 0 1px 0 rgb(255 255 255 / 15%);
+  --liquid-shadow: 0 0.75rem 2.5rem rgb(0 0 0 / 27%);
+  --liquid-selected: rgb(206 225 245 / 21%);
+  --liquid-separator: rgb(255 255 255 / 11%);
+  --liquid-text-primary: #f7f8fa;
+  --liquid-text-secondary: rgb(243 245 250 / 68%);
+  --liquid-radius-shell: 2.5rem;
+  --liquid-radius-popover: 1.5rem;
+  --liquid-radius-control: 0.875rem;
+  --liquid-space: 0.5rem;
+  --liquid-motion: 180ms;
+  --liquid-easing: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --layer-catalog-workspace: 900;
+  /*
+   * Workspace stacking order, declared in one place so a surface never has to guess.
+   * Every value below is a local order inside .study-workspace, which is its own
+   * stacking context (isolation: isolate), so these never compete with the fixed
+   * transient notices that sit above the workspace entirely.
+   *
+   *   scene            0  backdrop and glass canvases
+   *   zone             2  player, and any resting workspace furniture
+   *   chat-window      3  the floating chat: above the player it may overlap,
+   *                       below the bar so a dragged window cannot cover the bar
+   *   queue-drawer     5  rendered after chat so the opened queue receives pointer input
+   *   focus-bar        4  top bar, including its own hit area and toolbar
+   *   advanced-filters 20 popover disclosed from the bar's chevron; scoped inside
+   *                       the focus zone, so it is above the chat window too
+   *   control-centre   30 the modal hub, above every workspace surface
+   */
+  --layer-workspace-zone: 2;
+  --layer-workspace-chat-window: 3;
+  --layer-workspace-queue-drawer: 5;
+  --layer-workspace-focus-bar: 4;
+  --layer-workspace-popover: 20;
+  --layer-workspace-modal: 30;
+  --layout-shell-gutter: 1rem;
+  --layout-shell-double-gutter: 2rem;
+  --layout-workspace-inline-inset: 1rem;
+  --layout-workspace-block-start: 18.5rem;
+  --layout-workspace-block-end: 10rem;
+  --layout-timer-block-end: 0.75rem;
+  --layout-chat-block-start: 18.5rem;
+  --layout-chat-inline-size: 22rem;
+  --layout-chat-block-size: 14rem;
+  --layout-chat-open-workspace-block-start: 33.5rem;
+  --workspace-edge-inset: 1rem;
+  --workspace-player-inline-size: 30rem;
+  --workspace-player-artwork-size: 3.5rem;
+  --workspace-player-control-reserve: 12.5rem;
+  /* Clears the first-visit fan-project notice, which is fixed at 9rem and 298px tall in
+     English -- the tallest of the three locales, and the one a reviewer with an English
+     browser sees. 13rem put the chat panel wholly inside that card; the offset it
+     replaced, 25.25rem, still overlapped it by 38px. A legal notice has to be legible on
+     first visit and a "chat is coming later" panel does not, so the panel yields.
+     The floating chat window now derives its own placement from the viewport, so this
+     token is the block-start floor its default position is measured against on a
+     tablet rather than the panel's absolute position. */
+  --workspace-tablet-chat-block-start: 29rem;
+  /* The wrapped 375px focus bar ends at 13.75rem; keep the first-visit card below it. */
+  --workspace-mobile-notice-block-start: 14rem;
+  /* The floating chat window's own geometry. The default size is a size, not a
+     position: chatLayout.ts derives the position from the live viewport so a
+     coordinate that suited one display can never strand the window on another. */
+  --workspace-chat-window-inline-size: 22rem;
+  --workspace-chat-window-block-size: 24rem;
+  --workspace-player-details-radius: 1.5rem;
+  --workspace-focus-inline-inset: max(1rem, calc((100vw - 68rem) / 2));
+  --workspace-sheet-inline-size: 34rem;
+  --workspace-sheet-block-start: 9rem;
+  --workspace-sheet-block-end: 21rem;
+  --scene-backdrop-display: none;
+}
+
+[data-theme="cinematic"] { --scene-backdrop-display: block; }
+
+[data-theme="studio"] {
+  --colour-background: #2a2a33;
+  --colour-surface-opaque: #1b1e2a;
+  --colour-surface-glass: rgb(0 11 36 / 60%);
+  --colour-text-primary: #fff;
+  --colour-text-muted: rgb(255 255 255 / 75%);
+  --colour-accent: #96bade;
+  --colour-accent-strong: #b0c8e8;
+  --colour-focus: #96bade;
+  --glass-tint: transparent;
+  --glass-edge: rgb(255 255 255 / 12%);
+  --glass-highlight: inset 0 1px 0 rgb(255 255 255 / 15%);
+  --glass-shade: inset 0 -1px 0 rgb(0 0 0 / 30%);
+  --glass-blur: 1rem;
+  --glass-border: 1px solid rgb(255 255 255 / 18%);
+  --glass-shadow: 0 16px 40px rgb(0 0 0 / 45%);
+  --focus-ring: 0 0 0 2px var(--colour-background), 0 0 0 4px var(--colour-focus);
+  --radius-surface: 0.5rem;
+  --radius-control: 0.375rem;
+}
+
+/*
+ * Studio CSS fallback. Dark translucent liquid glass substrate paired with a subtle specular
+ * top highlight and enriched backdrop saturation. This avoids milky/grey washes while matching
+ * the depth and refractive tone of the WebGL studio glass shader.
+ * --studio-glass-gray-strength is the 0..1 preference fraction, set on the
+ * workspace root alongside --studio-glass-blur.
+ */
+[data-theme="studio"] .surface-glass,
+[data-theme="studio"] .focus-bar,
+[data-theme="studio"] [data-advanced-filters] {
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 8%) 0%, rgb(255 255 255 / 2%) 100%),
+    rgb(10 14 26 / calc(48% + var(--studio-glass-gray-strength, 0.26) * 16%)) !important;
+  -webkit-backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
+  backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
+  border: 1px solid rgb(255 255 255 / 18%) !important;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 18%), 0 16px 40px rgb(0 0 0 / 36%) !important;
+}
+
+/* Nested settings cards maintain dark translucent contrast instead of additive grey wash. */
+[data-theme="studio"] .settings-sheet__section {
+  background: rgb(255 255 255 / 4%) !important;
+  border: 1px solid rgb(255 255 255 / 12%) !important;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 8%), 0 4px 16px rgb(0 0 0 / 25%) !important;
+}
+
+/* Only surfaces that the shader actually rendered may drop their CSS fallback.
+   The foreground modal retains a dark translucent glass substrate, border and elevation
+   so underlying resting workspace furniture and scene daylight do not bleed through uncontrolled,
+   while remaining translucent enough for WebGL specular glares and refraction to shine through. */
+[data-theme="studio"][data-studio-glass="active"] [data-studio-glass-rendered="true"] {
+  background: transparent !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+/* The filter popover's own card was a second page on top of its shader shape. */
+[data-theme="studio"][data-studio-glass="active"] .focus-bar__advanced-popover:has([data-studio-glass-rendered="true"]) {
+  background: transparent !important;
+  background-color: transparent !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+  border: 0 !important;
+}
+[data-theme="studio"][data-studio-glass="active"] .focus-bar__advanced-popover:has([data-studio-glass-rendered="true"])::before {
+  content: none;
+}
+
+/* Equal, ellipsising columns keep all three games reachable when the bar spans the
+   whole viewport, because each 1fr column resolves against the space actually there.
+   The rule stops at the width where the bar becomes intrinsic: past that point a 1fr
+   column resolves against the widest label's max-content instead, which made the row
+   wider than the natural one it replaced and pushed the bar past its own edge. */
+@media (max-width: 47.99rem) {
+  [data-theme] .focus-bar .focus-bar__games {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    overflow: visible;
+  }
+  [data-theme] .focus-bar .focus-bar__games > button {
+    min-width: 0;
+    padding-inline: 0.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+@media (min-width: 31rem) { :root { --layout-workspace-inline-inset: 5rem; } }
+@media (min-width: 48rem) {
+  :root {
+    --layout-workspace-block-start: 13rem;
+    --layout-chat-block-start: 13rem;
+    --layout-chat-open-workspace-block-start: 28rem;
+    --workspace-sheet-block-start: 8rem;
+  }
+}
+@media (min-width: 64rem) {
+  :root {
+    --layout-workspace-block-start: 7.5rem;
+    --layout-chat-block-start: 7.5rem;
+    --layout-chat-open-workspace-block-start: 22.5rem;
+    --workspace-sheet-block-end: 1rem;
+  }
+}
+
+.surface-glass {
+  background: var(--colour-surface-opaque);
+  border: 1px solid var(--glass-edge);
+  box-shadow: var(--glass-highlight), var(--glass-shade), var(--glass-shadow);
+}
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .surface-glass {
+    background: var(--glass-tint);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+    backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  }
+}
+:where(a, button, select, input, [tabindex]):focus-visible {
+  outline: 0.1875rem solid var(--colour-focus);
+  outline-offset: 0.1875rem;
+  box-shadow: var(--focus-ring);
+}
+@media (forced-colors: active) {
+  :where(a, button, select, input, [tabindex]):focus-visible { outline-color: Highlight; box-shadow: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root { --motion-duration: 0ms; --decorative-displacement: 0rem; scroll-behavior: auto; }
+  .decorative-motion { animation: none !important; transform: none !important; }
+}
+
+/* A single material recipe for the foreground controls. The pseudo-element is a
+   masked light rim rather than a solid line around every side. */
+.liquid-shell,
+.liquid-popover {
+  position: relative;
+  isolation: isolate;
+  color: var(--liquid-text-primary);
+  background: linear-gradient(160deg, rgb(255 255 255 / 9%), transparent 32%, rgb(11 12 20 / 8%) 100%), var(--liquid-tint);
+  border: 0;
+  box-shadow: var(--liquid-inner-light), var(--liquid-shadow);
+}
+.liquid-shell { border-radius: var(--liquid-radius-shell); }
+.liquid-popover {
+  background-color: var(--liquid-popover-tint);
+  border-radius: var(--liquid-radius-popover);
+}
+.liquid-shell::before,
+.liquid-popover::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, var(--liquid-edge-light), rgb(255 255 255 / 4%) 40%, rgb(255 255 255 / 14%) 80%, rgb(255 255 255 / 6%));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .liquid-shell,
+  .liquid-popover {
+    -webkit-backdrop-filter: blur(var(--liquid-blur)) saturate(var(--liquid-saturation));
+    backdrop-filter: blur(var(--liquid-blur)) saturate(var(--liquid-saturation));
+  }
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .liquid-shell { background-color: rgb(29 31 40 / 91%); }
+  .liquid-popover { background-color: rgb(24 26 35 / 94%); }
+}
+/* Studio keeps its selected blur and shader-backed modal substrate. The optical
+   Liquid Glass recipe above remains the standard/cinematic fallback. */
+[data-theme="studio"] .liquid-shell:not([data-studio-glass-rendered="true"]),
+[data-theme="studio"] .liquid-popover:not([data-studio-glass-rendered="true"]) {
+  -webkit-backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
+  backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
+}
+/* The shader samples the rim. Leaving this stroke on top of it redraws a flat border. */
+[data-theme="studio"][data-studio-glass="active"] [data-studio-glass-rendered="true"]::before {
+  content: none;
+}
+/* CSS fallback only, and quieter than the shader: cool on one side, warm on the other. */
+[data-theme="studio"] .liquid-shell:not([data-studio-glass-rendered="true"])::before,
+[data-theme="studio"] .liquid-popover:not([data-studio-glass-rendered="true"])::before {
+  background: linear-gradient(128deg, rgb(186 220 255 / 22%), rgb(255 255 255 / 5%) 46%, rgb(255 186 170 / 18%));
+  opacity: var(--studio-edge-strength, 0.68);
+}
+/* The plate canvas owns its rounded alpha. Clipping that bitmap to the same
+   curve throws the antialiased fringe away and leaves a stair-stepped corner. */
+[data-theme="studio"][data-studio-glass="active"] .overlay-sheet:has([data-studio-glass-canvas]) {
+  overflow: visible;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root { --liquid-motion: 0ms; }
+}
+/* Control Centre owns the material; its Settings content uses spacing and quiet
+   separators instead of another stack of glass cards. */
+.overlay-sheet .settings-sheet__section,
+[data-theme="studio"] .overlay-sheet .settings-sheet__section {
+  background: transparent !important;
+  border: 0 !important;
+  border-bottom: 1px solid var(--liquid-separator) !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  /* The parent sheet already diffuses the moving scene. These long, scrolling
+     sections must not each filter it again (including their offscreen area). */
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+.overlay-sheet .settings-sheet__section:last-child { border-bottom: 0 !important; }
+.overlay-sheet .settings-sheet__index a,
+.overlay-sheet .settings-sheet button {
+  border: 0;
+  background: rgb(255 255 255 / 7%);
+}
+[data-theme="studio"] .queue-drawer .queue-panel {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}

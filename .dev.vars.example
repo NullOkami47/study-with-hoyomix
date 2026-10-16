@@ -1,0 +1,10 @@
+# Copy to .dev.vars. Integrations stay disabled until configured.
+PUBLIC_ORIGIN=http://localhost:8787
+SESSION_HMAC_SECRET=
+OAUTH_STATE_SECRET=
+# Generate separate random values of at least 32 bytes for the two secrets.
+# Optional OAuth, provider, R2 and Sheets variables are described by workers/index.ts.
+# Optional authenticated reverse proxy. Leave unset for same-origin local use.
+BACKEND_ORIGIN=
+PROXY_FRONTEND_ORIGIN=
+API_PROXY_SECRET=

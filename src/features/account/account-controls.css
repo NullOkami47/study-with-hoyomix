@@ -1,0 +1,251 @@
+/* Generic control feedback within account surfaces */
+.account-menu :is(button, summary, input) {
+  transition: transform var(--motion-duration) ease, filter var(--motion-duration) ease;
+}
+
+.account-menu :is(button:not(:disabled), summary, input):hover {
+  filter: var(--control-hover-filter);
+}
+
+.account-menu :is(button:not(:disabled), summary):active {
+  transform: scale(0.96);
+  filter: var(--control-active-filter);
+}
+
+.account-menu button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ==========================================================================
+   Meetup-inspired Social Authentication Buttons
+   Dual Visual Styles: 電影模式 (Cinematic) & Liquid Glass (Studio)
+   ========================================================================== */
+
+.auth-button {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr) 1.5rem;
+  align-items: center;
+  width: 100%;
+  min-height: 2.875rem;
+  padding: 0.625rem 1rem;
+  box-sizing: border-box;
+  text-decoration: none;
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  user-select: none;
+  cursor: pointer;
+  transition:
+    background var(--motion-duration, 180ms) ease,
+    border-color var(--motion-duration, 180ms) ease,
+    box-shadow var(--motion-duration, 180ms) ease,
+    transform var(--motion-duration, 180ms) ease,
+    color var(--motion-duration, 180ms) ease;
+}
+
+.auth-button__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+}
+
+.auth-button__text {
+  min-width: 0;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.auth-button__spacer {
+  display: block;
+  width: 1.5rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+}
+
+/* --------------------------------------------------------------------------
+   STYLE 1: 電影模式 (Cinematic Mode)
+   High-contrast, minimalist/subdued ambient styling
+   -------------------------------------------------------------------------- */
+.auth-button,
+.auth-button--cinematic,
+.auth-button[data-visual-style="cinematic"],
+[data-visual-style="cinematic"] .auth-button,
+[data-theme="cinematic"] .auth-button,
+[data-theme="studio"] .auth-button--cinematic,
+[data-visual-style="studio"] .auth-button--cinematic {
+  background: linear-gradient(180deg, rgba(22, 50, 59, 0.9) 0%, rgba(13, 31, 37, 0.95) 100%);
+  border: 1px solid rgb(184 255 245 / 24%);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 28%), inset 0 1px 0 rgb(255 255 255 / 10%);
+  color: var(--colour-text-primary, #f4fbfc);
+  border-radius: var(--radius-surface, 0.75rem);
+}
+
+.auth-button:hover,
+.auth-button--cinematic:hover,
+.auth-button[data-visual-style="cinematic"]:hover,
+[data-visual-style="cinematic"] .auth-button:hover,
+[data-theme="cinematic"] .auth-button:hover,
+[data-theme="studio"] .auth-button--cinematic:hover,
+[data-visual-style="studio"] .auth-button--cinematic:hover {
+  background: linear-gradient(180deg, rgba(31, 68, 79, 0.98) 0%, rgba(18, 42, 50, 0.98) 100%);
+  border-color: var(--colour-accent, #69e0cf);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 38%), 0 0 0 1px rgb(105 224 207 / 20%), inset 0 1px 0 rgb(255 255 255 / 18%);
+  color: #ffffff;
+  transform: translateY(-1px);
+  filter: none;
+}
+
+.auth-button:active,
+.auth-button--cinematic:active,
+.auth-button[data-visual-style="cinematic"]:active,
+[data-visual-style="cinematic"] .auth-button:active,
+[data-theme="cinematic"] .auth-button:active,
+[data-theme="studio"] .auth-button--cinematic:active,
+[data-visual-style="studio"] .auth-button--cinematic:active {
+  transform: translateY(0) scale(0.98);
+  background: rgba(11, 25, 30, 0.98);
+  box-shadow: 0 2px 6px rgb(0 0 0 / 24%);
+  filter: none;
+}
+
+/* --------------------------------------------------------------------------
+   STYLE 2: Liquid Glass (Studio Mode)
+   Translucent frosted glass, subtle borders, backdrop filter blur
+   -------------------------------------------------------------------------- */
+.auth-button--studio,
+.auth-button[data-visual-style="studio"],
+[data-visual-style="studio"] .auth-button,
+[data-theme="studio"] .auth-button,
+[data-theme="cinematic"] .auth-button--studio,
+[data-visual-style="cinematic"] .auth-button--studio {
+  background: linear-gradient(160deg, rgb(255 255 255 / 10%) 0%, rgb(255 255 255 / 3%) 42%, rgb(11 14 24 / 20%) 100%), rgb(18 22 36 / 58%);
+  -webkit-backdrop-filter: blur(var(--studio-glass-blur, 16px)) saturate(1.35) contrast(1.04);
+  backdrop-filter: blur(var(--studio-glass-blur, 16px)) saturate(1.35) contrast(1.04);
+  border: 1px solid rgb(255 255 255 / 18%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 22%), inset 0 -1px 0 rgb(0 0 0 / 18%), 0 8px 24px rgb(0 0 0 / 25%);
+  color: var(--liquid-text-primary, #f7f8fa);
+  border-radius: var(--liquid-radius-control, 0.875rem);
+}
+
+.auth-button--studio:hover,
+.auth-button[data-visual-style="studio"]:hover,
+[data-visual-style="studio"] .auth-button:hover,
+[data-theme="studio"] .auth-button:hover,
+[data-theme="cinematic"] .auth-button--studio:hover,
+[data-visual-style="cinematic"] .auth-button--studio:hover {
+  background: linear-gradient(160deg, rgb(255 255 255 / 18%) 0%, rgb(255 255 255 / 6%) 42%, rgb(11 14 24 / 25%) 100%), rgb(24 30 50 / 68%);
+  border-color: rgb(255 255 255 / 36%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 36%), inset 0 -1px 0 rgb(0 0 0 / 24%), 0 12px 30px rgb(0 0 0 / 34%);
+  color: #ffffff;
+  transform: translateY(-1px);
+  filter: none;
+}
+
+.auth-button--studio:active,
+.auth-button[data-visual-style="studio"]:active,
+[data-visual-style="studio"] .auth-button:active,
+[data-theme="studio"] .auth-button:active,
+[data-theme="cinematic"] .auth-button--studio:active,
+[data-visual-style="cinematic"] .auth-button--studio:active {
+  transform: translateY(0) scale(0.98);
+  background: rgb(14 18 30 / 72%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 12%), 0 4px 12px rgb(0 0 0 / 24%);
+  filter: none;
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .auth-button--studio,
+  .auth-button[data-visual-style="studio"],
+  [data-visual-style="studio"] .auth-button,
+  [data-theme="studio"] .auth-button,
+  [data-theme="cinematic"] .auth-button--studio,
+  [data-visual-style="cinematic"] .auth-button--studio {
+    background: rgb(24 28 42 / 92%);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Provider-specific brand hover accents
+   -------------------------------------------------------------------------- */
+.auth-button--google:hover:not(:active) {
+  border-color: rgba(66, 133, 244, 0.55);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 38%), 0 0 0 1px rgba(66, 133, 244, 0.28), inset 0 1px 0 rgb(255 255 255 / 18%);
+}
+
+.auth-button--github:hover:not(:active) {
+  border-color: rgba(255, 255, 255, 0.45);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 38%), 0 0 0 1px rgba(255, 255, 255, 0.22), inset 0 1px 0 rgb(255 255 255 / 18%);
+}
+
+.auth-button--linuxdo:hover:not(:active) {
+  border-color: rgba(254, 176, 5, 0.58);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 38%), 0 0 0 1px rgba(254, 176, 5, 0.32), inset 0 1px 0 rgb(255 255 255 / 18%);
+}
+
+.auth-button--studio.auth-button--google:hover,
+[data-theme="studio"] .auth-button--google:hover,
+[data-visual-style="studio"] .auth-button--google:hover {
+  border-color: rgba(66, 133, 244, 0.48);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 36%), inset 0 -1px 0 rgb(0 0 0 / 24%), 0 12px 30px rgb(0 0 0 / 34%), 0 0 0 1px rgba(66, 133, 244, 0.25);
+}
+
+.auth-button--studio.auth-button--github:hover,
+[data-theme="studio"] .auth-button--github:hover,
+[data-visual-style="studio"] .auth-button--github:hover {
+  border-color: rgba(255, 255, 255, 0.5);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 36%), inset 0 -1px 0 rgb(0 0 0 / 24%), 0 12px 30px rgb(0 0 0 / 34%), 0 0 0 1px rgba(255, 255, 255, 0.2);
+}
+
+.auth-button--studio.auth-button--linuxdo:hover,
+[data-theme="studio"] .auth-button--linuxdo:hover,
+[data-visual-style="studio"] .auth-button--linuxdo:hover {
+  border-color: rgba(254, 176, 5, 0.56);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 36%), inset 0 -1px 0 rgb(0 0 0 / 24%), 0 12px 30px rgb(0 0 0 / 34%), 0 0 0 1px rgba(254, 176, 5, 0.28);
+}
+
+/* Focus and accessibility */
+.auth-button:focus-visible {
+  outline: 0.1875rem solid var(--colour-focus);
+  outline-offset: 0.1875rem;
+  box-shadow: var(--focus-ring);
+}
+
+[data-theme="studio"] .auth-button:focus-visible,
+.auth-button--studio:focus-visible,
+[data-visual-style="studio"] .auth-button:focus-visible {
+  outline-color: var(--colour-focus);
+  box-shadow: 0 0 0 2px var(--colour-background), 0 0 0 4px var(--colour-focus);
+}
+
+@media (forced-colors: active) {
+  .auth-button,
+  .auth-button[data-visual-style] {
+    border: 2px solid ButtonText;
+  }
+  .auth-button:focus-visible,
+  .auth-button[data-visual-style]:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+    box-shadow: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-button {
+    transition: none !important;
+    transform: none !important;
+  }
+  .auth-button:hover,
+  .auth-button:active {
+    transform: none !important;
+  }
+}

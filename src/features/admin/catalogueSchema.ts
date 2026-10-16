@@ -1,0 +1,26 @@
+﻿export const ALLOWED_STRUCTURAL_FIELDS: Record<string, Set<string>> = {
+  track: new Set([
+    'title',
+    'album',
+    'release_date',
+    'vocal_status',
+    'work_group_id',
+    'evidence',
+    'notes',
+    'focus',
+    'sleep',
+    'chill',
+    'needs_classification',
+    'metadata_confidence',
+  ]),
+  source: new Set([
+    'external_id',
+    'source_type',
+    'source_status',
+    'rights_status',
+    'evidence',
+    'notes',
+    'source_confidence',
+  ]),
+  alias: new Set(['locale', 'alias']),
+}

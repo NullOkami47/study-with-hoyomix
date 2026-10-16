@@ -1,0 +1,52 @@
+{
+  "name": "study-with-hoyomix",
+  "version": "0.0.1",
+  "description": "An unofficial fan-made study companion featuring HOYO-MiX music.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "predev": "node scripts/generate-pwa-icons.mjs && node scripts/generate-build-info.mjs --allow-unknown",
+    "prebuild": "node scripts/generate-pwa-icons.mjs && node scripts/generate-build-info.mjs --allow-unknown",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "node scripts/generate-build-info.mjs --allow-unknown && vue-tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run --maxWorkers=3",
+    "test:workers": "vitest run --config vitest.workers.config.ts",
+    "dev:worker": "wrangler dev --local --port 8787",
+    "d1:migrate:local": "wrangler d1 migrations apply DB --local --config wrangler.toml",
+    "verify": "npm run typecheck && npm test && npm run test:workers && npm run build"
+  },
+  "dependencies": {
+    "@jitl/quickjs-wasmfile-release-asyncify": "0.32.0",
+    "@vueuse/core": "^10.1.2",
+    "lucide-vue-next": "^0.577.0",
+    "mediabunny": "1.61.1",
+    "opencc-js": "1.4.2",
+    "quickjs-emscripten-core": "0.32.0",
+    "vue": "^3.5.42"
+  },
+  "overrides": {
+    "nanoid": "3.3.18",
+    "postcss": "8.5.26"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "@vitejs/plugin-vue": "6.0.10",
+    "@vue/test-utils": "2.4.6",
+    "esbuild": "0.28.2",
+    "fake-indexeddb": "^6.2.4",
+    "jsdom": "22.1.0",
+    "miniflare": "5.20261012.0-beta",
+    "typescript": "5.6.3",
+    "vite": "8.3.4",
+    "vite-plugin-pwa": "^1.2.0",
+    "vitest": "5.0.5",
+    "vue-tsc": "2.1.10",
+    "wrangler": "4.151.0"
+  },
+  "private": true,
+  "license": "GPL-3.0",
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

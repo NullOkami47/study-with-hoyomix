@@ -1,0 +1,25 @@
+name = "study-with-hoyomix-local"
+main = "workers/index.ts"
+compatibility_date = "2025-12-01"
+
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "study-with-hoyomix"
+database_id = "local"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "PRESENCE"
+class_name = "OnlinePresence"
+
+[[migrations]]
+tag = "presence-v1"
+new_sqlite_classes = ["OnlinePresence"]
+
+[vars]
+PUBLIC_ORIGIN = "http://localhost:8787"

@@ -1,0 +1,50 @@
+.liquid-glass {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.liquid-glass__canvas,
+.liquid-glass__fallback {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.liquid-glass__canvas[data-active="false"],
+.liquid-glass__fallback[data-active="false"] {
+  display: none;
+}
+
+.liquid-glass__fallback {
+  background:
+    radial-gradient(circle at 74% 18%, rgb(91 213 200 / 24%), transparent 36%),
+    radial-gradient(circle at 18% 78%, rgb(117 87 214 / 22%), transparent 38%),
+    linear-gradient(145deg, #08101f, #101329 58%, var(--colour-background));
+  background-size: 110% 110%;
+  animation: liquid-glass-drift 18s ease-in-out infinite alternate;
+}
+
+.liquid-glass--low-power .liquid-glass__fallback {
+  animation: none;
+}
+
+@keyframes liquid-glass-drift {
+  from {
+    background-position: 0% 0%;
+  }
+
+  to {
+    background-position: 100% 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .liquid-glass__fallback {
+    animation: none;
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "Study with HOYO-MiX",
+  "short_name": "HOYO-MiX",
+  "description": "An unofficial fan project for studying with HOYO-MiX music. 一個以 HOYO-MiX 音樂陪伴學習的非官方粉絲專案。 一个以 HOYO-MiX 音乐陪伴学习的非官方粉丝项目。",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#10151c",
+  "theme_color": "#10151c",
+  "lang": "zh-Hant",
+  "categories": ["education", "productivity", "music"],
+  "icons": [
+    { "src": "/pwa-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/pwa-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

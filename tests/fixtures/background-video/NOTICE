@@ -1,0 +1,17 @@
+Synthetic test media
+
+All files in this directory were generated for this public source release by
+scripts/generate-test-video-fixtures.mjs using FFmpeg lavfi colour and sine
+sources. They contain no game artwork, soundtrack, recordings or downloaded
+third-party media. The JPEG is a single solid-colour image. The audio rejection
+fixture adds a generated 440 Hz sine tone.
+
+browser-avc-prefix.mp4 retains the historical test filename for compatibility.
+Its content is newly generated synthetic AVC video with synthetic type-14 SVC
+prefix NAL units inserted using Mediabunny. It is not a browser recording.
+
+The generator and these original synthetic fixtures are distributed under this
+repository's GPL-3.0 licence. Regeneration requires FFmpeg with libx264 and the
+locked npm dependencies. Run from the repository root:
+
+  node scripts/generate-test-video-fixtures.mjs

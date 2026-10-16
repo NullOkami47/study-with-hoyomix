@@ -1,0 +1,71 @@
+[
+  {
+    "id": "demo-zzz-study",
+    "title": "Demo ZZZ Study",
+    "aliases": {},
+    "games": [
+      "zzz"
+    ],
+    "relationIds": [],
+    "tabs": [],
+    "workGroupId": "work-demo-zzz-study",
+    "needsClassification": true,
+    "vocalStatus": "uncertain",
+    "sources": [
+      {
+        "provider": "r2",
+        "externalId": "tracks/authorized/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.mp3",
+        "metadata": {
+          "contentType": "audio/mpeg",
+          "rightsStatus": "owner-authorised"
+        }
+      }
+    ]
+  },
+  {
+    "id": "demo-genshin-study",
+    "title": "Demo Genshin Study",
+    "aliases": {},
+    "games": [
+      "genshin"
+    ],
+    "relationIds": [],
+    "tabs": [],
+    "workGroupId": "work-demo-genshin-study",
+    "needsClassification": true,
+    "vocalStatus": "uncertain",
+    "sources": [
+      {
+        "provider": "r2",
+        "externalId": "tracks/authorized/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.mp3",
+        "metadata": {
+          "contentType": "audio/mpeg",
+          "rightsStatus": "owner-authorised"
+        }
+      }
+    ]
+  },
+  {
+    "id": "demo-hsr-study",
+    "title": "Demo HSR Study",
+    "aliases": {},
+    "games": [
+      "hsr"
+    ],
+    "relationIds": [],
+    "tabs": [],
+    "workGroupId": "work-demo-hsr-study",
+    "needsClassification": true,
+    "vocalStatus": "uncertain",
+    "sources": [
+      {
+        "provider": "r2",
+        "externalId": "tracks/authorized/0011223344556677001122334455667700112233445566770011223344556677.mp3",
+        "metadata": {
+          "contentType": "audio/mpeg",
+          "rightsStatus": "owner-authorised"
+        }
+      }
+    ]
+  }
+]

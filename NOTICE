@@ -1,0 +1,27 @@
+Study with HOYO-MiX — source and licence notices
+
+This application is a derivative of StudyWithMiku by shshouse:
+https://github.com/shshouse/StudyWithMiku
+Imported source revision: 7b094632d08a6599a1b334e6c6af41dc10ea6495.
+The upstream project identifies shshouse as its project lead.
+Copyright (c) shshouse. Existing source copyright notices remain applicable.
+
+The combined application is distributed under the GNU General Public License,
+version 3. The complete licence is in LICENSE. No warranty is provided except
+as stated in that licence. Source and build configuration are supplied here.
+
+Modified version: Study with HOYO-MiX, public source edition, 2026-10-16.
+Changes include the HOYO-MiX study companion interface, player and provider
+integrations, focus features, account and Worker services, and removal of private
+configuration, operational data and third-party media from this distribution.
+This modified version is maintained by the Study with HOYO-MiX contributors.
+It is not the original StudyWithMiku release or an official HoYoverse product.
+
+Liquid Glass renderer adaptations retain the MIT copyright and permission notice
+for Charles Yin in src/features/liquid-glass/NOTICE.md. Additional dependency and
+licence notices are in docs/THIRD_PARTY_NOTICES.md and docs/licenses/.
+
+HOYO-MiX and game names identify their respective rightsholders. The software
+licence grants no rights to third-party music, artwork, videos or trademarks.
+No soundtrack library, game artwork or animated game wallpaper is included.
+Operators must supply media and service credentials they are entitled to use.

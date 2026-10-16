@@ -1,0 +1,55 @@
+Study with HOYO-MiX - local development
+
+Requirements: Node.js 22.18 or newer (Node.js 24 LTS recommended), npm, Git.
+Install exactly the lockfile: npm ci
+Check types: npm run typecheck
+Frontend tests: npm test
+Worker tests: npm run test:workers
+Build the app and PWA: npm run build
+Preview frontend only: npm run preview
+Edit frontend: npm run dev
+
+For a complete local Worker + frontend environment:
+1. Copy .dev.vars.example to .dev.vars (ignored by Git).
+2. Generate independent SESSION_HMAC_SECRET and OAUTH_STATE_SECRET values,
+   each at least 32 random bytes. Never use client-side VITE_ variables for secrets.
+3. Run npm run d1:migrate:local to initialise an empty, local D1 database.
+4. Run npm run build, then npm run dev:worker, and open http://localhost:8787.
+   The checked-in Wrangler configuration identifies local resources only.
+   No deploy scripts, GitHub Actions, account IDs or remote bindings are supplied.
+
+The public release deliberately includes no music library, copyrighted artwork,
+video library, user records, default music-source script or live service credentials.
+Its initial catalogue and shipped background list are empty. The study timer,
+player, queue, custom-source sandbox, background upload/conversion, admin, account
+and provider integration source remain available. An empty library is expected;
+external integrations require your own services and redistribution permissions.
+
+OAuth is optional. Configure your own applications and callback URLs through the
+optional provider fields in workers/auth/types.ts and workers/index.ts; leave them
+unset to keep sign-in providers disabled. Owner provisioning is explicit through
+OWNER_PROVIDER and OWNER_SUBJECT; no public release identity receives ownership.
+Production cookies require HTTPS, so test actual OAuth on an origin you control.
+
+Music providers are opt-in, server-side configuration: see workers/providers/registry.ts,
+workers/providers/config.ts and workers/index.ts. Configure your own Jellyfin,
+R2 or supported resolver resources. Do not point development at another person's
+infrastructure. The browser uses same-origin /api/*; unavailable services produce
+bounded errors and the empty catalogue. Never embed provider secrets in a bundle.
+
+Catalogue administration and optional Google Sheets import use workers/catalogue/.
+Only import media and catalogue information you have permission to use. Uploaded
+backgrounds require an explicitly configured BACKGROUND_BUCKET and rights review.
+To add your own redistributable static backgrounds, update staticDefinitions.ts
+and add the referenced files under public/. No remote bucket is enabled by default.
+
+The scripts/generate-test-video-fixtures.mjs utility regenerates tiny original
+solid-colour test fixtures using FFmpeg and Mediabunny. Fixtures are already
+included for tests; FFmpeg is not needed for normal installs or builds.
+
+See LICENSE, NOTICE, docs/THIRD_PARTY_NOTICES.md and docs/licenses/ for licensing.
+No README is included by design. This fan-made project is not affiliated with or
+endorsed by HoYoverse. The GPL applies to code; it grants no rights to game media.
+
+To regenerate the optional catalogue Han folding table after adding catalogue text:
+node scripts/generate-han-fold-table.mjs

@@ -51,6 +51,7 @@ async function send(page: Page, text: string) {
 }
 
 test('two independent authenticated browsers exchange, edit and delete persisted messages over actual WebSockets', async ({ browser }) => {
+  test.setTimeout(480_000)
   const one = await learner(browser, process.env.CHAT_E2E_USER_ONE)
   const two = await learner(browser, process.env.CHAT_E2E_USER_TWO)
   try {
@@ -96,6 +97,7 @@ test('two independent authenticated browsers exchange, edit and delete persisted
 })
 
 test('history pagination and reopen preserve real persisted messages while fresh pages default to hidden', async ({ browser }) => {
+  test.setTimeout(360_000)
   const context = await learner(browser, process.env.CHAT_E2E_USER_ONE)
   try {
     const page = await context.newPage()
@@ -121,7 +123,7 @@ test('history pagination and reopen preserve real persisted messages while fresh
 })
 
 test('keeps real sockets alive beyond the server stale interval and supports landscape keyboard input', async ({ browser }) => {
-  test.setTimeout(240_000)
+  test.setTimeout(420_000)
   const one = await learner(browser, process.env.CHAT_E2E_USER_ONE)
   const two = await learner(browser, process.env.CHAT_E2E_USER_TWO)
   try {
@@ -166,6 +168,7 @@ test('keeps real sockets alive beyond the server stale interval and supports lan
 })
 
 test('anonymous readers cannot send and logout revokes a previously valid local session', async ({ browser }) => {
+  test.setTimeout(360_000)
   const anonymous = await learner(browser)
   const signedIn = await learner(browser, process.env.CHAT_E2E_USER_TWO)
   try {

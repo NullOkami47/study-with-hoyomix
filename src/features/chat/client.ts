@@ -29,7 +29,11 @@ export interface ChatPayload {
   showLocation?: boolean
 }
 export function createChatClient(
-  deps: { socket?: () => ChatSocket; request?: typeof fetch } = {},
+  deps: {
+    socket?: () => ChatSocket
+    request?: typeof fetch
+    handshakeTimeoutMs?: number
+  } = {},
 ) {
   const messages = ref<ChatMessage[]>([]),
     state = ref<'connecting' | 'connected' | 'disconnected'>('connecting')
@@ -174,7 +178,7 @@ export function createChatClient(
           new URL('/api/chat/socket', location.href.replace(/^http/, 'ws')),
         )
       socket = connection
-      handshake = setTimeout(retry, 12000)
+      handshake = setTimeout(retry, deps.handshakeTimeoutMs ?? 12000)
       connection.onclose = retry
       connection.onerror = retry
       connection.onmessage = (event) => {

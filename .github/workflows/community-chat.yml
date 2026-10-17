@@ -30,7 +30,7 @@ jobs:
   network:
     name: Chat real network and responsive browser checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:

@@ -44,7 +44,7 @@ const emit = defineEmits<{
 const { locale } = usePreferences(),
   session = useAccountSession()
 const text = (key: TranslationKey) => translate(locale.value, key)
-const chat = props.client ?? createChatClient()
+const chat = props.client ?? createChatClient({ handshakeTimeoutMs: 30000 })
 const {
   announcement,
   messages,

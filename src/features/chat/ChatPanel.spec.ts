@@ -145,6 +145,8 @@ it('reconnects on session transitions without opening another chat surface', asy
   const { useAccountSession } = await import('../account/session')
   useAccountSession().publish(true, 'new-user')
   expect(client.restart).toHaveBeenCalled()
+  useAccountSession().publish(true, 'new-user')
+  expect(client.restart).toHaveBeenCalledTimes(1)
   useAccountSession().publish(false)
   expect(client.restart).toHaveBeenCalledTimes(2)
   expect(wrapper.findAll('[data-chat-panel]')).toHaveLength(1)

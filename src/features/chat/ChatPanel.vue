@@ -259,7 +259,15 @@ async function report() {
     status.value = text('chat.reportSent')
   })
 }
-watch(session.revision, () => chat.restart(), { flush: 'sync' })
+let accountIdentity = `${session.signedIn.value}:${session.userId.value ?? ''}`
+watch(session.revision, () => {
+  const identity = `${session.signedIn.value}:${session.userId.value ?? ''}`
+  // Periodic verified-session refreshes do not change the transport's account.
+  // The Worker separately revalidates revoked sessions and role changes.
+  if (identity === accountIdentity) return
+  accountIdentity = identity
+  chat.restart()
+}, { flush: 'sync' })
 onMounted(() => {
   chat.start()
   void session.ensure()
@@ -841,6 +849,7 @@ onBeforeUnmount(() => {
   border: 0;
 }
 @media (max-height: 450px) {
+  .chat-panel__messages { min-height: 0; }
   .chat-panel textarea {
     max-height: 2.75rem;
   }

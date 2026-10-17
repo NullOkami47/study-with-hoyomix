@@ -490,6 +490,13 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
   touch-action: none;
 }
 
+@media (max-height: 450px) {
+  /* Keep the complete composer reachable between the measured Focus and Player
+     bounds when the virtual keyboard or landscape viewport reduces the height. */
+  .chat-window__header { padding-block: 0.25rem; }
+  .chat-window__body { padding-block: 0.25rem; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .chat-window__close { transition-duration: 0ms; }
 }

@@ -1,0 +1,39 @@
+name: Community Chat
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: community-chat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  network:
+    name: Chat real network and responsive browser checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Real local Worker, D1 and two-browser chat
+        run: node scripts/run-chat-e2e.mjs
+        env:
+          CHAT_E2E_EVIDENCE: chat-browser-evidence
+          CHAT_E2E_CHANNEL: chromium
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chat-browser-evidence
+          path: chat-browser-evidence
+          if-no-files-found: warn

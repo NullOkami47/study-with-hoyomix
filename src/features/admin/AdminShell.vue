@@ -6,6 +6,8 @@ import NoticeManager from './NoticeManager.vue'
 import AuditLog from './AuditLog.vue'
 import BackgroundManager from './BackgroundManager.vue'
 import CatalogueManager from './CatalogueManager.vue'
+import ChatModeration from './ChatModeration.vue'
+import { chatModerationText } from './chatModerationText'
 import AdminStatusChip from './primitives/AdminStatusChip.vue'
 import AdminPageHeader from './primitives/AdminPageHeader.vue'
 import { readAuthProviders, type AuthProvider } from '../account/authProviders'
@@ -25,7 +27,7 @@ function t(key: string): string {
 
 const catalogueLabel = computed(() => translate(locale.value, 'admin.catalogue.title'))
 
-type LoadState = 'loading' | 'ready' | 'unauthorized' | 'unavailable'
+type LoadState = 'loading' | 'ready' | 'unauthorized' | 'unavailable' | 'moderator'
 
 const props = withDefaults(defineProps<{
   repository?: AdminRepository
@@ -47,7 +49,7 @@ const checkingHealth = ref(false)
 
 const providers = computed(() => overview.value?.providers ?? [])
 
-type SectionId = 'overview' | 'providers' | 'notices' | 'backgrounds' | 'catalogue' | 'audit'
+type SectionId = 'overview' | 'providers' | 'notices' | 'backgrounds' | 'catalogue' | 'audit' | 'chat'
 
 const SECTIONS: ReadonlyArray<{ id: SectionId; label: string; ownerOnly: boolean }> = [
   { id: 'overview', label: 'Overview', ownerOnly: false },
@@ -55,6 +57,7 @@ const SECTIONS: ReadonlyArray<{ id: SectionId; label: string; ownerOnly: boolean
   { id: 'notices', label: 'Notices', ownerOnly: false },
   { id: 'backgrounds', label: 'Backgrounds', ownerOnly: false },
   { id: 'catalogue', label: 'Catalogue', ownerOnly: false },
+  { id: 'chat', label: 'Chat moderation', ownerOnly: false },
   { id: 'audit', label: 'Audit log', ownerOnly: true },
 ]
 
@@ -78,6 +81,7 @@ const attentionCount = computed(() => providers.value.length === 0 ? DASH : Stri
 const systemOperational = computed(() => attention.value.length === 0 && providers.value.length > 0)
 
 function sectionTitle(id: SectionId): string {
+  if (id === 'chat') return chatModerationText(locale.value, 'title')
   if (id === 'catalogue') return catalogueLabel.value
   const translated = translate(locale.value, ('admin.nav.' + id) as TranslationKey)
   return translated || id
@@ -215,6 +219,17 @@ async function load(): Promise<void> {
       return
     }
     if (session.status === 'unauthorised') {
+      // A chat moderator has no access to unrelated administration. Only this explicit
+      // destination requests the narrower server-authorised moderation surface.
+      if (window.location.hash === '#admin-chat') {
+        try {
+          const response = await fetch('/api/chat/moderation', { credentials: 'same-origin', cache: 'no-store' })
+          if (response.ok) {
+            const body = await response.json() as { viewer?: { role?: string } }
+            if (body.viewer?.role === 'moderator') { state.value = 'moderator'; return }
+          }
+        } catch { /* Existing sign-in gate remains available when chat cannot be verified. */ }
+      }
       availableProviders.value = []
       state.value = 'unauthorized'
       availableProviders.value = await readAuthProviders()
@@ -251,6 +266,11 @@ onBeforeUnmount(() => {
         <p class="admin-shell__status" role="status">{{ t('admin.shell.loading') || 'Loading admin console...' }}</p>
       </div>
     </template>
+
+    <main v-else-if="state === 'moderator'" class="admin-shell__moderation-only">
+      <a href="/">{{ chatModerationText(locale, 'back') }}</a>
+      <ChatModeration />
+    </main>
 
     <template v-else-if="state === 'unauthorized'">
       <div class="admin-shell__gate" data-admin-unauthorized :data-visual-style="visualStyle">
@@ -521,6 +541,10 @@ onBeforeUnmount(() => {
           <CatalogueManager v-if="visited.has('catalogue')" :repository="repo" />
         </section>
 
+        <section v-show="activeSection === 'chat'" id="admin-chat" class="admin-shell__section" data-admin-section="chat">
+          <ChatModeration v-if="visited.has('chat')" />
+        </section>
+
         <section
           v-if="role"
           v-show="activeSection === 'audit'"
@@ -538,6 +562,8 @@ onBeforeUnmount(() => {
 <style src="../account/account-controls.css"></style>
 
 <style scoped>
+.admin-shell__moderation-only { grid-column: 1 / -1; padding: 1rem; width: 100%; max-width: 64rem; box-sizing: border-box; margin-inline: auto; }
+.admin-shell__moderation-only > a { display: inline-flex; align-items: center; min-height: 2.75rem; color: var(--colour-accent-strong); }
 .admin-shell__gate {
   grid-column: 1 / -1;
   display: flex;

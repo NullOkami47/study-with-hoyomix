@@ -912,7 +912,8 @@ describe('AdminShell sections', () => {
     const nav = wrapper.get('[data-admin-sidebar] nav')
     expect(nav.attributes('aria-label')).toBeTruthy()
     const links = wrapper.findAll('[data-admin-sidebar] a')
-    expect(links).toHaveLength(6)
+    expect(links).toHaveLength(7)
+    expect(wrapper.find('[data-admin-nav-chat]').attributes('href')).toBe('#admin-chat')
     for (const link of links) {
       expect(link.attributes('href')).toMatch(/^#admin-[a-z]+$/u)
       expect(link.attributes('aria-controls')).toMatch(/^admin-[a-z]+$/u)

@@ -466,10 +466,12 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
 .chat-window__close:active { transform: scale(0.94); filter: var(--control-active-filter); }
 
 .chat-window__body {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   padding: 0.875rem 1rem 1rem;
-  overflow: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
 }
 

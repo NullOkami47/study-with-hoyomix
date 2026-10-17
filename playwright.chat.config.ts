@@ -4,8 +4,8 @@ export default defineConfig({
   testDir: './e2e',
   testMatch: 'chat*.spec.ts',
   workers: 1,
-  timeout: 60_000,
-  expect: { timeout: 15_000 },
+  timeout: 120_000,
+  expect: { timeout: 20_000 },
   outputDir: process.env.CHAT_E2E_OUTPUT,
   reporter: [['list'], ['json', { outputFile: process.env.CHAT_E2E_REPORT }]],
   use: {

@@ -2,6 +2,7 @@
 // added to production: fixture users/sessions are inserted directly into local D1.
 import { spawn, execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { resolve, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -11,6 +12,9 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare'
 
 const root = process.cwd()
 if (process.platform === 'win32' && !/^D:/i.test(root)) throw new Error('Run chat E2E from the D drive')
+if (!existsSync(resolve(root, 'workers/buildInfo.ts'))) {
+  execFileSync(process.execPath, ['scripts/generate-build-info.mjs', '--allow-unknown'], { cwd: root, stdio: 'inherit' })
+}
 const scratchRoot = resolve(process.env.CHAT_E2E_SCRATCH || (process.platform === 'win32' ? 'D:/hoyomix_preview/chat-browser-runtime' : join(tmpdir(), 'hoyomix-chat-e2e')))
 await mkdir(scratchRoot, { recursive: true })
 process.env.TEMP = process.env.TMP = scratchRoot

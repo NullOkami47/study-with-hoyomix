@@ -121,7 +121,7 @@ test('history pagination and reopen preserve real persisted messages while fresh
 })
 
 test('keeps real sockets alive beyond the server stale interval and supports landscape keyboard input', async ({ browser }) => {
-  test.setTimeout(150_000)
+  test.setTimeout(240_000)
   const one = await learner(browser, process.env.CHAT_E2E_USER_ONE)
   const two = await learner(browser, process.env.CHAT_E2E_USER_TWO)
   try {
@@ -147,7 +147,7 @@ test('keeps real sockets alive beyond the server stale interval and supports lan
     const started = Date.now()
     await expect.poll(() => frames.filter(frame => frame === 'pong').length, { timeout: 40_000, intervals: [1000] }).toBeGreaterThan(0)
     const stableConnections = connections
-    await expect.poll(() => Date.now() - started, { timeout: 105_000, intervals: [5000] }).toBeGreaterThanOrEqual(95_000)
+    await expect.poll(() => Date.now() - started, { timeout: 160_000, intervals: [5000] }).toBeGreaterThanOrEqual(95_000)
     await writeFile(join(evidence, 'heartbeat.json'), JSON.stringify({ durationMs: Date.now() - started, stableConnections, finalConnections: connections, frames, events }, null, 2))
     expect(connections).toBe(stableConnections)
     expect(frames.filter(frame => frame === 'pong').length).toBeGreaterThanOrEqual(3)

@@ -41,6 +41,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx playwright install --with-deps chromium
+      - run: node scripts/generate-build-info.mjs --allow-unknown
       - name: Real local Worker, D1 and two-browser chat
         run: node scripts/run-chat-e2e.mjs
         env:

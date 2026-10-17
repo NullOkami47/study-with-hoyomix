@@ -34,6 +34,7 @@ const REQUIRED_MIGRATIONS = [
   '0026_auth_provider_linuxdo.sql',
   '0027_background_metadata_and_overrides.sql',
   '0028_user_ui_preferences.sql',
+  '0029_community_chat.sql',
 ]
 const REQUIRED_TABLES = [
   'account_deletion_events',
@@ -54,9 +55,12 @@ const REQUIRED_TABLES = [
   'catalogue_track_games',
   'catalogue_track_relations',
   'catalogue_tracks',
+  'chat_bans',
   'chat_message_versions',
   'chat_messages',
   'chat_reports',
+  'chat_request_receipts',
+  'chat_send_state',
   'chksz_discovery_locks',
   'chksz_discovery_rate_events',
   'chksz_dynamic_discoveries',

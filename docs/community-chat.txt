@@ -1,0 +1,86 @@
+COMMUNITY CHAT — CONFIGURATION AND RELEASE NOTES
+
+The application uses one global room per Worker deployment. ChatRoom is a
+dedicated SQLite-backed Durable Object; OnlinePresence remains a separate
+site-wide service. D1 retains messages, versions, reports, blocks, filters,
+ban state, send throttles and idempotency receipts.
+
+Local setup
+
+  npm ci
+  npm run d1:migrate:local
+  npm run build
+  npx wrangler dev --local --var PUBLIC_ORIGIN:http://localhost:8787
+
+Configure SESSION_HMAC_SECRET through the usual private environment mechanism
+and configure your own OAuth providers to post as an authenticated account.
+Never commit environment files. Anonymous visitors can read without OAuth.
+The local browser integration runner seeds disposable local accounts directly
+in a fresh local D1 instance; it introduces no production authentication bypass:
+
+  node scripts/run-chat-e2e.mjs
+
+The test runner requires a local OpenSSL executable for a short-lived localhost
+certificate and the Playwright Chromium browser. On Windows its scratch paths
+default to D:. CHAT_E2E_SCRATCH can select another explicit local directory.
+The runner serves both the frontend and Worker through local HTTPS so Secure
+__Host-session cookies and strict same-origin WebSockets are tested unchanged.
+
+Deployment preparation
+
+1. Use a dedicated staging Worker and isolated D1 database. Supply your own
+   resource identifiers, secrets and PUBLIC_ORIGIN. Verify every R2, D1 and
+   Durable Object binding against the deployment identity before any mutation.
+2. Apply the additive 0029_community_chat.sql migration to an isolated local
+   database, then staging. Existing applied migrations must remain unchanged.
+3. Preserve the existing presence-v1 DO migration and append community-chat-v1
+   with new_sqlite_classes = ["ChatRoom"]. Bind CHAT to ChatRoom. Do not replace
+   PRESENCE or re-use another deployment's namespace.
+4. Validate real HTTP/WebSocket upgrades, two independent authenticated accounts,
+   anonymous reading, persistence after restart, session revocation, moderation
+   and alarm-driven expiry in staging. Local tests do not prove remote bindings,
+   OAuth configuration, service quotas or production migration safety.
+5. Record the exact deployed commit and obtain explicit production approval.
+   Existing production release helpers intentionally reject an unexpected DO
+   migration ledger. They require a separate reviewed release change; do not
+   weaken those guards to deploy this feature.
+
+Rollback
+
+Deploying a DO migration creates durable namespace lifecycle state. Reverting
+application code does not reverse that migration or delete the namespace.
+Keep migration history and bindings in the rollback configuration, disable
+chat routing through a reviewed deployment, and leave stored data subject to
+retention. Do not delete a namespace or roll back D1 tables as a routine rollback.
+No automatic production deployment or merge is part of this change.
+
+Transport and public distribution
+
+WebSockets require a same-origin Worker deployment, or a proxy that supports
+WebSocket upgrades and preserves the verified public origin. The existing
+HTTP-only Vercel API proxy is not a WebSocket proxy. Chat shows a disconnected
+state there; do not pass session tokens in URLs or relax origin checking.
+
+The public distribution intentionally has an empty catalogue and background
+inventory. Track cards resolve canonical IDs through the application's current
+catalogue; missing tracks show an unavailable state. A self-hosted instance can
+provide its own authorised catalogue without copying operator data or media.
+Stickers are built-in labelled icons; no upstream sticker images are bundled.
+
+Privacy and moderation
+
+Messages are public. Posting, reporting and account blocking require a verified
+site session. Messages retain at most 30 days and 10,000 records. Versions and
+reports expire with their parent message. Deleted messages are hidden publicly
+while moderators may inspect retained originals. Account deletion anonymises
+retained authors, removes location and versions, and clears account references.
+Country badges are opt-in, derived by the outer Worker from Cloudflare metadata;
+chat does not store raw IP addresses or use browser geolocation.
+
+Moderator, admin and owner accounts can review /admin#admin-chat; moderators
+have no access to provider or general administration. Only admin/owner can
+manage filters and the send interval. Regular expressions deliberately support
+a restricted finite syntax to bound processing; arbitrary regex programs are
+rejected. Filter replacement is fixed to ***. Message text is rendered as text;
+URLs are not made clickable or embedded, so no third-party preview requests run.
+Do not send chat content to analytics, performance telemetry or error services.

@@ -9,6 +9,7 @@ import {
   vi,
 } from "vitest";
 import { readFile, readdir } from "node:fs/promises";
+import { build } from "esbuild";
 import { Miniflare } from "./miniflare-compat";
 import { ChatRoom } from "../chat/ChatRoom";
 import { issueSession } from "../auth/session";
@@ -21,9 +22,24 @@ let runtime: Miniflare,
   db: Awaited<ReturnType<Miniflare["getD1Database"]>>,
   identity: ChatIdentity;
 beforeAll(async () => {
+  const worker = await build({
+    stdin: { resolveDir: process.cwd(), contents: `
+      import {ChatRoom} from './workers/chat/ChatRoom';
+      export default {async fetch(request, env) {
+        const now=Number(request.headers.get('x-fixture-now'));Date.now=()=>now;
+        let alarm=null;const values=new Map();
+        const state={setWebSocketAutoResponse(){},getWebSockets(){return []},
+          storage:{async get(key){return values.get(key)},async put(key,value){values.set(key,value)},
+            async getAlarm(){return alarm},async setAlarm(value){alarm=value},async deleteAlarm(){alarm=null}}};
+        let batches=0;
+        const limit=Number(new URL(request.url).searchParams.get('limit')||'1000');
+        do {await new ChatRoom(state,env).alarm();batches++} while(alarm!==null && batches<limit);
+        return Response.json({batches,alarm});
+      }};` }, bundle: true, write: false, format: "esm", platform: "browser",
+  });
   runtime = new Miniflare({
     modules: true,
-    script: "export default { fetch() { return new Response() } }",
+    script: worker.outputFiles[0].text,
     compatibilityDate: "2025-12-01",
     d1Databases: { DB: "chat-lifecycle" },
   });
@@ -46,6 +62,7 @@ beforeEach(async () => {
   await db.prepare("DELETE FROM users").run();
   await db.prepare("DELETE FROM chat_messages").run();
   await db.prepare("DELETE FROM moderation_actions").run();
+  await db.prepare("UPDATE chat_retention_state SET message_count=0,floor_created_at=NULL,floor_id=NULL").run();
   await db
     .prepare(
       "INSERT INTO users(id,display_name,role,created_at,updated_at)VALUES('alice','Alice','user',?,?)",
@@ -60,7 +77,7 @@ beforeEach(async () => {
     seenAt: now,
     viewerKey: "alice:user",
   };
-  vi.useFakeTimers();
+  vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(now);
   vi.stubGlobal(
     "WebSocketRequestResponsePair",
@@ -79,6 +96,7 @@ afterEach(() => {
 function fixture(socketIdentity?: ChatIdentity) {
   let attachment = socketIdentity,
     alarm: number | null = null;
+  const durable = new Map<string, unknown>();
   const events: Record<string, unknown>[] = [],
     closed: number[] = [];
   const socket = {
@@ -99,6 +117,8 @@ function fixture(socketIdentity?: ChatIdentity) {
     setWebSocketAutoResponse: () => {},
     getWebSocketAutoResponseTimestamp: () => new Date(Date.now()),
     storage: {
+      get: async <T>(key: string) => durable.get(key) as T | undefined,
+      put: async (key: string, value: unknown) => { durable.set(key, value); },
       getAlarm: async () => alarm,
       setAlarm: async (value: number) => {
         alarm = value;
@@ -132,6 +152,7 @@ async function insert(id: string, created = now, expires = now + 1000) {
     )
     .bind(id, created, expires)
     .run();
+  await db.prepare("UPDATE chat_retention_state SET message_count=message_count+1").run();
 }
 
 describe("D1 retention, reconstruction and failures", () => {
@@ -144,6 +165,7 @@ describe("D1 retention, reconstruction and failures", () => {
       )
       .bind(now, now + 1000)
       .run();
+    await db.prepare("UPDATE chat_retention_state SET message_count=(SELECT COUNT(*) FROM chat_messages)").run();
     const f = fixture();
     await f.room().alarm();
     expect(
@@ -156,6 +178,20 @@ describe("D1 retention, reconstruction and failures", () => {
     ).toBeNull();
     expect(f.alarm()).toBe(now + 1000);
     vi.setSystemTime(now + 1001);
+    // Run the complete 10k backlog against native D1 bindings in workerd.
+    // Node's cross-process D1 proxy per statement would test RPC overhead here.
+    // Cap each dispatch well below the per-request D1 volume that resets the
+    // dispatch socket on newer pinned miniflare/workerd builds; every batch
+    // still runs inside workerd and the loop keeps its overall 1000-batch cap.
+    let batches = 0;
+    let drained: { batches: number; alarm: number | null } | undefined;
+    for (let chunk = 0; chunk < 20 && (!drained || drained.alarm !== null); chunk++) {
+      const drain = await runtime.dispatchFetch("https://local.invalid/drain?limit=100", {headers:{"x-fixture-now":String(now+1001)}});
+      drained = (await drain.json()) as { batches: number; alarm: number | null };
+      batches += drained.batches;
+    }
+    expect(drained).toMatchObject({alarm:null});
+    expect(batches).toBeGreaterThan(0);
     await f.room().alarm();
     expect(
       await db.prepare("SELECT COUNT(*) AS count FROM chat_messages").first(),
@@ -482,6 +518,8 @@ describe("D1 retention, reconstruction and failures", () => {
       setWebSocketAutoResponse: () => {},
       getWebSocketAutoResponseTimestamp: () => new Date(now),
       storage: {
+        get: async () => undefined,
+        put: async () => {},
         getAlarm: async () => null,
         setAlarm: async () => {},
         deleteAlarm: async () => {},
@@ -490,4 +528,182 @@ describe("D1 retention, reconstruction and failures", () => {
     await new ChatRoom(state as never, { DB: counted } as never).alarm();
     expect(queries).toBeLessThan(15);
   });
+});
+
+describe("bounded HTTP admission outside the mutation queue", () => {
+  function streaming(room: ChatRoom, path = "/api/chat/messages") {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; value.enqueue(new TextEncoder().encode('{')); },
+      cancel() { cancelled = true; },
+    });
+    const response = room.fetch(new Request(`https://chat.internal${path}`, {
+      method: "POST", headers: { "x-chat-identity": JSON.stringify(identity), "content-type": "application/json" },
+      body, duplex: "half",
+    } as RequestInit));
+    return { response, controller, cancelled: () => cancelled };
+  }
+  it("unfinished authenticated bodies cannot block history, sends, WS delivery/refresh or alarms", async () => {
+    const f = fixture(identity), room = f.room();
+    const slow = streaming(room);
+    const independent = (async () => {
+      expect((await room.fetch(request('/api/chat'))).status).toBe(200);
+      expect((await room.fetch(request('/api/chat/messages', 'POST', {requestId:'parallel', type:'text', text:'available'}))).status).toBe(201);
+      expect(f.events.some(e => e.type === 'message')).toBe(true);
+      await room.webSocketMessage(f.socket as never, 'refresh');
+      expect(f.events.some(e => e.type === 'snapshot')).toBe(true);
+      await room.alarm();
+      return true;
+    })();
+    const { setTimeout } = await import('node:timers/promises');
+    try {
+      expect(await Promise.race([independent, setTimeout(3000, false)])).toBe(true);
+    } finally {
+      slow.controller.close();
+      expect((await slow.response).status).toBe(400);
+      await independent;
+    }
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:1});
+  });
+  it("rejects a Session revoked while its body was pending at the protected boundary", async () => {
+    const room = fixture().room(), slow = streaming(room);
+    await db.prepare('UPDATE sessions SET revoked_at=? WHERE token_hash=?').bind(now, identity.sessionHash).run();
+    slow.controller.enqueue(new TextEncoder().encode('"requestId":"revoked","type":"text","text":"denied"}'));
+    slow.controller.close();
+    expect((await slow.response).status).toBe(401);
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:0});
+  });
+  it("rechecks moderation role after a pending body completes", async () => {
+    await db.prepare("UPDATE users SET role='admin' WHERE id='alice'").run();
+    const room = fixture().room(), slow = streaming(room, '/api/chat/moderation');
+    await db.prepare("UPDATE users SET role='user' WHERE id='alice'").run();
+    slow.controller.enqueue(new TextEncoder().encode('"action":"settings","intervalMs":250}'));
+    slow.controller.close();
+    expect((await slow.response).status).toBe(403);
+  });
+});
+
+
+describe('bounded retention work',()=>{
+ it('history performs no cleanup writes and never exposes expired messages',async()=>{
+  await insert('old',now-2000,now-1000);
+  const response=await fixture().room().fetch(request('/api/chat'));
+  expect((await response.json() as any).messages).toEqual([]);
+  expect(await db.prepare("SELECT id FROM chat_messages WHERE id='old'").first()).not.toBeNull();
+ });
+ it('one alarm bounds physical parent deletions during an expiry backlog',async()=>{
+  await db.prepare(`WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<1000)
+   INSERT INTO chat_messages(id,author_display_name,content,created_at,expires_at) SELECT printf('expiry-%04d',x),'test','expired',0,1 FROM seq`).run();
+  await db.prepare("UPDATE chat_retention_state SET message_count=(SELECT COUNT(*) FROM chat_messages)").run();
+  await fixture().room().alarm();
+  const row=await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first<{count:number}>();
+  expect(row!.count).toBeGreaterThanOrEqual(990);expect(row!.count).toBeLessThan(1000);
+ });
+});
+
+
+describe('ChatRoom stream limits and atomic admission',()=>{
+ function stream(room: ChatRoom) {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  let cancelled=false;
+  const response=room.fetch(new Request('https://chat.internal/api/chat/messages',{
+   method:'POST',headers:{'x-chat-identity':JSON.stringify(identity),'content-type':'application/json'},
+   body:new ReadableStream<Uint8Array>({start(c){controller=c;c.enqueue(new TextEncoder().encode('{'))},cancel(){cancelled=true}}),duplex:'half',
+  } as RequestInit));
+  return {response,controller,cancelled:()=>cancelled};
+ }
+ it('limits outstanding streams per Session, cancels rejection and releases slots after deadline',async()=>{
+  const room=fixture().room(), a=stream(room),b=stream(room),c=stream(room);
+  expect((await c.response).status).toBe(429);expect(c.cancelled()).toBe(true);
+  const {setTimeout}=await import('node:timers/promises');await setTimeout(30);
+  await setTimeout(5100);
+  expect((await a.response).status).toBe(400);expect((await b.response).status).toBe(400);
+  expect(a.cancelled()).toBe(true);expect(b.cancelled()).toBe(true);
+  expect((await room.fetch(request('/api/chat/messages','POST',{requestId:'after-timeout',type:'text',text:'available'}))).status).toBe(201);
+ });
+ it('concurrent identical requestIds create exactly one ordered message and receipt',async()=>{
+  const room=fixture(identity).room(),body={requestId:'simultaneous',type:'text',text:'once'};
+  const responses=await Promise.all([room.fetch(request('/api/chat/messages','POST',body)),room.fetch(request('/api/chat/messages','POST',body))]);
+  expect(responses.map(r=>r.status).sort()).toEqual([200,201]);
+  const messages=await Promise.all(responses.map(r=>r.json() as Promise<any>));expect(messages[0].message.id).toBe(messages[1].message.id);
+  expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:1});
+  expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_request_receipts').first()).toMatchObject({count:1});
+  expect(await db.prepare('SELECT message_count AS count FROM chat_retention_state').first()).toMatchObject({count:1});
+ });
+ it('keeps partially drained parents hidden and resumes bounded child cleanup after reconstruction',async()=>{
+  await insert('large',0,1);
+  await db.prepare(`WITH RECURSIVE seq(x)AS(SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<250)
+   INSERT INTO chat_reports(id,message_id,reason,status,created_at) SELECT printf('report-%03d',x),'large','expired reason','resolved',0 FROM seq`).run();
+  const f=fixture();await f.room().alarm();
+  expect(await db.prepare("SELECT id FROM chat_messages WHERE id='large'").first()).not.toBeNull();
+  expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_reports').first()).toMatchObject({count:150});
+  expect((await (await f.room().fetch(request('/api/chat'))).json() as any).messages).toEqual([]);
+  await f.room().alarm();await f.room().alarm();
+  expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:0});
+  expect(await db.prepare('PRAGMA foreign_key_check').all()).toMatchObject({results:[]});
+ });
+ it('atomically rolls back failed cleanup and persists a no-retry stop after reconstruction',async()=>{
+  await insert('failure',0,1);
+  await db.prepare("CREATE TRIGGER reject_retention BEFORE DELETE ON chat_messages BEGIN SELECT RAISE(ABORT,'cleanup unavailable'); END").run();
+  const f=fixture();try {
+   await expect(f.room().alarm()).rejects.toThrow();
+   expect(await f.state.storage.get('retention-paused')).toBe(true);
+   expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_retention_pending').first()).toMatchObject({count:0});
+   await db.prepare('DROP TRIGGER reject_retention').run();
+   await f.room().alarm();expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:1});
+  } finally {await db.prepare('DROP TRIGGER IF EXISTS reject_retention').run()}
+ });
+});
+
+
+it('bounds global body admission across independent valid Sessions',async()=>{
+ const room=fixture().room();const identities:ChatIdentity[]=[];
+ for(let i=0;i<33;i++){
+  const session=await issueSession(db as never,'alice',secret,now,crypto);
+  identities.push({...identity,sessionHash:session.record.tokenHash});
+ }
+ const controllers:ReadableStreamDefaultController<Uint8Array>[]=[];
+ const responses=identities.map(id=>room.fetch(new Request('https://chat.internal/api/chat/messages',{
+  method:'POST',headers:{'x-chat-identity':JSON.stringify(id),'content-type':'application/json'},
+  body:new ReadableStream<Uint8Array>({start(c){controllers.push(c);c.enqueue(new TextEncoder().encode('{'))}}),duplex:'half',
+ } as RequestInit)));
+ expect((await responses.at(-1)!).status).toBe(429);
+ for(const c of controllers.slice(0,32))c.close();
+ expect((await Promise.all(responses.slice(0,32))).every(r=>r.status===400)).toBe(true);
+ expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:0});
+});
+
+it('rechecks bans after slow input completion and before sending',async()=>{
+ const room=fixture().room();let c!:ReadableStreamDefaultController<Uint8Array>;
+ const response=room.fetch(new Request('https://chat.internal/api/chat/messages',{
+  method:'POST',headers:{'x-chat-identity':JSON.stringify(identity),'content-type':'application/json'},
+  body:new ReadableStream<Uint8Array>({start(controller){c=controller;c.enqueue(new TextEncoder().encode('{'))}}),duplex:'half',
+ } as RequestInit));
+ await db.prepare("INSERT INTO chat_bans(id,user_id,reason,created_at)VALUES('late-ban','alice','blocked',?)").bind(now).run();
+ c.enqueue(new TextEncoder().encode('"requestId":"late-ban","type":"text","text":"denied"}'));c.close();
+ expect((await response).status).toBe(403);
+ expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:0});
+});
+
+it('hides unexpired cap evictions during partial child draining, including moderation lists',async()=>{
+ await db.prepare("UPDATE users SET role='admin' WHERE id='alice'").run();
+ await insert('oldest',0,now+100000);
+ await db.prepare(`WITH RECURSIVE seq(x)AS(SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<9999)
+  INSERT INTO chat_messages(id,author_display_name,content,created_at,expires_at) SELECT printf('retained-%05d',x),'test','retained',?,? FROM seq`).bind(now-1000,now+100000).run();
+ await db.prepare('UPDATE chat_retention_state SET message_count=10000').run();
+ await db.prepare(`WITH RECURSIVE seq(x)AS(SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<250)
+  INSERT INTO chat_reports(id,message_id,reason,created_at) SELECT printf('pending-report-%03d',x),'oldest','private report',0 FROM seq`).run();
+ const f=fixture(),room=f.room();
+ expect((await room.fetch(request('/api/chat/messages','POST',{requestId:'at-cap',type:'text',text:'wait'}))).status).toBe(429);
+ expect(await db.prepare("SELECT id FROM chat_messages WHERE id='oldest'").first()).not.toBeNull();
+ expect(await db.prepare('SELECT message_count AS count FROM chat_retention_state').first()).toMatchObject({count:10000});
+ const moderation=await (await room.fetch(request('/api/chat/moderation'))).json() as any;
+ expect(moderation.reports).toEqual([]);
+ expect((await room.fetch(request('/api/chat/moderation/messages/oldest'))).status).toBe(404);
+ await room.alarm();await f.room().alarm();
+ const sent=await f.room().fetch(request('/api/chat/messages','POST',{requestId:'after-cap',type:'text',text:'available'}));
+ expect(sent.status).toBe(201);
+ expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({count:10000});
+ expect(await db.prepare('SELECT message_count AS count FROM chat_retention_state').first()).toMatchObject({count:10000});
 });

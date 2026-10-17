@@ -53,3 +53,4 @@ jobs:
           name: chat-browser-evidence
           path: chat-browser-evidence
           if-no-files-found: warn
+          retention-days: 14

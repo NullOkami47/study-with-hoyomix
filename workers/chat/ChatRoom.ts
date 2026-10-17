@@ -1,5 +1,6 @@
+import { MESSAGE_CAP, nextRetention, prune, retentionCount } from "./retention";
 import type { Database, DatabaseStatement } from "../db";
-import { readBoundedJsonRequest } from "../providers/boundedJson";
+import { cancelBody, readChatBody } from "./requestBody";
 import type { ChatEnv } from "./routes";
 import {
   ChatError,
@@ -20,7 +21,6 @@ import {
   filters,
   interval,
   iso,
-  prune,
   publicHistory,
   publicMessage,
   readMessage,
@@ -39,6 +39,8 @@ interface State {
   setWebSocketAutoResponse(pair: WebSocketRequestResponsePair): void;
   getWebSocketAutoResponseTimestamp(socket: WebSocket): Date | null;
   storage: {
+    get<T>(key: string): Promise<T | undefined>;
+    put(key: string, value: unknown): Promise<void>;
     getAlarm(): Promise<number | null>;
     setAlarm(time: number): Promise<void>;
     deleteAlarm(): Promise<void>;
@@ -56,6 +58,9 @@ const STALE = 90000;
  * hibernation. Attachments contain a keyed session hash, never a browser token. */
 export class ChatRoom {
   private tail: Promise<unknown> = Promise.resolve();
+  private pendingBodies = 0;
+  private bodyUsers = new Map<string, number>();
+  private bodies = new WeakMap<Request, Record<string, unknown>>();
   constructor(
     private state: State,
     private env: ChatEnv,
@@ -152,13 +157,9 @@ export class ChatRoom {
   }
   private async schedule() {
     const now = Date.now();
-    const expiry = await this.db
-      .prepare(
-        "SELECT MIN(expires_at) AS expiry FROM chat_messages WHERE room_id='global'",
-      )
-      .first<{ expiry: number | null }>();
+    const expiry = await this.state.storage.get<boolean>("retention-paused") ? Infinity : await nextRetention(this.db, now);
     const next = Math.min(
-      expiry?.expiry ?? Infinity,
+      expiry,
       this.active().length ? now + 30000 : Infinity,
     );
     if (!Number.isFinite(next)) {
@@ -167,7 +168,7 @@ export class ChatRoom {
     }
     const pending = await this.state.storage.getAlarm();
     if (pending === null || pending <= now || pending > next)
-      await this.state.storage.setAlarm(Math.max(now + 1, next));
+      await this.state.storage.setAlarm(Math.max(now + 1000, next));
   }
   private async snapshot(socket: Socket) {
     const user = await this.user(socket.deserializeAttachment());
@@ -191,6 +192,40 @@ export class ChatRoom {
     });
   }
   async fetch(request: Request): Promise<Response> {
+    // Admission includes parsed requests waiting to mutate, bounding both streams
+    // and buffered payloads. Only completed input may enter the shared queue.
+    if (!["POST", "PATCH"].includes(request.method) || !new URL(request.url).pathname.startsWith("/api/chat/"))
+      return this.handle(request);
+    const identity = JSON.parse(request.headers.get("x-chat-identity") ?? "null") as ChatIdentity | null;
+    const key = identity?.sessionHash ?? "";
+    const pending = this.bodyUsers.get(key) ?? 0;
+    if (this.pendingBodies >= 32 || pending >= 2) {
+      cancelBody(request.body);
+      return json({ error: "rate_limited" }, 429);
+    }
+    this.pendingBodies++;
+    this.bodyUsers.set(key, pending + 1);
+    try {
+      if (!identity) throw new ChatError("forbidden", 403);
+      // Cheap rejection of anonymous/revoked clients. This is only preflight;
+      // handle() repeats authoritative Session/role/ban checks inside serial().
+      await this.required(identity);
+      this.bodies.set(request, await readChatBody(request));
+      return await this.handle(request);
+    } catch (error) {
+      cancelBody(request.body);
+      return error instanceof ChatError
+        ? json({ error: error.code }, error.status)
+        : json({ error: "chat_operation_failed" }, 500);
+    } finally {
+      this.bodies.delete(request);
+      this.pendingBodies--;
+      const remaining = (this.bodyUsers.get(key) ?? 1) - 1;
+      if (remaining) this.bodyUsers.set(key, remaining);
+      else this.bodyUsers.delete(key);
+    }
+  }
+  private async handle(request: Request): Promise<Response> {
     return this.serial(async () => {
       try {
         const url = new URL(request.url);
@@ -220,7 +255,6 @@ export class ChatRoom {
             }).length >= 5
           )
             throw new ChatError("connection_limit", 429);
-          await prune(this.db, Date.now());
           const pair = new WebSocketPair();
           this.state.acceptWebSocket(pair[1]);
           pair[1].serializeAttachment(identity);
@@ -236,8 +270,8 @@ export class ChatRoom {
           } as ResponseInit);
         }
         if (request.method === "GET" && url.pathname === "/api/chat") {
-          await prune(this.db, Date.now());
           const user = await this.user(identity);
+          await this.schedule();
           return json(
             await publicHistory(
               this.db,
@@ -275,12 +309,9 @@ export class ChatRoom {
     });
   }
   private async body(request: Request) {
-    try {
-      return object(await readBoundedJsonRequest(request, 8192));
-    } catch (error) {
-      if (error instanceof ChatError) throw error;
-      throw new ChatError("invalid_request");
-    }
+    const body = this.bodies.get(request);
+    if (!body) throw new ChatError("invalid_request");
+    return body;
   }
   private async create(
     request: Request,
@@ -351,8 +382,16 @@ export class ChatRoom {
       .first<{ time: number }>();
     if (last && now - last.time < (await interval(this.db)))
       throw new ChatError("rate_limited", 429);
+    if (await retentionCount(this.db) >= MESSAGE_CAP) {
+      if (await this.cleanup(now, true)) await this.broadcast({ type: "reset" });
+      if (await retentionCount(this.db) >= MESSAGE_CAP) {
+        await this.schedule();
+        throw new ChatError("rate_limited", 429);
+      }
+    }
     const id = crypto.randomUUID();
     await this.db.batch([
+      this.db.prepare("UPDATE chat_retention_state SET message_count=message_count+1 WHERE room_id='global'"),
       this.db
         .prepare(
           `INSERT INTO chat_messages(id,user_id,author_display_name,content,message_type,sticker_id,track_id,coarse_location,created_at,expires_at)VALUES(?,?,?,?,?,?,?,?,?,?)`,
@@ -380,7 +419,7 @@ export class ChatRoom {
         )
         .bind(user.userId, now),
     ]);
-    if (await prune(this.db, now)) await this.broadcast({ type: "reset" });
+
     const message = publicMessage(
       (await readMessage(this.db, id, now))!,
       await filters(this.db),
@@ -598,7 +637,11 @@ export class ChatRoom {
     if (request.method === "GET") {
       const reports = await this.db
         .prepare(
-          `SELECT r.id,r.message_id AS messageId,r.reason,r.created_at AS createdAt,m.content,m.user_id AS userId,m.author_display_name AS displayName FROM chat_reports r JOIN chat_messages m ON m.id=r.message_id WHERE r.status='pending' AND m.expires_at>? ORDER BY r.created_at LIMIT 100`,
+          `SELECT r.id,r.message_id AS messageId,r.reason,r.created_at AS createdAt,m.content,m.user_id AS userId,m.author_display_name AS displayName FROM chat_reports r JOIN chat_messages m ON m.id=r.message_id WHERE r.status='pending' AND m.expires_at>?
+ AND NOT EXISTS(SELECT 1 FROM chat_retention_pending WHERE message_id=m.id)
+ AND ((SELECT floor_created_at FROM chat_retention_state WHERE room_id='global') IS NULL
+ OR (m.created_at,m.id)>=(SELECT floor_created_at,floor_id FROM chat_retention_state WHERE room_id='global'))
+ ORDER BY r.created_at LIMIT 100`,
         )
         .bind(now)
         .all<{ createdAt: number }>();
@@ -858,9 +901,18 @@ export class ChatRoom {
       await this.schedule();
     });
   }
+  private async cleanup(now: number, reserve = false) {
+    if (await this.state.storage.get<boolean>("retention-paused")) return 0;
+    try { return await prune(this.db, now, reserve); }
+    catch (error) {
+      // Persist a hard stop; no unbounded D1 retries, including after eviction.
+      await this.state.storage.put("retention-paused", true);
+      throw error;
+    }
+  }
   async alarm(): Promise<void> {
     await this.serial(async () => {
-      if (await prune(this.db, Date.now()))
+      if (await this.cleanup(Date.now()))
         await this.broadcast({ type: "reset" });
       const audience = await this.audience(),
         active = new Set(audience.sockets);

@@ -74,6 +74,8 @@ try {
   }
   await db.batch(Array.from({ length: 65 }, (_, i) => db.prepare(`INSERT INTO chat_messages (id,room_id,user_id,author_display_name,content,message_type,created_at,expires_at)
     VALUES (?,?,?,?,?,'text',?,?)`).bind(`history-${String(i).padStart(3, '0')}`, 'global', 'browser-user-1', 'Browser learner 1', `Earlier study message ${i}`, now - 100_000 + i * 1000, now + 86_400_000)))
+  // Local fixture insertion bypasses the coordinator's atomic count update.
+  await db.prepare("UPDATE chat_retention_state SET message_count=(SELECT COUNT(*) FROM chat_messages WHERE room_id='global') WHERE room_id='global'").run()
   delete process.env.VITE_ANALYTICS_ID
   delete process.env.VITE_ANALYTICS_URL
   process.env.VITE_ENABLE_DEMO_CATALOG = 'false'

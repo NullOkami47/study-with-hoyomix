@@ -51,8 +51,11 @@ export async function chatRoute(
   const internal = new URL("https://chat.internal");
   internal.pathname = url.pathname;
   internal.search = url.search;
-  const init: RequestInit = { method: request.method, headers };
-  if (!["GET", "HEAD"].includes(request.method)) init.body = request.body;
+  const init: RequestInit & { duplex?: "half" } = { method: request.method, headers, signal: request.signal };
+  if (!["GET", "HEAD"].includes(request.method)) {
+    init.body = request.body;
+    init.duplex = "half";
+  }
   return env.CHAT.get(env.CHAT.idFromName("global")).fetch(
     new Request(internal, init),
   );

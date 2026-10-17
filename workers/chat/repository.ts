@@ -107,7 +107,10 @@ export async function readMessage(
 ): Promise<MessageRow | null> {
   return db
     .prepare(
-      `SELECT ${columns} FROM chat_messages m LEFT JOIN users u ON u.id=m.user_id WHERE m.id=? AND m.room_id='global' AND m.expires_at>?`,
+      `SELECT ${columns} FROM chat_messages m LEFT JOIN users u ON u.id=m.user_id WHERE m.id=? AND m.room_id='global' AND m.expires_at>?
+ AND NOT EXISTS(SELECT 1 FROM chat_retention_pending WHERE message_id=m.id)
+ AND ((SELECT floor_created_at FROM chat_retention_state WHERE room_id='global') IS NULL
+ OR (m.created_at,m.id)>=(SELECT floor_created_at,floor_id FROM chat_retention_state WHERE room_id='global'))`,
     )
     .bind(id, now)
     .first<MessageRow>();
@@ -163,6 +166,9 @@ export async function history(
     .prepare(
       `SELECT ${columns} FROM chat_messages m LEFT JOIN users u ON u.id=m.user_id
  WHERE m.room_id='global' AND m.expires_at>? AND m.deleted_at IS NULL
+ AND NOT EXISTS(SELECT 1 FROM chat_retention_pending WHERE message_id=m.id)
+ AND ((SELECT floor_created_at FROM chat_retention_state WHERE room_id='global') IS NULL
+ OR (m.created_at,m.id)>=(SELECT floor_created_at,floor_id FROM chat_retention_state WHERE room_id='global'))
  AND NOT EXISTS (SELECT 1 FROM user_blocks b WHERE b.blocking_user_id=? AND b.blocked_user_id=m.user_id)
  ${cursor ? "AND (m.created_at<? OR (m.created_at=? AND m.id<?))" : ""}
  ORDER BY m.created_at DESC,m.id DESC LIMIT ?`,
@@ -226,25 +232,4 @@ export async function requireNotBanned(
     .bind(userId, now)
     .first();
   if (ban) throw new ChatError("chat_banned", 403);
-}
-export async function prune(db: Database, now: number) {
-  const results = await db.batch([
-    db
-      .prepare(
-        "DELETE FROM moderation_actions WHERE target_message_id IN (SELECT id FROM chat_messages WHERE room_id='global' AND (expires_at<=? OR id IN (SELECT id FROM chat_messages WHERE room_id='global' ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET 10000)))",
-      )
-      .bind(now),
-    db
-      .prepare(
-        "DELETE FROM chat_messages WHERE room_id='global' AND expires_at<=?",
-      )
-      .bind(now),
-    db.prepare(
-      "DELETE FROM chat_messages WHERE id IN (SELECT id FROM chat_messages WHERE room_id='global' ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET 10000)",
-    ),
-    db
-      .prepare("DELETE FROM chat_message_versions WHERE expires_at<=?")
-      .bind(now),
-  ]);
-  return results[1].meta.changes + results[2].meta.changes;
 }

@@ -12,6 +12,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  source:
+    name: Public source, unit, Worker and build checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit
+      - run: npm run verify
   network:
     name: Chat real network and responsive browser checks
     runs-on: ubuntu-24.04

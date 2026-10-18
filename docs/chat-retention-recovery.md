@@ -26,7 +26,15 @@ do not infer that cleanup is healthy. `markedParents` counts selected parents,
 not physically deleted messages or billed D1 rows. The API exposes no content,
 user identities, cookies, Session hashes or raw exception strings.
 
-Before any automatic cleanup SQL, including selection, the coordinator
+Automatic alarms first check the durable pause and perform the existing indexed,
+read-only due check for pending parents, overflow, message expiry and version
+expiry. A confirmed no-op returns without writing cleanup state or changing the
+generation. The check runs in the room mutation queue, is never cached across
+events or reconstruction, and uses the same cutoff as prune. Probe failure
+persists a fresh generation and pause without entering prune. Reserve admission
+and manual recovery retain their original guarded paths.
+
+Before entering actual prune SQL, including its selections, the coordinator
 atomically stores the pause and a new generation. Only successful completion
 atomically records its result and clears the pause. Failure or interruption
 therefore leaves a durable stop; reconstruction cannot silently resume it.
@@ -34,7 +42,8 @@ If acknowledging the final storage write fails, the handler reasserts pause
 without repeating SQL. If storage also refuses that write, its state is unknown:
 stop and reconcile actual status before acting. A 503 alone never proves rollback
 or durable pause. Successful D1 cleanup is not reversed by a storage failure.
-If the initial storage write fails, no cleanup SQL executes. Platform alarm
+If the initial storage write fails, no prune SQL executes (the read-only due
+check may already have executed). Platform alarm
 redelivery can still occur, but cannot enter cleanup while paused; failure to
 persist the initial guard also prevents entering cleanup on each delivery.
 This guarantee concerns cleanup, not normal Session, presence or history reads.
@@ -110,16 +119,38 @@ Do not use private recovery metadata as public distribution configuration.
 
 ## Guard cost and limits
 
-The durable write-ahead guarantee adds DO storage writes even to a no-op alarm.
-Normal cleanup uses two atomic multi-key put calls, writing four key values.
-At one heartbeat per 30 seconds with continuously active sockets, that is about
-2,880 cleanups/day, 5,760 put calls and 11,520 key-value writes, before reserve
-cleanup and other activity. A successful manual recovery uses two put calls
-writing three key values. These are application operation counts, **not** billed
-rows or prices. Failure handling can add a further atomic stop write. These
-counts exclude status reads, scheduling, Session checks and other DO activity.
-History reads do not invoke cleanup; a no-op cleanup still
-creates no D1 mutation batch. Monitor the actual storage engine and billing.
+Cloudflare's [SQLite DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
+counts KV `put()` keys as rows written and each `setAlarm()` as one row written;
+multi-key puts and cached operations are not exempt. Deletes also count as
+rows written. DO usage is distinct from D1 usage, but consumes DO storage limits.
+The Free limit is 100,000 rows written/day, shared with other DO activity; the
+Paid allowance is 50 million/month, then USD 1 per million rows written.
+
+Local API instrumentation (not Cloudflare billing telemetry) measured:
+
+| Scenario | Old put calls / keys | New put calls / keys | setAlarm old / new |
+|---|---:|---:|---:|
+| Two active heartbeats without cleanup, reconstructed between events | 4 / 8 | 0 / 0 | 2 / 2 |
+| One expired-version cleanup, active socket | 2 / 4 | 2 / 4 | 1 / 1 |
+
+At 2,880 active heartbeats/day, with no cleanup due throughout that day, the old
+path projects 5,760 put calls / 11,520 key writes plus 2,880 alarm writes:
+**14,400 estimated DO rows written/day** for these operations. The new path
+projects zero cleanup puts plus 2,880 alarm writes: **2,880 estimated DO rows
+written/day**, an 80% reduction for this model. An active room is not necessarily
+a room requiring cleanup. If every heartbeat actually cleans, the new path still
+projects 14,400/day. Each successful automatic cleanup/reserve attempt adds
+2 put calls / 4 key writes; manual recovery adds 2 calls / 3 keys. Failure
+reassertion adds 1 call / 2 keys, excluding ambiguous commits and platform retries.
+
+These are estimated logical API operations mapped to documented pricing, not
+measured billed rows or a total bill. They exclude other DO keys, read rows,
+deleteAlarm accounting, requests, duration, stored bytes, additional scheduling,
+reconnects and D1 operations/index amplification. Empty idle rooms cancel their
+alarm; they do not incur 2,880 daily alarms. Actual due cleanup adds read-only D1
+probe queries (up to four) before guarded prune; no-op probes replace prune's
+existing selection reads. History still invokes no cleanup. Preserve real
+staging measurements of rows, retries and quota before cost clearance.
 
 The guards use the atomic multi-key `put(entries)` API described in the
 [Cloudflare storage documentation](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/).

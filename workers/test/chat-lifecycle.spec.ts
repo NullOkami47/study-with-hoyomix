@@ -93,7 +93,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
-function fixture(socketIdentity?: ChatIdentity) {
+function fixture(socketIdentity?: ChatIdentity, database = db) {
   let attachment = socketIdentity,
     alarm: number | null = null;
   const durable = new Map<string, unknown>();
@@ -131,7 +131,7 @@ function fixture(socketIdentity?: ChatIdentity) {
     },
   };
   const env = {
-    DB: db,
+    DB: database,
     PUBLIC_ORIGIN: "https://study.example",
     SESSION_HMAC_SECRET: secret,
   };
@@ -147,6 +147,154 @@ const request = (path: string, method = "GET", body?: unknown) =>
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+
+describe('retention storage cost', () => {
+  // Wrap the native D1 proxy: spying on its dynamic method properties directly
+  // does not reliably intercept calls on both pinned Miniflare versions.
+  function database() {
+    return {
+      prepare: (sql: string) => db.prepare(sql),
+      batch: (statements: Parameters<typeof db.batch>[0]) => db.batch(statements),
+      exec: (sql: string) => db.exec(sql),
+    };
+  }
+  function meter(f: ReturnType<typeof fixture>) {
+    const operations = { putCalls: 0, keyWrites: 0, setAlarm: 0, deleteAlarm: 0 };
+    const put = f.state.storage.put, setAlarm = f.state.storage.setAlarm, deleteAlarm = f.state.storage.deleteAlarm;
+    vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      operations.putCalls++;
+      operations.keyWrites += typeof key === 'string' ? 1 : Object.keys(key).length;
+      await put(key, value);
+    });
+    vi.spyOn(f.state.storage, 'setAlarm').mockImplementation(async value => { operations.setAlarm++; await setAlarm(value); });
+    vi.spyOn(f.state.storage, 'deleteAlarm').mockImplementation(async () => { operations.deleteAlarm++; await deleteAlarm(); });
+    return operations;
+  }
+  it('idle heartbeat preserves generation without cleanup writes after restart', async () => {
+    await insert('future-cost', now, now + 86400000);
+    const counted = database(), f = fixture(identity, counted as never), operations = meter(f);
+    const batch = vi.spyOn(counted, 'batch');
+    try {
+      await f.room().alarm();
+      const token = await f.state.storage.get('retention-attempt');
+      vi.setSystemTime(now + 30000);
+      await f.room().alarm();
+      console.info('DO_LOGICAL_COST idle-two-heartbeats-measured', JSON.stringify(operations));
+      expect(await f.state.storage.get('retention-attempt')).toEqual(token);
+      expect(operations).toEqual({ putCalls: 0, keyWrites: 0, setAlarm: 2, deleteAlarm: 0 });
+      expect(batch).not.toHaveBeenCalled();
+      console.info('DO_LOGICAL_COST idle-two-heartbeats', JSON.stringify(operations));
+    } finally { batch.mockRestore(); }
+  });
+  it('expired version alone still performs guarded cleanup and schedules presence', async () => {
+    await insert('version-cost', now, now + 86400000);
+    await db.prepare("INSERT INTO chat_message_versions(id,message_id,editor_user_id,original_content,created_at,expires_at) VALUES('expired-version','version-cost','alice','old',0,?)").bind(now).run();
+    const f = fixture(identity), operations = meter(f);
+    await f.room().alarm();
+    expect(await db.prepare("SELECT id FROM chat_message_versions WHERE id='expired-version'").first()).toBeNull();
+    expect(await f.state.storage.get('retention-attempt')).toMatchObject({ outcome: 'cleaned', markedParents: 0 });
+    expect(operations).toEqual({ putCalls: 2, keyWrites: 4, setAlarm: 1, deleteAlarm: 0 });
+    console.info('DO_LOGICAL_COST version-cleanup', JSON.stringify(operations));
+  });
+  it('empty room performs no cleanup writes and cancels scheduling', async () => {
+    const f = fixture(), operations = meter(f);
+    await f.room().alarm();
+    expect(operations).toEqual({ putCalls: 0, keyWrites: 0, setAlarm: 0, deleteAlarm: 1 });
+    expect(f.alarm()).toBeNull();
+  });
+  it('no-op after recovery preserves its token and refuses replay after restart', async () => {
+    await db.prepare("UPDATE users SET role='owner' WHERE id='alice'").run();
+    const path = '/api/chat/moderation/retention', f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    const recovered = await (await f.room().fetch(request(path, 'POST', { expectedToken: null }))).json() as any;
+    const operations = meter(f);
+    await f.room().alarm();
+    const status = await (await f.room().fetch(request(path))).json() as any;
+    expect(status.token).toBe(recovered.token);
+    expect((await f.room().fetch(request(path, 'POST', { expectedToken: recovered.token }))).status).toBe(409);
+    expect(operations.keyWrites).toBe(0);
+  });
+  it('ambiguous automatic unpause reasserts stop without repeating SQL', async () => {
+    await insert('unpause-automatic', 0, 1);
+    const counted = database(), f = fixture(undefined, counted as never), put = f.state.storage.put;
+    const spy = vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      await put(key, value);
+      if (typeof key !== 'string' && key['retention-paused'] === false) throw new Error('acknowledgement lost');
+    });
+    const batch = vi.spyOn(counted, 'batch');
+    try {
+      await expect(f.room().alarm()).rejects.toThrow();
+      expect(await f.state.storage.get('retention-paused')).toBe(true);
+      expect(await f.state.storage.get('retention-attempt')).toMatchObject({ outcome: 'failed' });
+      expect(batch).toHaveBeenCalledTimes(1);
+      await f.room().alarm();
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(await db.prepare("SELECT id FROM chat_messages WHERE id='unpause-automatic'").first()).toBeNull();
+    } finally { spy.mockRestore(); batch.mockRestore(); }
+  });
+  it('expiry boundary after an idle restart guards every mutation before unpausing', async () => {
+    await insert('due-cost', now, now + 30000);
+    const counted = database(), f = fixture(identity, counted as never), operations = meter(f);
+    const batch = counted.batch;
+    const spy = vi.spyOn(counted, 'batch').mockImplementation(async (statements: Parameters<typeof counted.batch>[0]) => {
+      expect(await f.state.storage.get('retention-paused')).toBe(true);
+      expect(await f.state.storage.get('retention-attempt')).toMatchObject({ outcome: 'in_progress' });
+      return batch(statements);
+    });
+    try {
+      await f.room().alarm();
+      expect(operations.keyWrites).toBe(0);
+      vi.setSystemTime(now + 30000);
+      await f.room().alarm();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(operations).toEqual({ putCalls: 2, keyWrites: 4, setAlarm: 2, deleteAlarm: 0 });
+      expect(await f.state.storage.get('retention-paused')).toBe(false);
+      expect(await db.prepare("SELECT id FROM chat_messages WHERE id='due-cost'").first()).toBeNull();
+      console.info('DO_LOGICAL_COST idle-then-cleanup', JSON.stringify(operations));
+    } finally { spy.mockRestore(); }
+  });
+  it.each([
+    'SELECT message_id FROM chat_retention_pending LIMIT 1',
+    "SELECT message_count AS count FROM chat_retention_state WHERE room_id='global'",
+    "SELECT expires_at AS expiry FROM chat_messages WHERE room_id='global' ORDER BY expires_at,id LIMIT 1",
+    'SELECT expires_at AS expiry FROM chat_message_versions ORDER BY expires_at,id LIMIT 1',
+  ])('probe failure persists pause without mutation or automatic retry: %s', async (failedSql: string) => {
+    const counted = database(), f = fixture(undefined, counted as never), operations = meter(f);
+    const prepare = counted.prepare;
+    let probes = 0;
+    const spy = vi.spyOn(counted, 'prepare').mockImplementation((sql: string) => {
+      if (sql === failedSql) { probes++; throw new Error('private probe failure'); }
+      return prepare(sql);
+    });
+    const batch = vi.spyOn(counted, 'batch');
+    try {
+      await expect(f.room().alarm()).rejects.toThrow();
+      expect(await f.state.storage.get('retention-paused')).toBe(true);
+      expect(await f.state.storage.get('retention-attempt')).toMatchObject({ outcome: 'failed' });
+      await f.room().alarm();
+      expect(probes).toBe(1);
+      expect(batch).not.toHaveBeenCalled();
+      expect(operations.keyWrites).toBe(4);
+    } finally { spy.mockRestore(); batch.mockRestore(); }
+  });
+  it('ambiguous automatic guard write cannot clean or resume after reconstruction', async () => {
+    await insert('ambiguous-automatic', 0, 1);
+    const f = fixture(), put = f.state.storage.put;
+    const spy = vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      await put(key, value);
+      throw new Error('acknowledgement lost');
+    });
+    try {
+      await expect(f.room().alarm()).rejects.toThrow();
+      const attempt = await f.state.storage.get('retention-attempt');
+      expect(attempt).toMatchObject({ outcome: 'in_progress' });
+      await f.room().alarm();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(await f.state.storage.get('retention-attempt')).toEqual(attempt);
+      expect(await db.prepare("SELECT id FROM chat_messages WHERE id='ambiguous-automatic'").first()).not.toBeNull();
+    } finally { spy.mockRestore(); }
+  });
+});
 
 describe('Owner retention recovery', () => {
   const path = '/api/chat/moderation/retention';

@@ -969,14 +969,23 @@ export class ChatRoom {
   }
   private async cleanup(now: number, reserve = false) {
     if (await this.state.storage.get<boolean>("retention-paused")) return 0;
-    // Before *any* cleanup SQL (including selection), persist a write-ahead
-    // stop: failed storage cannot allow D1 cleanup retries after eviction.
+    // Read-only due check, inside the same serial queue as all room mutations.
+    // Never cache this across events/reconstruction. Reserve admission keeps
+    // the original guarded path (count === cap already needs an eviction).
+    let probeFailed = false;
+    if (!reserve) {
+      try { if (await nextRetention(this.db, now) > now) return 0; }
+      catch { probeFailed = true; }
+    }
+    // Before entering prune (including its selections), persist a write-ahead
+    // stop. An unavailable probe also takes this path and pauses without SQL.
     const attempt: RetentionAttempt = { token: crypto.randomUUID(), at: now, outcome: 'in_progress' };
     // A single atomic put binds the stop to its generation; no crash window
     // may expose a new pause with an old operator approval token.
     try { await this.state.storage.put({ 'retention-paused': true, 'retention-attempt': attempt }); }
     catch { console.error('chat_retention_pause_write_failed'); throw new Error('chat_retention_storage_unavailable'); }
     try {
+      if (probeFailed) throw new Error('chat_retention_probe_failed');
       const changed = await prune(this.db, now, reserve);
       await this.state.storage.put({ 'retention-attempt': { ...attempt, outcome: 'cleaned', markedParents: changed }, 'retention-paused': false });
       return changed;

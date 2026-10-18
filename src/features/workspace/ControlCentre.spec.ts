@@ -311,7 +311,8 @@ describe('ControlCentre', () => {
     expect(wrapper.find('[data-control-centre-focus-chat]').exists()).toBe(false)
     await wrapper.get('[data-control-centre-open-chat]').trigger('click')
     expect(wrapper.emitted('open-chat')).toHaveLength(1)
-    expect(wrapper.findAll('[data-chat-availability]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-chat-panel]')).toHaveLength(0)
+    expect(wrapper.get('[data-control-centre-chat]').text()).toContain('A shared study lounge')
   })
 
   it('offers to focus the open chat window rather than to open a second one', async () => {

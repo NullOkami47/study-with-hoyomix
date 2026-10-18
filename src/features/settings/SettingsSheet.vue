@@ -817,6 +817,11 @@ onBeforeUnmount(() => {
         <p data-privacy-operator-keys>{{ text('settings.privacy.operatorKeys') }}</p>
         <p data-privacy-media-urls>{{ text('settings.privacy.mediaUrls') }}</p>
 
+        <h4>{{ text('settings.privacy.chatHeading') }}</h4>
+        <p data-privacy-chat>{{ text('settings.privacy.chat') }}</p>
+        <p data-privacy-chat-location>{{ text('settings.privacy.chatLocation') }}</p>
+        <p data-privacy-chat-moderation>{{ text('settings.privacy.chatModeration') }}</p>
+
         <h4>{{ text('settings.privacy.controlsHeading') }}</h4>
         <p data-privacy-export>{{ text('settings.privacy.export') }}</p>
         <p data-privacy-deletion>{{ text('settings.privacy.deletion') }}</p>

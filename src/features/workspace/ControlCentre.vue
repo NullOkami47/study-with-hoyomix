@@ -18,7 +18,6 @@ import {
   Smartphone, Timer,
 } from 'lucide-vue-next'
 
-import ChatAvailability from '../chat/ChatAvailability.vue'
 import CompactPlayback from '../player/CompactPlayback.vue'
 import StudyCalendar from '../focus/StudyCalendar.vue'
 import type { FocusSessionRecord } from '../focus/types'
@@ -275,7 +274,7 @@ watch(() => props.section, () => {
           :time-zone="timeZone"
         />
         <div v-else-if="section === 'chat'" class="control-centre__chat" data-control-centre-chat>
-          <ChatAvailability />
+          <p>{{ text('chat.introduction') }}</p>
           <!--
             The recovery path for a closed chat window, and the only one: the main page
             deliberately carries no permanent "open chat" button. There is one chat

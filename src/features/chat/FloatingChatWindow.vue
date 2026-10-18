@@ -466,10 +466,12 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
 .chat-window__close:active { transform: scale(0.94); filter: var(--control-active-filter); }
 
 .chat-window__body {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   padding: 0.875rem 1rem 1rem;
-  overflow: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
 }
 
@@ -486,6 +488,13 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
     linear-gradient(135deg, transparent 46%, var(--colour-text-muted) 46%, var(--colour-text-muted) 54%, transparent 54%),
     linear-gradient(135deg, transparent 70%, var(--colour-text-muted) 70%, var(--colour-text-muted) 78%, transparent 78%);
   touch-action: none;
+}
+
+@media (max-height: 450px) {
+  /* Keep the complete composer reachable between the measured Focus and Player
+     bounds when the virtual keyboard or landscape viewport reduces the height. */
+  .chat-window__header { padding-block: 0.25rem; }
+  .chat-window__body { padding-block: 0.25rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {

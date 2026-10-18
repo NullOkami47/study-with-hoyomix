@@ -12,6 +12,7 @@
     "typecheck": "node scripts/generate-build-info.mjs --allow-unknown && vue-tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run --maxWorkers=3",
     "test:workers": "vitest run --config vitest.workers.config.ts",
+    "test:e2e:chat": "node scripts/run-chat-e2e.mjs",
     "dev:worker": "wrangler dev --local --port 8787",
     "d1:migrate:local": "wrangler d1 migrations apply DB --local --config wrangler.toml",
     "verify": "npm run typecheck && npm test && npm run test:workers && npm run build"
@@ -30,6 +31,7 @@
     "postcss": "8.5.26"
   },
   "devDependencies": {
+    "@playwright/test": "1.55.1",
     "@types/node": "22.15.3",
     "@vitejs/plugin-vue": "6.0.10",
     "@vue/test-utils": "2.4.6",

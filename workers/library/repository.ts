@@ -416,7 +416,21 @@ export async function deleteAccount(
       WHERE reporter_user_id = ? AND status = 'pending'
     `).bind(userId),
     database.prepare(`
-      UPDATE chat_messages SET user_id = NULL, author_display_name = 'Deleted user'
+      DELETE FROM chat_message_versions
+      WHERE message_id IN (SELECT id FROM chat_messages WHERE user_id = ?)
+    `).bind(userId),
+    database.prepare(`
+      UPDATE moderation_actions SET reason = NULL
+      WHERE target_user_id = ? OR actor_user_id = ?
+        OR target_message_id IN (SELECT id FROM chat_messages WHERE user_id = ?)
+    `).bind(userId, userId, userId),
+    database.prepare(`
+      UPDATE chat_reports SET reason = 'Report retained after account deletion', resolution_note = NULL
+      WHERE reporter_user_id = ?
+        OR message_id IN (SELECT id FROM chat_messages WHERE user_id = ?)
+    `).bind(userId, userId),
+    database.prepare(`
+      UPDATE chat_messages SET user_id = NULL, author_display_name = 'Deleted user', coarse_location = NULL
       WHERE user_id = ?
     `).bind(userId),
   ]

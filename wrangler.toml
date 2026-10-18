@@ -21,5 +21,13 @@ class_name = "OnlinePresence"
 tag = "presence-v1"
 new_sqlite_classes = ["OnlinePresence"]
 
+[[durable_objects.bindings]]
+name = "CHAT"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "community-chat-v1"
+new_sqlite_classes = ["ChatRoom"]
+
 [vars]
 PUBLIC_ORIGIN = "http://localhost:8787"

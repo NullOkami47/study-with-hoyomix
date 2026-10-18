@@ -12,6 +12,10 @@ export async function chatRoute(
 ): Promise<Response> {
   const url = new URL(request.url);
   if (!env.CHAT) return json({ error: "chat_unavailable" }, 503);
+  if (url.pathname === '/api/chat/moderation/retention' &&
+      (url.origin !== env.PUBLIC_ORIGIN ||
+       (request.headers.has('origin') && request.headers.get('origin') !== env.PUBLIC_ORIGIN)))
+    return json({ error: 'forbidden_origin' }, 403);
   const socket = url.pathname === "/api/chat/socket";
   if (
     (socket || !["GET", "HEAD"].includes(request.method)) &&

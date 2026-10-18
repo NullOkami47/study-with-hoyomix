@@ -33,6 +33,12 @@ interface Socket extends WebSocket {
   serializeAttachment(value: ChatIdentity): void;
   deserializeAttachment(): ChatIdentity;
 }
+interface RetentionAttempt {
+  token: string;
+  at: number;
+  outcome: 'in_progress' | 'recovered' | 'cleaned' | 'failed';
+  markedParents?: number;
+}
 interface State {
   acceptWebSocket(socket: WebSocket): void;
   getWebSockets(): Socket[];
@@ -40,7 +46,7 @@ interface State {
   getWebSocketAutoResponseTimestamp(socket: WebSocket): Date | null;
   storage: {
     get<T>(key: string): Promise<T | undefined>;
-    put(key: string, value: unknown): Promise<void>;
+    put(key: string | Record<string, unknown>, value?: unknown): Promise<void>;
     getAlarm(): Promise<number | null>;
     setAlarm(time: number): Promise<void>;
     deleteAlarm(): Promise<void>;
@@ -155,9 +161,9 @@ export class ChatRoom {
       this.send(socket, event);
     }
   }
-  private async schedule() {
+  private async schedule(retentionExpiry?: number) {
     const now = Date.now();
-    const expiry = await this.state.storage.get<boolean>("retention-paused") ? Infinity : await nextRetention(this.db, now);
+    const expiry = retentionExpiry ?? (await this.state.storage.get<boolean>("retention-paused") ? Infinity : await nextRetention(this.db, now));
     const next = Math.min(
       expiry,
       this.active().length ? now + 30000 : Infinity,
@@ -283,6 +289,8 @@ export class ChatRoom {
           );
         }
         const user = await this.required(identity);
+        if (url.pathname === '/api/chat/moderation/retention')
+          return await this.retentionOperation(request, user);
         if (url.pathname.startsWith("/api/chat/moderation"))
           return await this.moderation(request, url, user);
         if (
@@ -901,13 +909,83 @@ export class ChatRoom {
       await this.schedule();
     });
   }
+  private async retentionStatus() {
+    try {
+      const durablePaused = Boolean(await this.state.storage.get<boolean>('retention-paused'));
+      const attempt = await this.state.storage.get<RetentionAttempt>('retention-attempt');
+      return {
+        paused: durablePaused,
+        durablePaused,
+        token: attempt?.token ?? null,
+        lastAttempt: attempt ? {
+          at: attempt.at,
+          outcome: attempt.outcome,
+          ...(attempt.markedParents === undefined ? {} : { markedParents: attempt.markedParents }),
+        } : null,
+      };
+    } catch {
+      console.error('chat_retention_status_unavailable');
+      throw new ChatError('retention_storage_unavailable', 503);
+    }
+  }
+  private async retentionOperation(request: Request, user: ChatUser) {
+    if (user.role !== 'owner') throw new ChatError('forbidden', 403);
+    if (request.method === 'GET') return json(await this.retentionStatus());
+    if (request.method !== 'POST') throw new ChatError('not_found', 404);
+    const body = await this.body(request);
+    exactKeys(body, ['expectedToken']);
+    if (body.expectedToken !== null) identifier(body.expectedToken);
+    const status = await this.retentionStatus();
+    if (!status.paused || body.expectedToken !== status.token)
+      throw new ChatError('retention_state_changed', 409);
+    // Consume the token durably BEFORE SQL. Ambiguous delivery/reconstruction
+    // cannot repeat an attempt; an operator must read and approve a new token.
+    const attempt: RetentionAttempt = { token: crypto.randomUUID(), at: Date.now(), outcome: 'in_progress' };
+    try {
+      await this.state.storage.put('retention-attempt', attempt);
+    } catch {
+      console.error('chat_retention_attempt_write_failed');
+      throw new ChatError('retention_storage_unavailable', 503);
+    }
+    try {
+      const markedParents = await prune(this.db, Date.now());
+      // Prepare scheduling and client invalidation while the durable stop still
+      // holds. Errors reassert the stop; storage-unknown outcomes require
+      // operator reconciliation, never a SQL retry.
+      await this.schedule(await nextRetention(this.db, Date.now()));
+      if (markedParents) await this.broadcast({ type: 'reset' });
+      await this.state.storage.put({ 'retention-attempt': { ...attempt, outcome: 'recovered', markedParents }, 'retention-paused': false });
+      console.info('chat_retention_recovered');
+      return json({ paused: false, durablePaused: false, token: attempt.token,
+        lastAttempt: { at: attempt.at, outcome: 'recovered', markedParents } });
+    } catch {
+      console.error('chat_retention_recovery_failed');
+      // A write can have an ambiguous result. Reassert the stop without ever
+      // repeating SQL; if storage is unavailable the operator must reconcile.
+      try { await this.state.storage.put({ 'retention-paused': true, 'retention-attempt': { ...attempt, outcome: 'failed' } }); }
+      catch { console.error('chat_retention_attempt_write_failed'); }
+      return json(await this.retentionStatus(), 503);
+    }
+  }
   private async cleanup(now: number, reserve = false) {
     if (await this.state.storage.get<boolean>("retention-paused")) return 0;
-    try { return await prune(this.db, now, reserve); }
-    catch (error) {
-      // Persist a hard stop; no unbounded D1 retries, including after eviction.
-      await this.state.storage.put("retention-paused", true);
-      throw error;
+    // Before *any* cleanup SQL (including selection), persist a write-ahead
+    // stop: failed storage cannot allow D1 cleanup retries after eviction.
+    const attempt: RetentionAttempt = { token: crypto.randomUUID(), at: now, outcome: 'in_progress' };
+    // A single atomic put binds the stop to its generation; no crash window
+    // may expose a new pause with an old operator approval token.
+    try { await this.state.storage.put({ 'retention-paused': true, 'retention-attempt': attempt }); }
+    catch { console.error('chat_retention_pause_write_failed'); throw new Error('chat_retention_storage_unavailable'); }
+    try {
+      const changed = await prune(this.db, now, reserve);
+      await this.state.storage.put({ 'retention-attempt': { ...attempt, outcome: 'cleaned', markedParents: changed }, 'retention-paused': false });
+      return changed;
+    }
+    catch {
+      console.error('chat_retention_paused');
+      try { await this.state.storage.put({ 'retention-paused': true, 'retention-attempt': { ...attempt, outcome: 'failed' } }); }
+      catch { console.error('chat_retention_pause_write_failed'); }
+      throw new Error('chat_retention_cleanup_failed');
     }
   }
   async alarm(): Promise<void> {

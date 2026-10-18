@@ -31,14 +31,21 @@ Deployment preparation
 1. Use a dedicated staging Worker and isolated D1 database. Supply your own
    resource identifiers, secrets and PUBLIC_ORIGIN. Verify every R2, D1 and
    Durable Object binding against the deployment identity before any mutation.
-2. Apply the additive 0029_community_chat.sql migration to an isolated local
-   database, then staging. Existing applied migrations must remain unchanged.
+2. Inspect the exact migration ledger and schema, backup/recovery point and
+   quota before applying only the reviewed pending additions, in order:
+   0029_community_chat.sql and 0030_chat_retention.sql. If 0029 is already
+   applied, apply only 0030; if both are applied and their schema matches,
+   apply neither. Unknown, duplicate or partial states must stop the procedure.
+   Rehearse locally before separately authorised staging changes. Preserve all
+   applied filenames and SQL. 0030 builds five indexes and initialises the
+   physical count and visibility floor; estimate cost from actual data size.
 3. Preserve the existing presence-v1 DO migration and append community-chat-v1
    with new_sqlite_classes = ["ChatRoom"]. Bind CHAT to ChatRoom. Do not replace
    PRESENCE or re-use another deployment's namespace.
 4. Validate real HTTP/WebSocket upgrades, two independent authenticated accounts,
    anonymous reading, persistence after restart, session revocation, moderation
-   and alarm-driven expiry in staging. Local tests do not prove remote bindings,
+   and alarm-driven expiry in staging. Also complete the retention acceptance
+   and recovery checklist in docs/chat-retention-recovery.md. Local tests do not prove remote bindings,
    OAuth configuration, service quotas or production migration safety.
 5. Record the exact deployed commit and obtain explicit production approval.
    Existing production release helpers intentionally reject an unexpected DO

@@ -29,7 +29,7 @@ beforeAll(async () => {
         const now=Number(request.headers.get('x-fixture-now'));Date.now=()=>now;
         let alarm=null;const values=new Map();
         const state={setWebSocketAutoResponse(){},getWebSockets(){return []},
-          storage:{async get(key){return values.get(key)},async put(key,value){values.set(key,value)},
+          storage:{async get(key){return values.get(key)},async put(key,value){for(const [k,v] of typeof key==='string'?[[key,value]]:Object.entries(key))values.set(k,v)},
             async getAlarm(){return alarm},async setAlarm(value){alarm=value},async deleteAlarm(){alarm=null}}};
         let batches=0;
         const limit=Number(new URL(request.url).searchParams.get('limit')||'1000');
@@ -118,7 +118,9 @@ function fixture(socketIdentity?: ChatIdentity) {
     getWebSocketAutoResponseTimestamp: () => new Date(Date.now()),
     storage: {
       get: async <T>(key: string) => durable.get(key) as T | undefined,
-      put: async (key: string, value: unknown) => { durable.set(key, value); },
+      put: async (key: string | Record<string, unknown>, value?: unknown) => {
+        for (const [k, v] of typeof key === 'string' ? [[key, value] as const] : Object.entries(key)) durable.set(k, v);
+      },
       getAlarm: async () => alarm,
       setAlarm: async (value: number) => {
         alarm = value;
@@ -145,6 +147,186 @@ const request = (path: string, method = "GET", body?: unknown) =>
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+
+describe('Owner retention recovery', () => {
+  const path = '/api/chat/moderation/retention';
+  async function owner() { await db.prepare("UPDATE users SET role='owner' WHERE id='alice'").run(); }
+  it('protects status and recovery with a live Owner Session', async () => {
+    const f = fixture();
+    for (const role of ['user', 'moderator', 'admin']) {
+      await db.prepare('UPDATE users SET role=? WHERE id=?').bind(role, 'alice').run();
+      expect((await f.room().fetch(request(path))).status).toBe(403);
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(403);
+    }
+    await owner();
+    const status = await f.room().fetch(request(path));
+    expect(status.status).toBe(200);
+    expect(status.headers.get('cache-control')).toBe('no-store');
+    expect(await status.json()).toMatchObject({ paused: false, durablePaused: false, token: null, lastAttempt: null });
+    await db.prepare("DELETE FROM sessions WHERE user_id='alice'").run();
+    expect((await f.room().fetch(request(path))).status).toBe(401);
+    expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(401);
+  });
+  it('recovers one bounded batch, rotates the token and reschedules after reconstruction', async () => {
+    await owner();
+    const f = fixture();
+    await insert('recovery-parent', 0, 1);
+    await db.prepare(`WITH RECURSIVE seq(x)AS(SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<250)
+      INSERT INTO chat_reports(id,message_id,reason,status,created_at) SELECT printf('recovery-%03d',x),'recovery-parent','private reason','resolved',0 FROM seq`).run();
+    await f.state.storage.put('retention-paused', true);
+    const room = f.room();
+    const responses = await Promise.all([0, 1].map(() => room.fetch(request(path, 'POST', { expectedToken: null }))));
+    expect(responses.map(r => r.status).sort()).toEqual([200, 409]);
+    const result = await responses.find(r => r.status === 200)!.json() as any;
+    expect(result).toMatchObject({ paused: false, durablePaused: false, lastAttempt: { outcome: 'recovered', markedParents: 1 } });
+    expect(typeof result.token).toBe('string');
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_reports').first()).toMatchObject({ count: 150 });
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 1 });
+    expect(f.alarm()).toBe(now + 1000);
+    expect(await (await f.room().fetch(request(path))).json()).toEqual(result);
+    expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(409);
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_reports').first()).toMatchObject({ count: 150 });
+    await f.room().alarm();
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_reports').first()).toMatchObject({ count: 50 });
+  });
+  it('keeps a failed attempt paused and refuses replay even after reconstruction', async () => {
+    await owner();
+    await insert('failed-recovery', 0, 1);
+    const f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    await db.prepare("CREATE TRIGGER reject_recovery BEFORE DELETE ON chat_messages BEGIN SELECT RAISE(ABORT,'private failure'); END").run();
+    try {
+      const response = await f.room().fetch(request(path, 'POST', { expectedToken: null }));
+      expect(response.status).toBe(503);
+      const result = await response.json() as any;
+      expect(result).toMatchObject({ paused: true, durablePaused: true, lastAttempt: { outcome: 'failed' } });
+      expect(JSON.stringify(result)).not.toMatch(/private failure|private original|private reason|sessionHash/);
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(409);
+      await db.prepare('DROP TRIGGER reject_recovery').run();
+      await f.room().alarm();
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 1 });
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: result.token }))).status).toBe(200);
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 0 });
+    } finally { await db.prepare('DROP TRIGGER IF EXISTS reject_recovery').run(); }
+  });
+  it('never touches cleanup SQL if persisting the write-ahead pause fails', async () => {
+    await insert('storage-failure', 0, 1);
+    const f = fixture();
+    const put = vi.spyOn(f.state.storage, 'put').mockRejectedValue(new Error('private storage failure'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(f.room().alarm()).rejects.toThrow();
+      await expect(f.room().alarm()).rejects.toThrow();
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 1 });
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_retention_pending').first()).toMatchObject({ count: 0 });
+      expect(log).toHaveBeenCalledWith('chat_retention_pause_write_failed');
+    } finally { put.mockRestore(); log.mockRestore(); }
+  });
+  it('keeps the durable stop if the final unpause write fails after successful cleanup', async () => {
+    await owner();
+    const f = fixture();
+    await insert('unpause-failure', 0, 1);
+    await f.state.storage.put('retention-paused', true);
+    const put = f.state.storage.put;
+    const spy = vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      if (typeof key !== 'string' && key['retention-paused'] === false) throw new Error('private storage failure');
+      await put(key, value);
+    });
+    try {
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(503);
+      expect(await f.state.storage.get('retention-paused')).toBe(true);
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(409);
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 0 });
+    } finally { spy.mockRestore(); }
+  });
+  it('does not execute cleanup if the attempt receipt cannot be saved', async () => {
+    await owner();
+    await insert('receipt-failure', 0, 1);
+    const f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    const put = f.state.storage.put;
+    const spy = vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      if (key === 'retention-attempt') throw new Error('private receipt failure');
+      await put(key, value);
+    });
+    try {
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(503);
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 1 });
+      expect(await f.state.storage.get('retention-paused')).toBe(true);
+    } finally { spy.mockRestore(); }
+  });
+  it('reports unknown status as unavailable rather than claiming retention is healthy', async () => {
+    await owner();
+    const f = fixture();
+    const spy = vi.spyOn(f.state.storage, 'get').mockRejectedValue(new Error('private status failure'));
+    try {
+      const response = await f.room().fetch(request(path));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ error: 'retention_storage_unavailable' });
+    } finally { spy.mockRestore(); }
+  });
+  it('invalidates an earlier approval token when a later automatic cleanup pauses', async () => {
+    await owner();
+    const f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    const first = await (await f.room().fetch(request(path, 'POST', { expectedToken: null }))).json() as any;
+    await insert('later-pause', 0, 1);
+    await db.prepare("CREATE TRIGGER later_failure BEFORE DELETE ON chat_messages BEGIN SELECT RAISE(ABORT,'later failure'); END").run();
+    try {
+      await expect(f.room().alarm()).rejects.toThrow();
+      const status = await (await f.room().fetch(request(path))).json() as any;
+      expect(status.paused).toBe(true);
+      expect(status.token).not.toBe(first.token);
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: first.token }))).status).toBe(409);
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 1 });
+    } finally { await db.prepare('DROP TRIGGER later_failure').run(); }
+  });
+  it('does not repeat SQL after an ambiguous token-consumption write', async () => {
+    await owner();
+    await insert('ambiguous-consume', 0, 1);
+    const f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    const put = f.state.storage.put;
+    const spy = vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      await put(key, value);
+      throw new Error('write committed but acknowledgement lost');
+    });
+    expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(503);
+    spy.mockRestore();
+    expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(409);
+    expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 1 });
+  });
+  it('reasserts pause after an ambiguous final write without repeating SQL', async () => {
+    await owner();
+    await insert('ambiguous-unpause', 0, 1);
+    const f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    const put = f.state.storage.put;
+    const spy = vi.spyOn(f.state.storage, 'put').mockImplementation(async (key, value) => {
+      await put(key, value);
+      if (typeof key !== 'string' && key['retention-paused'] === false) throw new Error('acknowledgement lost');
+    });
+    try {
+      const response = await f.room().fetch(request(path, 'POST', { expectedToken: null }));
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ paused: true, lastAttempt: { outcome: 'failed' } });
+      expect(await db.prepare('SELECT COUNT(*) AS count FROM chat_messages').first()).toMatchObject({ count: 0 });
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(409);
+    } finally { spy.mockRestore(); }
+  });
+  it('keeps pause if recovery cannot reschedule its next alarm', async () => {
+    await owner();
+    await insert('alarm-failure', 0, now + 1000);
+    const f = fixture();
+    await f.state.storage.put('retention-paused', true);
+    const spy = vi.spyOn(f.state.storage, 'setAlarm').mockRejectedValue(new Error('private alarm failure'));
+    try {
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(503);
+      expect(await f.state.storage.get('retention-paused')).toBe(true);
+      expect((await f.room().fetch(request(path, 'POST', { expectedToken: null }))).status).toBe(409);
+    } finally { spy.mockRestore(); }
+  });
+});
 async function insert(id: string, created = now, expires = now + 1000) {
   await db
     .prepare(

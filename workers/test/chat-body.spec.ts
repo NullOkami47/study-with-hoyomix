@@ -88,3 +88,18 @@ it('forwards caller cancellation through the real origin/identity router', async
     expect((await result).status).toBe(400);
     expect(cancelled).toBe(true);
 });
+it('rejects cross-origin retention status and recovery before reaching the coordinator', async () => {
+    const { chatRoute } = await import('../chat/routes');
+    let forwarded = 0;
+    const env = { PUBLIC_ORIGIN: 'https://study.example', CHAT: { idFromName: () => '', get: () => ({ fetch: async () => {
+        forwarded++;
+        return new Response(null, { status: 200 });
+    } }) } } as never;
+    for (const method of ['GET', 'POST']) {
+        const response = await chatRoute(new Request('https://study.example/api/chat/moderation/retention', {
+            method, headers: { origin: 'https://other.example', 'x-chat-identity': '{"role":"owner"}' },
+        }), env);
+        expect(response.status).toBe(403);
+    }
+    expect(forwarded).toBe(0);
+});

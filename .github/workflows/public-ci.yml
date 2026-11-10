@@ -1,0 +1,138 @@
+name: Public CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CI: 'true'
+  WRANGLER_SEND_METRICS: 'false'
+  npm_config_update_notifier: 'false'
+
+jobs:
+  verify:
+    name: Public source validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the exact public event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '>=22.18.0 <23'
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Record public inputs
+        run: |
+          node <<'NODE'
+          const { appendFileSync, readFileSync } = require('node:fs');
+          const { createHash } = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+          const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          const tree = execFileSync('git', ['rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim();
+          if (!/^[0-9a-f]{40}$/.test(head) || head !== process.env.GITHUB_SHA) {
+            throw new Error('Checked-out source does not match the public event commit.');
+          }
+          if (!/^[0-9a-f]{40}$/.test(tree)) throw new Error('Invalid source tree identity.');
+          const [major, minor] = process.versions.node.split('.').map(Number);
+          if (major !== 22 || minor < 18) throw new Error('Node 22.18 or newer within Node 22 is required.');
+          const npm = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim();
+          if (!/^\d+\.\d+\.\d+$/.test(npm)) throw new Error('Unexpected npm version.');
+          const files = [
+            'package.json', 'package-lock.json',
+            'vite.config.ts', 'vitest.config.ts', 'vitest.workers.config.ts',
+            'tsconfig.json', 'tsconfig.node.json', 'wrangler.toml',
+            '.github/workflows/public-ci.yml', 'scripts/public-ci.test.mjs',
+          ];
+          const lines = [
+            '## Public source inputs',
+            '',
+            'This run validates this public repository only. It does not validate a private release candidate or fulfil checks in another repository.',
+            '',
+            `Checked-out commit: \`${head}\``,
+            `Tracked source tree: \`${tree}\``,
+            `Node: \`${process.versions.node}\`; npm: \`${npm}\``,
+            '',
+            'Pull request runs check the event merge commit. Push and manual runs check the event commit.',
+            'Hashes below are captured before dependency installation or generated build output.',
+            '',
+            '| Input | SHA-256 |',
+            '| --- | --- |',
+          ];
+          for (const file of files) {
+            const hash = createHash('sha256').update(readFileSync(file)).digest('hex');
+            lines.push(`| ${file} | \`${hash}\` |`);
+          }
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          NODE
+
+      - name: Check the public CI contract
+        run: node --test scripts/public-ci.test.mjs
+
+      - name: Install the public lockfile
+        run: npm ci --no-audit --no-fund
+
+      - name: Check types
+        run: npm run typecheck
+
+      - name: Test the frontend with the package worker limit
+        run: npm test
+
+      - name: Test Workers with two workers
+        run: npm run test:workers -- --maxWorkers=2
+
+      - name: Build the public app
+        run: npm run build
+
+      - name: Apply migrations to a local D1 database
+        run: npm run d1:migrate:local
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  gate:
+    name: All public checks
+    if: ${{ always() }}
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          node <<'NODE'
+          let results;
+          try {
+            results = JSON.parse(process.env.NEEDS_JSON);
+          } catch {
+            console.error('Public validation results are missing or malformed.');
+            process.exit(1);
+          }
+          if (!results || Object.keys(results).length !== 1 || results.verify?.result !== 'success') {
+            console.error('Public validation must succeed; failure, cancellation and skipping are not accepted.');
+            process.exit(1);
+          }
+          console.log('All public checks succeeded for this public source run.');
+          NODE

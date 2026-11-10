@@ -31,7 +31,7 @@
   <a href="#screenshots">Screenshots</a> •
   <a href="#capabilities">Capabilities</a> •
   <a href="#implemented">Implemented</a> •
-  <a href="#next-release-functions-and-structure">Next Release</a> •
+  <a href="#new-functions-and-structure">New Functions</a> •
   <a href="#planned-features">Planned Features</a> •
   <a href="#tech-stack">Tech Stack</a> •
   <a href="#quick-start">Quick Start</a> •
@@ -122,9 +122,9 @@ This repository is a curated source distribution. The hosted app can run a diffe
 - **QuickJS WASM Runtime (`src/features/player/lx/runtime/`)**: Executes user scripts inside a dedicated module Worker using `quickjs-emscripten-core` and `@jitl/quickjs-wasmfile-release-asyncify` (`0.32.0`), enforcing deterministic memory, stack, call-timeout, and bridged-response limits defined in `protocol.ts`.
 - **ChKSz Personal Credential Support**: Supports user-supplied `chksz_` API keys (registered via `api.chksz.com` with a LinuxDo account) alongside Worker-side SSRF/origin validation (`src/shared/chksz.ts`).
 
-## Next release: functions and structure
+## New functions and structure
 
-The changes below are implemented in the development release candidate. They are **awaiting final verification and a reviewed public-source update**; the application files in this public checkout still represent the earlier source edition. This section documents the new work without implying that it is already deployed or available from a fresh clone. The existing features above describe the public edition.
+The changes below are implemented in the development release line. Some are already part of earlier hosted releases. The remaining integration is **awaiting final verification**, and the combined source is awaiting a **reviewed public-source update**. This public checkout still contains the earlier application source edition. This section documents the new work without implying that it is already deployed or available from a fresh clone. The existing features above describe the public edition.
 
 | Area | New behaviour in the release candidate |
 | :--- | :--- |
@@ -132,6 +132,9 @@ The changes below are implemented in the development release candidate. They are
 | **Track preparation and transitions** | Prepares the next track through the enabled provider fallback chain. Adds **Off**, **Smooth Crossfade** and **Smart Mix** settings; Off remains the default. Transition duration defaults to 5 seconds and can be set from 2–12 seconds. Overlap requires ready media and supported volume control, and cancels on interruption, seeking, backgrounding or stale ownership. Smart Mix analyses existing playback with a deterministic fallback. |
 | **Provider resilience and artwork** | GD Studio can reconcile a mismatched audio MIME label against a recognised container header while retaining URL, redirect, Range and media-ticket validation. Library artwork uses current LX/GD and applicable legacy fallback sources instead of an automatic dependency on the retired Jellyfin service. |
 | **Optional Vkeys QQ Music adapter** | Adds a distinct QQ Music provider with identity matching, media qualification and expiry/recovery handling. It is **disabled by default**. Qualification currently covers MP3 samples; this is not a claim of universal format, region or device support. NetEase playback through this adapter and InnerTube playback were investigated but are not integrated. |
+| **Global LX source management** | Adds an owner-managed registry with immutable script snapshots and content hashes, update/rollback by version, and explicit network-origin approval. Personal imported sources remain separate. Scripts continue to execute inside the bounded QuickJS sandbox. |
+| **Community chat and presence** | Separates chat protocol, storage, moderation and retention into dedicated Worker modules, with responsive and floating chat views, authenticated sending and request deduplication. Presence remains a separate service boundary. |
+| **Workspace polish** | Refines Focus glass surfaces, library artwork fallback and focus-record presentation alongside the playback work. |
 | **Catalogue discovery and review** | Adds deterministic discovery for Genshin Impact, Honkai: Star Rail and Zenless Zone Zero, an Admin discovery inbox, source/identity checks, classification suggestions and a Google Sheets staging/review flow. Canonical track identity remains separate from provider IDs; candidates without a qualified playable source remain candidates rather than silently entering the catalogue. Focus eligibility is independent of whether a track has vocals. |
 | **Optional catalogue automation** | Adds durable row/cycle/staging records for a bounded discover → classify → stage → publish round trip. Automatic processing and automatic publication are separate opt-ins, both **off by default**. Publication rechecks source identity, reviewed changes, catalogue revision and write-budget evidence; uncertain outcomes require reconciliation. No personal AI account or external schedule is implicitly connected. |
 
@@ -142,9 +145,12 @@ The new work is organised around these boundaries. Paths in this table describe 
 | `src/features/player/PlayerBar.vue`, `store.ts`, `preloadPolicy.ts` | Native audio lifecycle, explicit user intent, provider resolution and freshness checks for the prepared next track. |
 | `src/features/player/transitionEngine.ts` | Transition modes, overlap timing, envelopes and cancellation rules. |
 | `src/features/player/providers/vkeys.ts` and `workers/providers/vkeys*.ts` | Client adapter plus server-side identity, media and response-policy checks for the optional provider. |
+| `workers/lx/` and `src/features/player/lx/globalSourceRepository.ts` | Shared source registry, immutable snapshots, client cache and network-origin approval. |
+| `workers/chat/`, `workers/presence.ts` and `src/features/chat/` | Chat routing/protocol, persistence, retention/moderation, presence and responsive views. |
 | `tools/catalog-sync/catalog_sync/discovery.py` | Deterministic discovery inputs and candidate generation. |
 | `src/features/admin/CatalogueDiscovery.vue` | Review inbox, classification and staging controls. |
 | `workers/catalogue/discovery/` | Candidate storage, source qualification, Sheets reconciliation, staging and optional automation/publication. |
+| `migrations/0029_community_chat.sql`–`0031_lx_global_sources.sql` | Chat sending/retention records and the shared LX source registry. |
 | `migrations/0032_catalogue_discovery.sql` and `0033_catalogue_discovery_automation.sql` | Additive discovery and automation ledgers. Schema preparation does not activate automation. |
 
 Release qualification still includes complete source-bound CI and physical-device checks for background transitions, source recovery, manual controls, sleep shutdown, crossfade and installed PWAs. A normal browser run or passing unit tests does not establish all of those behaviours. Public-source synchronisation and production activation are separate reviewed steps.
@@ -351,10 +357,51 @@ study-with-hoyomix/
 
 ## 🙏 Credits
 
-- https://github.com/lladlam/MeloX-Android
-- https://github.com/iyinchao/liquid-glass-studio
-- https://github.com/shshouse/StudyWithMiku
-- [MHub — jizizr/mhub](https://github.com/jizizr/mhub): reference for research into multi-provider resolution, media validation and playback qualification. MHub was reviewed as a research reference; its code is not vendored or included as a dependency in this distribution.
+The public edition contains the incorporated components listed below. Research references informed design or evaluation work; they are not claims of bundled dependencies, shipped candidate features, live-service availability or device acceptance.
+
+### Incorporated foundations and renderer components
+
+- [shshouse/StudyWithMiku](https://github.com/shshouse/StudyWithMiku) — the application baseline from which this project was adapted; retained notices are in [NOTICE](NOTICE) and [third-party notices](docs/THIRD_PARTY_NOTICES.md).
+- [iyinchao/liquid-glass-studio](https://github.com/iyinchao/liquid-glass-studio) — selected renderer and shader components adapted under MIT; retained notices and source mapping are in [the renderer notice](src/features/liquid-glass/NOTICE.md).
+
+### Upstream acknowledgements and compatibility references
+
+- [DIYgod/APlayer](https://github.com/DIYgod/APlayer) — acknowledged by the original StudyWithMiku project; its legacy bundles are not included in this public source edition.
+- [metowolf/Meting](https://github.com/metowolf/Meting) — API/compatibility research reference. The separate @meting/core-based compatibility service is not included in this public source edition.
+
+### Design, architecture and platform research
+
+- [gxxk-dev/StudyWithMiku](https://github.com/gxxk-dev/StudyWithMiku) — reference for Focus records, sessions and PWA design; the local implementation follows its own storage and update model.
+- [WenqiOfficial/StudyWithMiku](https://github.com/WenqiOfficial/StudyWithMiku) — update-strategy research reference; its polling/update implementation was not incorporated.
+- [pdone/lx-music-source](https://github.com/pdone/lx-music-source) — protocol research for independently implemented LX resolver adapters; upstream scripts were not copied wholesale.
+- [guoyue2010/lxmusic-](https://github.com/guoyue2010/lxmusic-) — historical source-provenance research using dated LX mirror snapshots; not a bundled runtime dependency.
+- [lladlam/MeloX-Android](https://github.com/lladlam/MeloX-Android) — reference for third-party music-source disclosure and consent topics; its branding and cloud-control architecture were not adopted.
+- [jizizr/mhub](https://github.com/jizizr/mhub) — research reference for multi-provider resolution, media validation and playback qualification; its code is not vendored or added as a dependency.
+- [qier222/YesPlayMusic](https://github.com/qier222/YesPlayMusic) — NetEase resolver and player-architecture feasibility reference; no application code was incorporated.
+- [metowolf/MetingJS](https://github.com/metowolf/MetingJS) — browser-player integration research reference; not incorporated into the Worker-only provider architecture.
+- [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) — resolver API feasibility research; not shipped as a provider or dependency in this public edition.
+- [sxhxliang/gpui-liquid-glass](https://github.com/sxhxliang/gpui-liquid-glass) — design reference for backdrop ownership, layering, lifecycle cleanup and readable fallbacks; native code was not ported.
+- [lucaperullo/simple-liquid-glass](https://github.com/lucaperullo/simple-liquid-glass) — evaluated renderer/Web Component alternative that informed CSP and backdrop-ownership decisions; no source was incorporated.
+- [gentpan/liquidglass](https://github.com/gentpan/liquidglass) — source-review reference for refraction and fallback approaches; no source was incorporated.
+- [regosen/Gapless-5](https://github.com/regosen/Gapless-5) — research reference for preload readiness, fade envelopes and cleanup; not a runtime dependency.
+- [subframe7536/audio0](https://github.com/subframe7536/audio0) — research reference for queue-aware preparation, listener cleanup and Media Session lifecycle; not a runtime dependency.
+- [goldfire/howler.js](https://github.com/goldfire/howler.js) — research reference for media fallback, pooling/unlock and fade cancellation; not a runtime dependency.
+- [meyda/meyda](https://github.com/meyda/meyda) — research reference for bounded audio-feature sampling; no Meyda dependency or FFT/BPM pipeline was added.
+- [monochrome-music/monochrome](https://github.com/monochrome-music/monochrome) — reference for guarded synchronous handoff on the existing audio element; in particular [PR #558](https://github.com/monochrome-music/monochrome/pull/558), studied during background-playback work. It was not vendored or treated as device-acceptance proof.
+- [phiamo/capacitor-plugin-playlist](https://github.com/phiamo/capacitor-plugin-playlist) — native playlist and background-audio feasibility reference; no plugin or native application was integrated.
+- [androidx/media](https://github.com/androidx/media) — platform research for MediaSessionService and native background-audio lifecycle; not a dependency of this web app.
+- [WebKit/WebKit](https://github.com/WebKit/WebKit) — source and behaviour research on background media, volume handling and platform limits; no WebKit code was incorporated.
+- [TeamPiped/Piped-Backend](https://github.com/TeamPiped/Piped-Backend), [OpenAPI](https://github.com/TeamPiped/OpenAPI) and [documentation](https://github.com/TeamPiped/documentation) — API schema and stream-response research for the independent provider adapter; the Piped frontend and backend are not bundled.
+- [iv-org/invidious](https://github.com/iv-org/invidious) — API and audio-stream contract research for an independently implemented bounded provider adapter; server code was not bundled.
+
+### Historical development tooling
+
+- [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) — historical media-preparation metadata tooling recorded in earlier work; not bundled with this public source edition.
+
+
+The actual browser sandbox dependency is [justjake/quickjs-emscripten](https://github.com/justjake/quickjs-emscripten). Other shipped dependency notices, including Mediabunny and OpenCC, are maintained in [third-party notices](docs/THIRD_PARTY_NOTICES.md) and the retained licence texts.
+
+These acknowledgements record the role established by source and research records. Similar project names or a link appearing inside another project do not by themselves establish use.
 
 <a id="links"></a>
 <a id="en-links"></a>

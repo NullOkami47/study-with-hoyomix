@@ -1,7 +1,7 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { Log, LogLevel, Miniflare } from './miniflare-compat'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { issueSession } from '../auth/session'
 import type { Database } from '../db'
@@ -49,6 +49,8 @@ describe('IDOR and cross-user resource isolation', () => {
   let userBToken: string
 
   beforeEach(async () => {
+    // Session issuance and request validation must share the fixture clock.
+    vi.spyOn(Date, 'now').mockReturnValue(NOW)
     miniflare = new Miniflare({
       compatibilityDate: '2025-12-01',
       modules: true,
@@ -77,6 +79,7 @@ describe('IDOR and cross-user resource isolation', () => {
   })
 
   afterEach(async () => {
+    vi.restoreAllMocks()
     await miniflare.dispose()
   })
 

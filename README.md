@@ -31,6 +31,7 @@
   <a href="#screenshots">Screenshots</a> •
   <a href="#capabilities">Capabilities</a> •
   <a href="#implemented">Implemented</a> •
+  <a href="#next-release-functions-and-structure">Next Release</a> •
   <a href="#planned-features">Planned Features</a> •
   <a href="#tech-stack">Tech Stack</a> •
   <a href="#quick-start">Quick Start</a> •
@@ -121,20 +122,43 @@ This repository is a curated source distribution. The hosted app can run a diffe
 - **QuickJS WASM Runtime (`src/features/player/lx/runtime/`)**: Executes user scripts inside a dedicated module Worker using `quickjs-emscripten-core` and `@jitl/quickjs-wasmfile-release-asyncify` (`0.32.0`), enforcing deterministic memory, stack, call-timeout, and bridged-response limits defined in `protocol.ts`.
 - **ChKSz Personal Credential Support**: Supports user-supplied `chksz_` API keys (registered via `api.chksz.com` with a LinuxDo account) alongside Worker-side SSRF/origin validation (`src/shared/chksz.ts`).
 
+## Next release: functions and structure
+
+The changes below are implemented in the development release candidate. They are **awaiting final verification and a reviewed public-source update**; the application files in this public checkout still represent the earlier source edition. This section documents the new work without implying that it is already deployed or available from a fresh clone. The existing features above describe the public edition.
+
+| Area | New behaviour in the release candidate |
+| :--- | :--- |
+| **Background playback and recovery** | Keeps a stable active audio element through natural track handoff on Android, rejects stale preparation/recovery replies, and preserves explicit Play, Pause, Seek, Next and Previous intent. Apple mobile WebKit avoids the zero-volume preroll that caused incorrect media timing. Source failures use bounded recovery; Pause, Stop and sleep expiry must not be undone by late replies. |
+| **Track preparation and transitions** | Prepares the next track through the enabled provider fallback chain. Adds **Off**, **Smooth Crossfade** and **Smart Mix** settings; Off remains the default. Transition duration defaults to 5 seconds and can be set from 2–12 seconds. Overlap requires ready media and supported volume control, and cancels on interruption, seeking, backgrounding or stale ownership. Smart Mix analyses existing playback with a deterministic fallback. |
+| **Provider resilience and artwork** | GD Studio can reconcile a mismatched audio MIME label against a recognised container header while retaining URL, redirect, Range and media-ticket validation. Library artwork uses current LX/GD and applicable legacy fallback sources instead of an automatic dependency on the retired Jellyfin service. |
+| **Optional Vkeys QQ Music adapter** | Adds a distinct QQ Music provider with identity matching, media qualification and expiry/recovery handling. It is **disabled by default**. Qualification currently covers MP3 samples; this is not a claim of universal format, region or device support. NetEase playback through this adapter and InnerTube playback were investigated but are not integrated. |
+| **Catalogue discovery and review** | Adds deterministic discovery for Genshin Impact, Honkai: Star Rail and Zenless Zone Zero, an Admin discovery inbox, source/identity checks, classification suggestions and a Google Sheets staging/review flow. Canonical track identity remains separate from provider IDs; candidates without a qualified playable source remain candidates rather than silently entering the catalogue. Focus eligibility is independent of whether a track has vocals. |
+| **Optional catalogue automation** | Adds durable row/cycle/staging records for a bounded discover → classify → stage → publish round trip. Automatic processing and automatic publication are separate opt-ins, both **off by default**. Publication rechecks source identity, reviewed changes, catalogue revision and write-budget evidence; uncertain outcomes require reconciliation. No personal AI account or external schedule is implicitly connected. |
+
+The new work is organised around these boundaries. Paths in this table describe the **candidate structure** and will become navigable after the reviewed source update:
+
+| Module or directory | Responsibility |
+| :--- | :--- |
+| `src/features/player/PlayerBar.vue`, `store.ts`, `preloadPolicy.ts` | Native audio lifecycle, explicit user intent, provider resolution and freshness checks for the prepared next track. |
+| `src/features/player/transitionEngine.ts` | Transition modes, overlap timing, envelopes and cancellation rules. |
+| `src/features/player/providers/vkeys.ts` and `workers/providers/vkeys*.ts` | Client adapter plus server-side identity, media and response-policy checks for the optional provider. |
+| `tools/catalog-sync/catalog_sync/discovery.py` | Deterministic discovery inputs and candidate generation. |
+| `src/features/admin/CatalogueDiscovery.vue` | Review inbox, classification and staging controls. |
+| `workers/catalogue/discovery/` | Candidate storage, source qualification, Sheets reconciliation, staging and optional automation/publication. |
+| `migrations/0032_catalogue_discovery.sql` and `0033_catalogue_discovery_automation.sql` | Additive discovery and automation ledgers. Schema preparation does not activate automation. |
+
+Release qualification still includes complete source-bound CI and physical-device checks for background transitions, source recovery, manual controls, sleep shutdown, crossfade and installed PWAs. A normal browser run or passing unit tests does not establish all of those behaviours. Public-source synchronisation and production activation are separate reviewed steps.
+
 <a id="planned-features"></a>
 <a id="en-planned-features"></a>
 
-## 🗂️ Planned Features (Creating New Folder...)
+## Planned work
 
-- **Chatroom**: Real-time study lounge chatroom & interactive community features
-- **More Tracks (including Fan-Made Music)**: Expanded soundtrack selection including fan-made arrangements
-- **More Third-Party Music Providers**: Add support for more third-party music providers, such as LX Music
-- **Better Liquid Glass UI**: Enhanced optical refraction shaders, surface depth, and visual polish
-- **ZZZ TV UI Style**: Zenless Zone Zero CRT / TV-array inspired retro-futuristic interface theme
-- **Genshin Impact UI Style**: A Genshin Impact-inspired interface theme
-- **Honkai: Star Rail UI Style**: A Honkai: Star Rail-inspired interface theme
-- **Smooth Transitions **: Seamless audio crossfades and visual transitions across tracks and scenes
-- **Smart Mixing **: Intelligent tempo/envelope-aware track mixing (AutoMix)
+- Complete release qualification and the reviewed public-source update for the implemented changes above.
+- Expand the catalogue, including eligible fan-made arrangements, after source and redistribution-rights review.
+- Improve Liquid Glass rendering, surface depth and visual polish.
+- Explore Zenless Zone Zero TV/CRT, Genshin Impact and Honkai: Star Rail interface themes.
+- Qualify additional music providers and formats before enabling them.
 
 <a id="tech-stack"></a>
 <a id="en-tech-stack"></a>
@@ -330,6 +354,7 @@ study-with-hoyomix/
 - https://github.com/lladlam/MeloX-Android
 - https://github.com/iyinchao/liquid-glass-studio
 - https://github.com/shshouse/StudyWithMiku
+- [MHub — jizizr/mhub](https://github.com/jizizr/mhub): reference for research into multi-provider resolution, media validation and playback qualification. MHub was reviewed as a research reference; its code is not vendored or included as a dependency in this distribution.
 
 <a id="links"></a>
 <a id="en-links"></a>

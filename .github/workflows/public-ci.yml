@@ -96,8 +96,8 @@ jobs:
       - name: Check types
         run: npm run typecheck
 
-      - name: Test the frontend with two workers
-        run: npm test -- --maxWorkers=2
+      - name: Test the frontend with the package worker limit
+        run: npm test
 
       - name: Test Workers with two workers
         run: npm run test:workers -- --maxWorkers=2

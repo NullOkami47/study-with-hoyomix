@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/NullOkami47/study-with-hoyomix/actions/workflows/public-ci.yml"><img src="https://github.com/NullOkami47/study-with-hoyomix/actions/workflows/public-ci.yml/badge.svg?branch=main" alt="Public CI on main" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg?style=flat-square" alt="License: GPL-3.0" /></a>
   <a href="https://github.com/NullOkami47/study-with-hoyomix/commits/main"><img src="https://img.shields.io/github/last-commit/NullOkami47/study-with-hoyomix/main?style=flat-square" alt="GitHub last commit" /></a>
   <a href="https://github.com/NullOkami47/study-with-hoyomix/stargazers"><img src="https://img.shields.io/github/stars/NullOkami47/study-with-hoyomix?style=flat-square" alt="GitHub stars" /></a>
@@ -33,6 +34,7 @@
   <a href="#planned-features">Planned Features</a> •
   <a href="#tech-stack">Tech Stack</a> •
   <a href="#quick-start">Quick Start</a> •
+  <a href="#continuous-integration">Continuous Integration</a> •
   <a href="#project-layout">Project Layout</a> •
   <a href="#credits">Credits</a> •
   <a href="#links">Links</a> •
@@ -48,6 +50,8 @@
 **Study with HOYO-MiX** ([`NullOkami47/study-with-hoyomix`](https://github.com/NullOkami47/study-with-hoyomix)) is the public open-source release of [`NullOkami47/hoyomix_web_player`](https://github.com/NullOkami47/hoyomix_web_player) — a calm, dark-mode study and focus web workspace built around a WebGPU / WebGL2 / CSS **Liquid Glass** interface, durable Pomodoro & sleep timers, multi-provider playback orchestration, anonymous-first local `IndexedDB` storage with optional OAuth cloud sync, and a Cloudflare Workers + D1 + R2 + Durable Objects edge backend.
 
 The public production app is **[Study with HOYO-MiX](https://app.study-with-hoyomix.workers.dev)**, served by the Cloudflare Worker `app`.
+
+This repository is a curated source distribution. The hosted app can run a different revision: the CI badge describes the public `main` branch, not the production deployment. Private operational records, deployment identities and unpublished release candidates are not included.
 
 - [Build & Local Setup Guide (`BUILDING.txt`)](https://github.com/NullOkami47/study-with-hoyomix/blob/main/BUILDING.txt)
 - [Source & Licence Notices (`NOTICE`)](https://github.com/NullOkami47/study-with-hoyomix/blob/main/NOTICE)
@@ -156,7 +160,7 @@ The public production app is **[Study with HOYO-MiX](https://app.study-with-hoyo
 
 #### 1. Prerequisites
 
-- **Node.js** `22.18.0` or newer (**Node.js 24 LTS** recommended)
+- **Node.js** `22.18.0` or newer; public CI verifies the Node.js 22 line
 - **npm** (bundled with Node.js)
 - **Git**
 
@@ -205,7 +209,7 @@ The install icons are stored in Git as text-only Base64 sources (`scripts/pwa-ic
 Run the decoder directly when you need the raster files:
 
 ```bash
-npm run generate:pwa-icons
+node scripts/generate-pwa-icons.mjs
 ```
 
 `npm run dev` and `npm run build` run the decoder automatically. The decoder validates the Base64 syntax, PNG signature, declared dimensions, and SHA-256 digest before writing `public/pwa-icon-192.png` and `public/pwa-icon-512.png`.
@@ -232,8 +236,27 @@ Open `http://localhost:8787`. The checked-in `wrangler.toml` identifies local re
 Because the public release deliberately ships with an empty catalogue and background list:
 
 - **Music Catalogue**: Populate `src/features/catalog/catalog.production.json` (and `catalog.sample.json`) conforming to `src/features/catalog/schema.ts`, or administer catalogue revisions and optional Google Sheets imports through `workers/catalogue/`. To regenerate the optional Han folding table after adding catalogue text, run `node scripts/generate-han-fold-table.mjs`.
-- **Music Providers**: Configure opt-in server-side providers in `src/features/player/providers/registry.ts`, `workers/providers/routing.ts`, `workers/providers/config.ts`, and `workers/index.ts` with your own Jellyfin, R2, or resolver resources.
+- **Music Providers**: Configure opt-in server-side providers in `src/features/player/providers/registry.ts`, `workers/providers/routing.ts`, `workers/providers/config.ts`, and `workers/index.ts` with your own authorised R2 or supported resolver resources. Jellyfin is retired from the hosted service; legacy source references do not imply an active service.
 - **Background Stage**: To add redistributable static backgrounds, update `src/features/backgrounds/staticDefinitions.ts` and place the referenced files under `public/`. Uploaded dynamic backgrounds require an explicitly configured `BACKGROUND_BUCKET` R2 binding.
+
+## Continuous integration
+
+[Public CI](https://github.com/NullOkami47/study-with-hoyomix/actions/workflows/public-ci.yml) runs for pull requests into `main`, pushes to `main`, and manual dispatch. It uses standard GitHub-hosted Ubuntu 24.04 runners and Node.js 22.
+
+The workflow installs the public lockfile, checks types, runs the complete public frontend and Worker test suites, builds the app, applies migrations to an ephemeral local D1 database, and checks production dependencies for high or critical vulnerabilities. Frontend tests retain their existing three-worker limit; Worker tests use two workers. The jobs request read-only repository access and use no deployment secrets, self-hosted runner, dependency cache or uploaded artifact.
+
+The job summary records the tested commit/tree, tool versions and input hashes before the build. `All public checks` passes only when validation succeeds; failed, cancelled or skipped validation is rejected. See [the CI guide](docs/public-ci.md) for exact commands, action pins and the result gate.
+
+To run the application checks locally:
+
+```sh
+npm ci
+npm run verify
+npm run d1:migrate:local
+npm audit --omit=dev --audit-level=high
+```
+
+These checks cover the source and synthetic fixtures published here. They do not demonstrate live provider availability, audible background playback on physical devices, production readiness, or equivalence with an unpublished candidate. The supplied catalogue and background definitions remain empty by default.
 
 <a id="project-layout"></a>
 <a id="en-project-layout"></a>
@@ -242,6 +265,7 @@ Because the public release deliberately ships with an empty catalogue and backgr
 
 ```text
 study-with-hoyomix/
+├── .github/workflows/public-ci.yml # Public hosted validation and success gate
 ├── docs/
 │   ├── licenses/                 # MIT, Apache-2.0 & runtime dependency licence texts
 │   └── THIRD_PARTY_NOTICES.md    # Upstream & third-party attribution notices

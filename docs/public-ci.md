@@ -7,7 +7,7 @@ One standard `ubuntu-24.04` runner uses Node `>=22.18.0 <23` and runs these chec
 1. Record the exact checkout commit/tree, actual Node/npm versions, and ten input SHA-256 hashes in the job summary, before dependency installation or build generation.
 2. Run `node --test scripts/public-ci.test.mjs`.
 3. Install with `npm ci --no-audit --no-fund` and run `npm run typecheck`.
-4. Run `npm test -- --maxWorkers=2` and `npm run test:workers -- --maxWorkers=2`.
+4. Run `npm test` with its existing three-worker limit and `npm run test:workers -- --maxWorkers=2`. The frontend script already supplies its limit; passing the option again is rejected by Vitest.
 5. Run `npm run build` and `npm run d1:migrate:local` against an ephemeral local D1 database.
 6. Run `npm audit --omit=dev --audit-level=high`. High/critical production findings or registry errors fail validation; lower severities remain visible. Advisory results can change without a source change.
 

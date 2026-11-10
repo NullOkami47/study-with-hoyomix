@@ -12,7 +12,7 @@ const commands = [
   'node --test scripts/public-ci.test.mjs',
   'npm ci --no-audit --no-fund',
   'npm run typecheck',
-  'npm test -- --maxWorkers=2',
+  'npm test',
   'npm run test:workers -- --maxWorkers=2',
   'npm run build',
   'npm run d1:migrate:local',
@@ -104,3 +104,10 @@ test('the actual gate code rejects every non-success result and missing/extra jo
     assert.equal(child.status, expected, `gate result for ${JSON.stringify(results)}: ${child.stderr}`)
   }
 })
+
+test('frontend invocation preserves the existing single worker limit', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.match(pkg.scripts.test, /--maxWorkers=3$/);
+  assert.match(verify, /run: npm test\n/);
+  assert.doesNotMatch(verify, /run: npm test --/);
+});

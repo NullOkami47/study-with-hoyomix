@@ -14,8 +14,10 @@ import { IMPLEMENTED_LX_PROVIDER_IDS, type ProviderEnv } from './providers/confi
 import { getBuildInfo } from './buildInfo'
 import { presenceRoute, type PresenceEnv } from './presence'
 export { OnlinePresence } from './presence'
+import { chatRoute, type ChatEnv } from './chat/routes'
+export { ChatRoom } from './chat/ChatRoom'
 
-interface AppEnv extends AuthEnv, ProviderEnv, BackgroundEnv, CatalogueEnv, PresenceEnv {
+interface AppEnv extends AuthEnv, ProviderEnv, BackgroundEnv, CatalogueEnv, PresenceEnv, ChatEnv {
   API_PROXY_SECRET?: string
   BACKEND_ORIGIN?: string
   PROXY_FRONTEND_ORIGIN?: string
@@ -60,6 +62,7 @@ export const applyApiSecurityHeaders = (response: Response): Response => {
 
 const routeRequest = (request: Request, env: AppEnv): Promise<Response> => {
   const path = new URL(request.url).pathname
+  if (path === '/api/chat' || path.startsWith('/api/chat/')) return chatRoute(request, env)
   if (path === '/api/presence' || path === '/api/presence/visitor') return presenceRoute(request, env)
   if (path === '/api/build-info' || path === '/api/version') {
     return Promise.resolve(Response.json(getBuildInfo(), {
@@ -90,6 +93,12 @@ export default {
   async fetch(request: Request, env: AppEnv): Promise<Response> {
     const incoming = await authenticateProxyIngress(request, env)
     const response = incoming instanceof Response ? incoming : await routeRequest(incoming, env)
+    if (!(incoming instanceof Response) && incoming.method === 'POST' && response.ok &&
+      ['/api/logout', '/api/logout-all', '/api/account/delete'].includes(new URL(incoming.url).pathname) && env.CHAT) {
+      try {
+        await env.CHAT.get(env.CHAT.idFromName('global')).fetch(new Request('https://chat.internal/revalidate', { method: 'POST' }))
+      } catch { /* Every subsequent chat operation still validates the committed session state. */ }
+    }
     if (!(incoming instanceof Response) && incoming.method === 'POST' && response.ok &&
       ['/api/logout', '/api/logout-all', '/api/account/delete'].includes(new URL(incoming.url).pathname) && env.PRESENCE) {
       // Revocation is already committed. Refresh every Owner session, including other tabs/devices.

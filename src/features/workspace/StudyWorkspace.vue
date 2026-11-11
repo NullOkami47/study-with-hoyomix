@@ -5,7 +5,7 @@ import { createCatalogFilterState } from '../catalog/filterState'
 import { CatalogRepository } from '../catalog/repository'
 import { runtimeCatalog } from '../catalog/runtimeCatalog'
 import { loadRemoteCatalog } from '../catalog/remoteCatalog'
-import ChatAvailability from '../chat/ChatAvailability.vue'
+import ChatPanel from '../chat/ChatPanel.vue'
 import FloatingChatWindow from '../chat/FloatingChatWindow.vue'
 import { getDefaultBackgroundStore } from '../backgrounds/store'
 import BackgroundSwitcher from '../backgrounds/BackgroundSwitcher.vue'
@@ -91,6 +91,7 @@ const controlCentreSection = ref<ControlCentreSection>('focus')
  * only through the explicit open and close commands; only its layout is persisted.
  */
 const chatOpen = ref(false)
+const chatDraft = ref('')
 const chatWindow = ref<InstanceType<typeof FloatingChatWindow>>()
 // Set for exactly one hub close: the "Focus chat window" command. Not reactive, because
 // nothing renders from it -- it only tells the closing hub where focus belongs.
@@ -492,7 +493,7 @@ onBeforeUnmount(() => {
       constrain-to-available-space
       @close="closeChatWindow"
     >
-      <ChatAvailability />
+      <ChatPanel v-model:draft="chatDraft" :tracks="catalogue.tracks" :current-track="player.currentTrack.value" @play="player.playNow" @enqueue="player.enqueue" @account="controlCentreSection = 'account'; controlCentreOpen = true" />
     </FloatingChatWindow>
     <!-- Queue is rendered after chat at the same workspace layer so opening it gives
          the standalone queue ownership of overlapping pointer targets without making it modal. -->

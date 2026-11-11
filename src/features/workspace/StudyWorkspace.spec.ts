@@ -1057,7 +1057,7 @@ describe('StudyWorkspace', () => {
       global: { stubs: workspaceStubs },
     })
 
-    // A fresh load keeps the unfinished chat out of the resting scene.
+    // A fresh load keeps chat out of the resting scene.
     expect(wrapper.find('[data-floating-chat]').exists()).toBe(false)
 
     await openSection(wrapper, 'chat')
@@ -1075,7 +1075,8 @@ describe('StudyWorkspace', () => {
     expect(wrapper.find('[data-control-centre-open-chat]').exists()).toBe(false)
     // One chat surface: the hub offers an action on the floating window rather than
     // mounting a second live chat inside itself.
-    expect(wrapper.findAll('[data-chat-availability]')).toHaveLength(2)
+    expect(wrapper.findAll('[data-chat-panel]')).toHaveLength(1)
+    expect(wrapper.find('[data-control-centre-panel] [data-chat-panel]').exists()).toBe(false)
 
     // Focus lands on the window itself rather than on a control inside it, so the user
     // arrives at the top of the window and tabs in from there.

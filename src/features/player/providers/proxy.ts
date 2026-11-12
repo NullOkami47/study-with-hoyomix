@@ -12,6 +12,8 @@ const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024
 export interface ServerProxyProviderOptions {
   fetch?: typeof fetch
   validateExternalId?: (value: string) => boolean
+  /** Preserve a validated effective ticket deadline only for providers using that contract. */
+  includeExpiry?: boolean
   requestHeaders?: () => HeadersInit | undefined
   /**
    * Extra fields merged into the resolve request body alongside `externalId`.
@@ -24,6 +26,7 @@ export interface ServerProxyProviderOptions {
 }
 
 interface ProxyAudioResponse {
+  expiresAt?: unknown
   mimeType: string
   url: string
   metadata?: unknown
@@ -173,6 +176,7 @@ function validatePlayable(
   origin: URL,
   mediaPathPrefix: string,
   externalId: string,
+  includeExpiry = false,
 ): Playable {
   if (typeof value !== 'object' || value === null) {
     throw new ProviderResolveError('invalid_response')
@@ -217,6 +221,14 @@ function validatePlayable(
     throw new ProviderResolveError('invalid_response')
   }
 
+  let expiresAt: number | undefined
+  if (includeExpiry && 'expiresAt' in response) {
+    if (typeof response.expiresAt !== 'number' || !Number.isSafeInteger(response.expiresAt) || response.expiresAt <= 0) {
+      throw new ProviderResolveError('invalid_response')
+    }
+    expiresAt = response.expiresAt
+  }
+
   let metadata: PlaybackPresentationMetadata | undefined
   if ('metadata' in response && typeof response.metadata === 'object' && response.metadata !== null) {
     const rawMeta = response.metadata as Record<string, unknown>
@@ -235,6 +247,7 @@ function validatePlayable(
     mimeType: response.mimeType.toLowerCase(),
     url: playbackUrl.toString(),
     ...(metadata ? { metadata } : {}),
+    ...(expiresAt === undefined ? {} : { expiresAt }),
   }
 }
 
@@ -279,7 +292,8 @@ async function proxyFetch(
     if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
       throw abortReason(signal)
     }
-    throw new ProviderResolveError('unavailable')
+    // A dropped request says nothing about the track (task 41.7).
+    throw new ProviderResolveError('unavailable', { transient: true })
   }
 }
 
@@ -334,11 +348,13 @@ export function createServerProxyProvider(
       if (response.status === 429) throw new ProviderResolveError('rate_limited')
       if (!response.ok) {
         const code = await parseFailureCode(response)
-        throw new ProviderResolveError(code ?? (response.status === 504 ? 'timeout' : 'unavailable'))
+        const resolved = code ?? (response.status === 504 ? 'timeout' : 'unavailable')
+        // A 5xx outage reported as `unavailable` may answer on a retry (task 41.7).
+        throw new ProviderResolveError(resolved, { transient: response.status >= 500 && resolved === 'unavailable' })
       }
 
       const body = await parseJsonResponse(response, DEFAULT_MAX_RESPONSE_BYTES)
-      return validatePlayable(body, origin, mediaPathPrefix, source.externalId)
+      return validatePlayable(body, origin, mediaPathPrefix, source.externalId, options.includeExpiry === true)
     },
   }
 }

@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config'
+import { concurrencyBudget } from './scripts/ci-runner-budget.mjs'
 
 /**
  * Concurrency is pinned deliberately instead of being derived from the host CPU count.
@@ -18,11 +19,14 @@ import { defineConfig } from 'vitest/config'
  * also what the 4-vCPU CI runner already derives, so pinning it costs nothing in CI while stopping
  * the default from scaling into the measured-unstable region on hosts with more CPUs.
  *
- * `minThreads` must be pinned too: Vitest defaults it to the same CPU-derived count, and a
- * `maxThreads` below that default makes Tinypool reject the pair with
- * "options.minThreads and options.maxThreads must not conflict".
+ * Those measurements were taken with Vitest 0.34's threads pool. Vitest 5 runs each file in a
+ * forked Node process (`maxWorkers`), which costs more memory per slot, so the self-hosted WSL
+ * runner (4 GB) uses 2 slots while hosted runners and local runs keep 3. The value comes from the
+ * CI_RUNNER_PROFILE helper; see `workerTests` in scripts/ci-runner-budget.mjs for the evidence.
  */
-const MEASURED_STABLE_THREADS = 3
+const workerSlots = concurrencyBudget('workerTests')
+// CI sets VITEST_JSON_REPORT to keep per-test durations as a run artefact (P95-06).
+const jsonReport = process.env.VITEST_JSON_REPORT
 
 export default defineConfig({
   test: {
@@ -30,7 +34,7 @@ export default defineConfig({
     include: ['workers/test/**/*.spec.ts'],
     testTimeout: 60_000,
     hookTimeout: 60_000,
-    maxWorkers: MEASURED_STABLE_THREADS,
-
+    maxWorkers: workerSlots,
+    ...(jsonReport ? { reporters: ['default', 'json'], outputFile: { json: jsonReport } } : {}),
   },
 })

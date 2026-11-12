@@ -6,13 +6,14 @@ import { ProviderRegistry } from './providers/registry'
 import type { AudioProvider } from './providers/types'
 import type { ResolveOptions, ResolveResult } from './resolver'
 
-const tracks = ['a', 'b', 'c'].map((id) => ({ id, title: id, sources: [{ provider: 'jellyfin', externalId: `item-${id}` }] } as Track))
-const success = (track: Track): ResolveResult => ({ ok: true, providerId: 'jellyfin', playable: { kind: 'audio', url: `https://media.invalid/jellyfin/${track.id}.mp3`, mimeType: 'audio/mpeg' }, attempts: [] })
+const tracks = ['a', 'b', 'c'].map((id) => ({ id, title: id, sources: [{ provider: 'gd-studio', externalId: `netease:${id}:320` }] } as Track))
+const success = (track: Track): ResolveResult => ({ ok: true, providerId: 'gd-studio', playable: { kind: 'audio', url: `https://media.invalid/gd-studio/${track.id}.mp3`, mimeType: 'audio/mpeg' }, attempts: [] })
 async function setup(resolve = vi.fn(async (track: Track) => success(track))) {
   const store = createPlaybackStore({ resolve })
   store.reconcileUpcomingQueue(tracks)
   await store.prepareQueueIndex(0)
   store.setPreloadPolicy('auto')
+  await store.armNextPreparation()
   await flushPromises()
   return { store, resolve }
 }
@@ -20,7 +21,7 @@ async function setup(resolve = vi.fn(async (track: Track) => success(track))) {
 beforeEach(() => window.localStorage.setItem('hoyomix-player-shuffle-v1', 'false'))
 
 describe('isolated next-track preparation', () => {
-  it('resolves only the next Jellyfin item without mutating active state or intent', async () => {
+  it('resolves only the next third-party item inside the lead window without mutating active state or intent', async () => {
     const { store, resolve } = await setup()
     expect(resolve.mock.calls.map(([track]) => track.id)).toEqual(['a', 'b'])
     expect(store.preparedNext.value?.track).toBe(tracks[1])
@@ -37,14 +38,12 @@ describe('isolated next-track preparation', () => {
     const prepared = store.preparedNext.value
     await store.next()
     await flushPromises()
-    // 'b' is resolved once by the warm-up and then *adopted* at the transition, so the resolve that
-    // used to happen exactly when the track had to start no longer happens at all. 'c' is the new
-    // next track, prepared once the index moved.
-    expect(resolve.mock.calls.map(([track]) => track.id)).toEqual(['a', 'b', 'c'])
+    // The already prepared result is adopted; 'c' waits for its own bounded lead window.
+    expect(resolve.mock.calls.map(([track]) => track.id)).toEqual(['a', 'b'])
     expect(store.preloadHandoff.value?.id).toBe(prepared?.id)
     expect(store.preloadHandoff.value?.generation).toBe(store.playbackGeneration.value)
     expect(store.playable.value).toEqual(prepared?.playable)
-    expect(store.activeProviderId.value).toBe('jellyfin')
+    expect(store.activeProviderId.value).toBe('gd-studio')
     expect(store.status.value).toBe('ready')
     store.releasePreloadHandoff(store.playbackGeneration.value - 1)
     expect(store.preloadHandoff.value).not.toBeNull()
@@ -75,7 +74,7 @@ describe('isolated next-track preparation', () => {
     store.dispose()
   })
 
-  it('waits for an in-flight speculative resolve instead of resolving the same next track twice', async () => {
+  it('waits for an in-flight third-party resolve instead of resolving the same next track twice', async () => {
     let finish: ((result: ResolveResult) => void) | undefined
     const resolve = vi.fn(async (track: Track): Promise<ResolveResult> =>
       track.id === 'b' ? new Promise(settle => { finish = settle }) : success(track))
@@ -83,13 +82,14 @@ describe('isolated next-track preparation', () => {
     store.reconcileUpcomingQueue(tracks)
     await store.prepareQueueIndex(0)
     store.setPreloadPolicy('auto')
+    const pending = store.armNextPreparation()
     await flushPromises()
     expect(resolve.mock.calls.filter(([track]) => track.id === 'b')).toHaveLength(1)
 
     const armed = store.armNextPreparation()
     expect(resolve.mock.calls.filter(([track]) => track.id === 'b')).toHaveLength(1)
     finish?.(success(tracks[1]))
-    await armed
+    await Promise.all([armed, pending])
     expect(store.preparedNext.value?.armed).toBe(true)
     store.dispose()
   })
@@ -151,6 +151,7 @@ describe('isolated next-track preparation', () => {
       store.reconcileUpcomingQueue(tracks)
       await store.prepareQueueIndex(0)
       store.setPreloadPolicy('auto')
+      const pending = store.armNextPreparation()
       await flushPromises()
       if (change === 'reorder') store.moveQueueItem(1, 2)
       if (change === 'remove') store.removeQueueIndex(1)
@@ -163,6 +164,7 @@ describe('isolated next-track preparation', () => {
       if (change === 'dispose') store.dispose()
       expect(signals[0]?.aborted).toBe(true)
       finishers[0]?.(success(tracks[1]))
+      await pending
       await flushPromises()
       expect(store.preparedNext.value?.track).not.toBe(tracks[1])
       expect(store.currentTrack.value?.id).toBe(change === 'clear' ? undefined : 'a')
@@ -170,10 +172,10 @@ describe('isolated next-track preparation', () => {
     },
   )
 
-  it('does not surface speculative failure or attempt callbacks on the active song', async () => {
+  it('does not surface failed third-party preparation on the active song', async () => {
     const resolve = vi.fn(async (track: Track, _registry: unknown, options?: ResolveOptions): Promise<ResolveResult> => {
       if (track.id === 'b') {
-        options?.onAttempt?.({ providerId: 'jellyfin', ok: false, code: 'unavailable', latencyMs: 0 })
+        options?.onAttempt?.({ providerId: 'gd-studio', ok: false, code: 'unavailable', latencyMs: 0 })
         throw new Error('speculative failure')
       }
       return success(track)
@@ -181,7 +183,8 @@ describe('isolated next-track preparation', () => {
     const store = createPlaybackStore({ resolve })
     store.reconcileUpcomingQueue(tracks)
     await store.prepareQueueIndex(0)
-    store.setPreloadPolicy('metadata')
+    store.setPreloadPolicy('auto')
+    await store.armNextPreparation()
     await flushPromises()
     expect(store.preparedNext.value).toBeNull()
     expect(store.attempts.value).toEqual([])
@@ -206,6 +209,7 @@ describe('isolated next-track preparation', () => {
     store.reconcileUpcomingQueue(tracks)
     await store.prepareQueueIndex(0)
     store.setPreloadPolicy('auto')
+    await store.armNextPreparation()
     await flushPromises()
     await new Promise((settle) => setTimeout(settle, 5))
     await store.next()
@@ -284,43 +288,25 @@ describe('isolated next-track preparation', () => {
     store.dispose()
   })
 
-  it('handles Jellyfin preload failure as advisory without consuming ChKSz or resurrecting R2', async () => {
-    const multiTracks = ['m1', 'm2'].map((id) => ({
-      id,
-      title: id,
-      sources: [
-        { provider: 'chksz', externalId: '12345' },
-        { provider: 'jellyfin', externalId: `item-${id}` },
-        { provider: 'r2', externalId: `${id}.mp3` },
-      ],
-    } as Track))
-    const resolve = vi.fn(async (track: Track, _registry: unknown, options?: ResolveOptions): Promise<ResolveResult> => {
-      if (options?.excludeProviderIds?.includes('chksz')) {
-        return { ok: false, code: 'exhausted', attempts: [{ providerId: 'jellyfin', ok: false, code: 'unavailable', latencyMs: 5 }] }
-      }
-      return {
-        ok: true,
-        providerId: 'chksz',
-        playable: { kind: 'audio', url: `https://media.invalid/chksz/${track.id}.mp3`, mimeType: 'audio/mpeg' },
-        attempts: [],
-      }
-    })
+  it('does not resolve any provider before the bounded lead window', async () => {
+    const resolve = vi.fn(async (track: Track) => success(track))
     const store = createPlaybackStore({ resolve })
-    store.reconcileUpcomingQueue(multiTracks)
+    store.reconcileUpcomingQueue(tracks)
     await store.prepareQueueIndex(0)
     store.setPreloadPolicy('auto')
     await flushPromises()
-
+    expect(resolve).toHaveBeenCalledTimes(1)
     expect(store.preparedNext.value).toBeNull()
-    expect(store.status.value).toBe('ready')
-    expect(store.activeProviderId.value).toBe('chksz')
+    await store.armNextPreparation()
+    expect(resolve).toHaveBeenCalledTimes(2)
+    expect(store.preparedNext.value?.providerId).toBe('gd-studio')
     store.dispose()
   })
 
   /**
    * The armed preparation is the one the transition actually consumes, so unlike the speculative
    * warm-up it is provider-agnostic. These cases pin that difference, and pin that "provider-
-   * agnostic" still means "strictly the provider the current mode would choose".
+   * agnostic" still respects automatic order and a strict manual override.
    */
   describe('armed preparation', () => {
     it('arms the next track for a provider the speculative warm-up never touches', async () => {
@@ -518,5 +504,117 @@ describe('isolated next-track preparation', () => {
       expect(store.preparedNext.value?.providerId).toBe('chksz')
       store.dispose()
     })
+  })
+})
+
+
+// P96-06 (task 8.7a): the ticket-margin adoption rule, the starting state after a handover, and the
+// ladder steps counted toward the skip-run bound. Only `Date` is faked, so the clock moves on demand.
+describe('handover starting state and ticket margin (P96-06)', () => {
+  async function handoverSetup() {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const resolve = vi.fn(async (track: Track) => success(track))
+    const registry = new ProviderRegistry([{
+      provider: { id: 'gd-studio', resolve: async () => null } as unknown as AudioProvider,
+      enabled: true, priority: 1, timeoutMs: 100,
+    }])
+    const store = createPlaybackStore({ resolve, registry })
+    store.reconcileUpcomingQueue(tracks)
+    await store.prepareQueueIndex(0)
+    store.setPreloadPolicy('auto')
+    await store.armNextPreparation()
+    await flushPromises()
+    expect(store.preparedNext.value?.track.id).toBe('b')
+    return { store, resolve, resolvesOfB: () => resolve.mock.calls.filter(([track]) => track.id === 'b').length }
+  }
+
+  it.each([[60_000, true], [89_000, true], [91_000, false], [101_000, false]])(
+    'at preparation age %i ms, promotes it: %s (30 s of ticket life required)',
+    async (age, promoted) => {
+      const { store, resolvesOfB } = await handoverSetup()
+      try {
+        vi.setSystemTime(Date.now() + age)
+        await store.next()
+        await flushPromises()
+        expect(store.currentTrack.value?.id).toBe('b')
+        expect(resolvesOfB()).toBe(promoted ? 1 : 2)
+        expect(store.awaitingStart.value !== undefined).toBe(promoted)
+      } finally { store.dispose(); vi.useRealTimers() }
+    },
+  )
+
+  it('keeps the starting state through a playing report and ends it on currentTime progress', async () => {
+    const { store } = await handoverSetup()
+    try {
+      await store.next()
+      const generation = store.playbackGeneration.value
+      expect(store.awaitingStart.value).toEqual({ generation, startPosition: 0 })
+      store.reportMediaState('playing', generation)
+      expect(store.status.value).toBe('ready')
+      store.reportProgress(0, generation)
+      expect(store.status.value).toBe('ready')
+      store.reportProgress(0.3, generation)
+      expect(store.status.value).toBe('playing')
+      expect(store.awaitingStart.value).toBeUndefined()
+    } finally { store.dispose(); vi.useRealTimers() }
+  })
+
+  it('runs step (b) only below the ticket margin and counts every step toward the skip bound', async () => {
+    const { store, resolvesOfB } = await handoverSetup()
+    try {
+      await store.next()
+      const generation = store.playbackGeneration.value
+      // A valid ticket: step (b) is skipped and not counted.
+      expect(await store.recoverHandover('reResolve', generation)).toBe(false)
+      expect(await store.recoverHandover('srcSwap', generation)).toBe(true)
+      vi.setSystemTime(Date.now() + 95_000)
+      expect(await store.recoverHandover('reResolve', generation)).toBe(true)
+      expect(resolvesOfB()).toBe(2)
+      const renewed = store.playbackGeneration.value
+      expect(renewed).toBeGreaterThan(generation)
+      expect(store.awaitingStart.value).toEqual({ generation: renewed, startPosition: 0 })
+      // Two steps reached the bound of a three-track queue (min(10, n - 1) = 2): straight to the notice.
+      expect(await store.recoverHandover('srcSwap', renewed)).toBe(false)
+      expect(await store.recoverHandover('notice', renewed)).toBe(true)
+      expect(store.status.value).toBe('paused')
+      expect(store.playbackIntent.value).toBe('playing')
+      expect(store.playbackNotices.value.filter(({ kind }) => kind === 'tapToResume')).toHaveLength(1)
+    } finally { store.dispose(); vi.useRealTimers() }
+  })
+})
+
+describe('speculative provider identity', () => {
+  it.each(['armed transition', 'direct queue transition'])('respects GD priority without unnecessary Jellyfin speculation through %s', async (transition) => {
+    const providers = ['gd-studio', 'jellyfin'].map((id, index) => ({
+      provider: { id, canResolve: () => true, resolve: async () => null },
+      enabled: true, priority: index === 0 ? 5 : 30, timeoutMs: 1000,
+    }))
+    const registry = new ProviderRegistry(providers)
+    const resolve = vi.fn(async (track: Track, _registry: ProviderRegistry, options?: ResolveOptions): Promise<ResolveResult> => ({
+      ok: true, providerId: options?.sourceOverride ?? 'gd-studio',
+      playable: { kind: 'audio', url: 'https://media.invalid/' + track.id + '.mp3', mimeType: 'audio/mpeg' }, attempts: [],
+    }))
+    const store = createPlaybackStore({ registry, resolve })
+    try {
+      store.enqueue({ id: 'A', title: 'A', sources: [{ provider: 'chksz', externalId: '12345' }, { provider: 'jellyfin', externalId: 'item-A' }] } as Track)
+      store.enqueue({ id: 'B', title: 'B', sources: [{ provider: 'chksz', externalId: '12346' }, { provider: 'jellyfin', externalId: 'item-B' }] } as Track)
+      await store.prepareQueueIndex(0)
+      resolve.mockClear()
+      store.setPreloadPolicy('auto')
+      await flushPromises()
+      expect(resolve).not.toHaveBeenCalled()
+      expect(store.preparedNext.value).toBeNull()
+      if (transition === 'armed transition') {
+        await store.armNextPreparation()
+        expect(resolve.mock.calls[0]?.[2]?.sourceOverride).toBeUndefined()
+        expect(resolve.mock.calls[0]?.[2]?.excludeProviderIds).toBeUndefined()
+        expect(store.preparedNext.value?.providerId).toBe('gd-studio')
+        expect(store.preparedNext.value?.armed).toBe(true)
+      }
+      await store.playQueueIndex(1)
+      expect(store.activeProviderId.value).toBe('gd-studio')
+      expect(resolve.mock.calls.filter(([track]) => track.id === 'B')).toHaveLength(1)
+
+    } finally { store.dispose() }
   })
 })

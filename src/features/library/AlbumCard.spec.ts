@@ -21,7 +21,7 @@ const sampleAlbum: AlbumEntry = {
     workGroupId: 'wg-1',
     needsClassification: false,
     vocalStatus: 'instrumental',
-    sources: [{ provider: 'jellyfin', externalId: 'jf-stellar' }],
+    sources: [{ provider: 'jellyfin', externalId: 'jf-stellar' }, { provider: 'chksz', externalId: '9000000002' }],
     album: 'The Stellar Moments',
   },
 }
@@ -49,7 +49,7 @@ describe('AlbumCard', () => {
 
     const img = wrapper.find('[data-album-artwork]')
     expect(img.exists()).toBe(true)
-    expect(img.attributes('src')).toBe('/api/providers/jellyfin/artwork/jf-stellar')
+    expect(img.attributes('src')).toBe('/api/providers/lx/artwork/9000000002')
     expect(img.classes()).not.toContain('is-loaded')
 
     // Simulate load
@@ -57,7 +57,19 @@ describe('AlbumCard', () => {
     expect(img.classes()).toContain('is-loaded')
   })
 
-  it('falls back cleanly to gradient when image fails to load and no other source is available', async () => {
+  it('shows a provider-owned cover when Jellyfin is unavailable but the canonical NetEase binding exists',async()=>{
+    const album={...sampleAlbum,representativeTrack:{...sampleAlbum.representativeTrack!,sources:[
+      {provider:'jellyfin',externalId:'jf-unavailable'}, {provider:'chksz',externalId:'9000000002'},
+    ]}}
+    const wrapper=mount(AlbumCard,{props:{album,locale:'en'}})
+    expect(wrapper.get('[data-album-artwork]').attributes('src')).toBe('/api/providers/lx/artwork/9000000002')
+    await wrapper.get('[data-album-artwork]').trigger('load')
+    expect(wrapper.get('[data-album-artwork]').classes()).toContain('is-loaded')
+    expect(wrapper.get('[data-album-artwork]').attributes('loading')).toBe('lazy')
+    wrapper.unmount()
+  })
+
+  it('uses the gradient immediately when only a retired Jellyfin binding remains', async () => {
     const failingAlbum: AlbumEntry = {
       ...sampleAlbum,
       id: 'zzz:Failing Album',
@@ -72,10 +84,6 @@ describe('AlbumCard', () => {
       props: { album: failingAlbum, locale: 'en' },
     })
 
-    const img = wrapper.get('[data-album-artwork]')
-    await img.trigger('error')
-
-    // Since there was no ChKSz fallback, image is removed and gradient fallback remains
     expect(wrapper.find('[data-album-artwork]').exists()).toBe(false)
     expect(wrapper.get('.album-card__artwork').attributes('style')).toContain('--artwork: linear-gradient')
   })

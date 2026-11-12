@@ -18,8 +18,10 @@
  *   visible rather than silently reshaped.
  * - response-size limits: upstream body bounded to 64 KiB; request body bounded by
  *   `readBoundedJsonRequest` (64 KiB) at the route layer.
- * - rate limiting: per-admin in-memory sliding window, 20 requests/minute (matches the
- *   documented ChKSz family limit). Returns 429 with `Retry-After` when exceeded.
+ * - rate limiting: per-admin, 20 requests/minute (matches the documented ChKSz family
+ *   limit), through the shared limiter port: the `[[ratelimits]]` binding when configured,
+ *   else a module-scope sliding window that outlives the per-request handler (M-06).
+ *   Returns 429 with `Retry-After` when exceeded.
  * - timeout: 8s upstream abort; maps to 504.
  * - no key reflection: the key is appended to the upstream URL server-side only and is
  *   never copied into any response, error message, or audit detail.
@@ -31,13 +33,20 @@
  *
  * The response `durationMs` unit is milliseconds, verified live on 2026-09-20:
  * local ffprobe 149.520979s vs candidate raw 149520 (delta <1ms) for NetEase id
- * 2100334024 (La vaguelette accompaniment). Evidence:
- * `docs/verification/task15-verified-joins.json`. Consumers compare seconds
+ * 9000000001 (Demo Genshin Study accompaniment). Evidence:
+ * `the regression specification`. Consumers compare seconds
  * against `durationMs / 1000` with the project's conservative tolerance.
  */
 
 import { readBoundedJsonResponse } from './boundedJson'
 import { parseChkszSearchResponse } from '../../src/shared/chkszSearch'
+import {
+  rateLimitKey,
+  selectRateLimiter,
+  type RateLimitBinding,
+  type RateLimiter,
+  type RateLimitResult,
+} from '../rateLimit'
 
 export const CHKSZ_SEARCH_UPSTREAM_ORIGIN = 'https://api.chksz.com'
 export const CHKSZ_SEARCH_UPSTREAM_PATH = '/api/163_search'
@@ -49,7 +58,7 @@ export const CHKSZ_ADMIN_SEARCH_MAX_LIMIT = 10
 export const CHKSZ_ADMIN_SEARCH_MAX_OFFSET = 200
 export const CHKSZ_ADMIN_SEARCH_MAX_RESPONSE_BYTES = 64 * 1024
 export const CHKSZ_ADMIN_SEARCH_TIMEOUT_MS = 8_000
-/** Family-wide limit: 20 requests/minute. Enforced per admin user, per isolate. */
+/** Family-wide limit: 20 requests/minute, enforced per admin user. */
 export const CHKSZ_ADMIN_SEARCH_RATE_LIMIT_PER_MINUTE = 20
 export const CHKSZ_ADMIN_SEARCH_RATE_WINDOW_MS = 60_000
 
@@ -114,8 +123,12 @@ export function buildChkszAdminSearchUpstreamUrl(
   return url
 }
 
-/** In-memory per-admin sliding-window rate limiter (per isolate). */
-export class ChkszAdminSearchRateLimiter {
+/**
+ * In-memory per-admin sliding-window rate limiter (per isolate). Implements the shared
+ * `RateLimiter` port, so it can stand in for the `[[ratelimits]]` binding as the module-scope
+ * fallback (M-06) and as an injected test double.
+ */
+export class ChkszAdminSearchRateLimiter implements RateLimiter {
   private readonly hits = new Map<string, number[]>()
   constructor(
     private readonly now: () => number = Date.now,
@@ -138,15 +151,33 @@ export class ChkszAdminSearchRateLimiter {
     return null
   }
 
+  async limit(key: string): Promise<RateLimitResult> {
+    const retryAfter = this.check(key)
+    return retryAfter === null ? { success: true } : { success: false, retryAfter }
+  }
+
   clear(): void {
     this.hits.clear()
   }
 }
 
+// M-06: the fallback lives at module scope, so the fresh `createAdminHandler(env)` that
+// `worker.fetch` builds for every request no longer resets the count. It is per isolate (best
+// effort); the shared binding, when configured, bounds the admin across isolates per location.
+const chkszAdminSearchFallback = new ChkszAdminSearchRateLimiter()
+
+/**
+ * The admin search limiter `worker.fetch` uses: the committed `AUTH_START_LIMITER` binding
+ * (20 per 60 s, equal to CHKSZ_ADMIN_SEARCH_RATE_LIMIT_PER_MINUTE) with route-prefixed hashed
+ * keys when configured, else the module-scope fallback.
+ */
+export const chkszAdminSearchRateLimiter = (binding: RateLimitBinding | undefined): RateLimiter =>
+  selectRateLimiter(binding, CHKSZ_ADMIN_SEARCH_RATE_WINDOW_MS / 1000, chkszAdminSearchFallback)
+
 export interface ChkszAdminSearchDeps {
   fetch?: typeof fetch
   now?: () => number
-  limiter?: ChkszAdminSearchRateLimiter
+  limiter?: RateLimiter
 }
 
 export interface ChkszAdminSearchResult {
@@ -168,14 +199,16 @@ export async function executeChkszAdminSearch(
   deps: ChkszAdminSearchDeps = {},
 ): Promise<ChkszAdminSearchResult> {
   const fetchImpl = deps.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init))
-  const limiter = deps.limiter ?? new ChkszAdminSearchRateLimiter(deps.now ?? Date.now)
+  const limiter = deps.limiter ?? chkszAdminSearchFallback
 
-  const limited = limiter.check(adminId)
-  if (limited !== null) {
+  // Keyed by admin user ID, hashed so the raw ID never becomes a limiter key.
+  const decision = await limiter.limit(await rateLimitKey('chksz-admin-search', adminId))
+  if (!decision.success) {
+    const retryAfter = Math.max(1, Math.ceil(decision.retryAfter ?? CHKSZ_ADMIN_SEARCH_RATE_WINDOW_MS / 1000))
     return {
       status: 429,
       body: { error: 'rate_limited' },
-      headers: { 'retry-after': String(limited) },
+      headers: { 'retry-after': String(retryAfter) },
       auditDetail: { keywordLength: body.keyword.length, limit: body.limit, outcome: 'rate_limited' },
     }
   }

@@ -5,7 +5,7 @@
  * Optimised for identity safety under upstream rate-limited conditions: a wrong recording is worse
  * than no recording, so every gate fails closed.
  *
- * Full 1:1 TypeScript port of `scripts/chksz-identity-matcher.mjs`.
+ * Full 1:1 TypeScript port of the catalogue validation contract.
  */
 
 import {

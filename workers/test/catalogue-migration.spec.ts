@@ -2,9 +2,10 @@ import { beforeAll, afterAll, describe, it, expect } from 'vitest'
 import { catalogueDatabase } from './catalogue-fixture'
 import { readFileSync } from 'node:fs'
 import type { Track } from '../../src/features/catalog/types'
-const seed = JSON.parse(
-  readFileSync('workers/test/catalogue-seed.json', 'utf8'),
-) as Track[]
+import catalogueSeed from './catalogue-seed.json'
+
+// Match the synthetic rows inserted by catalogueDatabase(), not empty runtime defaults.
+const seed = catalogueSeed as Track[]
 describe('catalogue migration', () => {
   let fixture: Awaited<ReturnType<typeof catalogueDatabase>>
   beforeAll(async () => {
@@ -13,10 +14,11 @@ describe('catalogue migration', () => {
   afterAll(async () => {
     await fixture?.dispose()
   })
-  it('loads three synthetic test identities and R2 metadata', async () => {
+  it('seeds exactly the three synthetic identities and R2 metadata', async () => {
     const tracks = await fixture.db
       .prepare('SELECT * FROM catalogue_tracks ORDER BY track_id')
       .all<any>()
+    expect(tracks.results).toHaveLength(3)
     expect(tracks.results.map((t: { track_id: string }) => t.track_id)).toEqual(
       seed.map((t) => t.id).sort(),
     )

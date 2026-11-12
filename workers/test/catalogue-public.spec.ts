@@ -8,11 +8,11 @@ import {
 import { cataloguePublicResponse } from '../catalogue/publicRoutes'
 import app from '../index'
 import { parseCatalog } from '../../src/features/catalog/schema'
-import { readFileSync } from 'node:fs'
 import type { Track } from '../../src/features/catalog/types'
-const seed = JSON.parse(
-  readFileSync('workers/test/catalogue-seed.json', 'utf8'),
-) as Track[]
+import catalogueSeed from './catalogue-seed.json'
+
+// Match the synthetic rows inserted by catalogueDatabase(), not empty runtime defaults.
+const seed = catalogueSeed as Track[]
 describe('public D1 catalogue', () => {
   let fixture: Awaited<ReturnType<typeof catalogueDatabase>>
   beforeAll(async () => {
@@ -24,8 +24,8 @@ describe('public D1 catalogue', () => {
   it('reconstructs exact seed from bounded batch queries', async () => {
     const result = await readPublishedCatalogue(fixture.db)
     expect(result.revision).toBe('1')
-    // The original migration intentionally seeds unclassified modes. Bundled
-    // fallback modes can later be explicitly classified without rewriting it.
+    expect(result.tracks).toHaveLength(3)
+    // The test fixture starts unclassified; projection must preserve that state.
     expect(parseCatalog(result.tracks)).toEqual(
       seed.map((track) => ({ ...track, tabs: [] })).sort((a, b) => a.id.localeCompare(b.id)),
     )

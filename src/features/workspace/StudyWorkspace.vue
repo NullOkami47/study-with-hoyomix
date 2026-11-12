@@ -5,7 +5,7 @@ import { createCatalogFilterState } from '../catalog/filterState'
 import { CatalogRepository } from '../catalog/repository'
 import { runtimeCatalog } from '../catalog/runtimeCatalog'
 import { loadRemoteCatalog } from '../catalog/remoteCatalog'
-import ChatAvailability from '../chat/ChatAvailability.vue'
+import ChatPanel from '../chat/ChatPanel.vue'
 import FloatingChatWindow from '../chat/FloatingChatWindow.vue'
 import { getDefaultBackgroundStore } from '../backgrounds/store'
 import BackgroundSwitcher from '../backgrounds/BackgroundSwitcher.vue'
@@ -15,6 +15,7 @@ import { useAccountSession } from '../account/session'
 import { automaticSyncStatus } from '../account/automaticSync'
 import { createWorkspaceAccountSync } from '../account/workspaceSync'
 import { createPomodoroFocusRecorder } from '../focus/pomodoroRecorder'
+import { useFocusNow } from '../focus/useFocusNow'
 import { deriveFocusStatistics } from '../focus/statistics'
 import StudyCalendar from '../focus/StudyCalendar.vue'
 import type { FocusSessionRecord } from '../focus/types'
@@ -45,7 +46,6 @@ import { createWorkspaceFullscreen } from './fullscreen'
 import { createFocusVisibilityController } from './focusVisibility'
 import OverlaySheet from './OverlaySheet.vue'
 import SceneBackdrop from './SceneBackdrop.vue'
-import StudioGlassCanvas from '../liquid-glass/StudioGlassCanvas.vue'
 import { usePwaUpdateStatus } from '../../pwa/updateStatus'
 import PwaUpdateNotice from './PwaUpdateNotice.vue'
 import NoticeCentre from '../notices/NoticeCentre.vue'
@@ -63,7 +63,7 @@ type FocusHistoryStatus = 'storage_error' | 'pending_overflow' | 'overflow_full'
 
 const preferences = usePreferences()
 const pwaUpdateStatus = usePwaUpdateStatus()
-const { backgroundMode, locale, lowPower, studioBlur, studioGlassGray, studioEdge, visualStyle } = preferences
+const { backgroundMode, locale, lowPower, studioBlur, studioGlassGray, studioEdge } = preferences
 const text = (key: TranslationKey): string => translate(locale.value, key)
 const studyTip = computed(() => getStudyTip(locale.value, Math.floor(Date.now() / 86_400_000)))
 const demoCatalogue = import.meta.env.VITE_ENABLE_DEMO_CATALOG === 'true'
@@ -91,6 +91,7 @@ const controlCentreSection = ref<ControlCentreSection>('focus')
  * only through the explicit open and close commands; only its layout is persisted.
  */
 const chatOpen = ref(false)
+const chatDraft = ref('')
 const chatWindow = ref<InstanceType<typeof FloatingChatWindow>>()
 // Set for exactly one hub close: the "Focus chat window" command. Not reactive, because
 // nothing renders from it -- it only tells the closing hub where focus belongs.
@@ -120,8 +121,9 @@ void focusRepository.list().then((sessions) => {
 }).catch(error => {
   if (!workspaceDestroyed && initialFocusScope === focusScopeEpoch) onFocusHistoryError(error)
 })
+const focusNow = useFocusNow(() => resolvedTimeZone)
 const focusStatistics = computed(() => deriveFocusStatistics(focusSessions.value, {
-  now: new Date().toISOString(),
+  now: focusNow(),
   timeZone: resolvedTimeZone,
 }))
 // The workspace owns each semantic modal transition, so it names the return-focus target
@@ -227,7 +229,7 @@ const focusVisibility = createFocusVisibilityController({ document, pomodoroStor
 const providerPreferences = createProviderPreferencesStore()
 const providerRepository = createRuntimeProviderRepository({ providerPreferences })
 void providerRepository.prefetch()
-const player = createPlaybackStore({ loadRegistry: providerRepository.load })
+const player = createPlaybackStore({ loadRegistry: providerRepository.load, peekRegistry: providerRepository.peek })
 const unsubscribeProviderPreferences = providerPreferences.subscribe(() => player.invalidatePreload())
 // A quality change makes any prepared next track wrong: it was resolved at the previous tier, so
 // promoting it would play the old quality. Invalidating drops the preparation, and the player
@@ -238,7 +240,7 @@ const library = getDefaultLocalLibraryRepository()
 const backgroundStore = getDefaultBackgroundStore()
 const accountSync = createWorkspaceAccountSync({ preferences, player, backgrounds: backgroundStore, focus: accountFocus })
 const sleepTimer = createSleepTimerStore({ player: playbackCommands })
-let recordedPlaybackGeneration = -1
+let recordedListeningSessionId = -1
 
 const filterStateSnapshot = computed(() => JSON.stringify({
   games: filters.games.value,
@@ -270,25 +272,29 @@ function onFocusHistoryError(error: unknown): void {
 }
 
 watch(
-  [player.status, player.currentTrack, player.playbackGeneration],
-  ([status, track, generation]) => {
-    if (status !== 'playing' || !track || generation === recordedPlaybackGeneration) return
-    recordedPlaybackGeneration = generation
+  [player.status, player.currentTrack, player.listeningSessionId],
+  ([status, track, sessionId]) => {
+    if (status !== 'playing' || !track || sessionId === recordedListeningSessionId) return
+    recordedListeningSessionId = sessionId
     void library.recordRecent(track.id)
   },
 )
 
 // Choosing a Library track returns to the listening scene. Playback's shared
 // transport remains in the hub, including when it changes track or source.
+// The trigger is a new listening session, not a new playback generation: a same-track
+// Jellyfin recovery or a media renewal bumps the generation within the same session and
+// must leave the Library open (D23, P95-09). The default `pre` flush runs before the next
+// render, after the store has finished the synchronous move (the session advances before
+// `startQueueIndex` sets the intent to `playing`), so the hub still closes before it paints.
 watch(
-  player.playbackGeneration,
+  player.listeningSessionId,
   () => {
     if (controlCentreOpen.value && controlCentreSection.value === 'library'
       && player.playbackIntent.value === 'playing') {
       controlCentreOpen.value = false
     }
   },
-  { flush: 'sync' },
 )
 
 /**
@@ -428,6 +434,7 @@ onBeforeUnmount(() => {
     id="app-content"
     class="study-workspace"
     data-workspace="cinematic"
+    :data-workspace-modal="controlCentreOpen ? 'true' : undefined"
     :data-active-official-player="!modalOpen && player.playable.value?.kind === 'youtube' ? 'true' : 'false'"
     tabindex="-1"
     :style="{
@@ -444,7 +451,7 @@ onBeforeUnmount(() => {
       :low-power="lowPower"
       :store="backgroundStore"
     />
-    <StudioGlassCanvas v-if="visualStyle === 'studio'" :low-power="lowPower" :blur-radius="studioBlur" :glass-gray="studioGlassGray" :edge="studioEdge" />
+
     <PwaUpdateNotice :status="pwaUpdateStatus" />
     <NoticeCentre />
     <BackgroundSwitcher
@@ -489,10 +496,9 @@ onBeforeUnmount(() => {
       :inert="modalOpen"
       :reserved="playerRegions"
       :obstructed-top="obstructedTop"
-      constrain-to-available-space
       @close="closeChatWindow"
     >
-      <ChatAvailability />
+      <ChatPanel v-model:draft="chatDraft" :tracks="catalogue.tracks" :current-track="player.currentTrack.value" @play="player.playNow" @enqueue="player.enqueue" @account="controlCentreSection = 'account'; controlCentreOpen = true" />
     </FloatingChatWindow>
     <!-- Queue is rendered after chat at the same workspace layer so opening it gives
          the standalone queue ownership of overlapping pointer targets without making it modal. -->

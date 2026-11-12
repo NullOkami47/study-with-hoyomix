@@ -81,12 +81,12 @@ describe('buildCatalogueIndex — album grouping', () => {
 
   it('returns an album’s tracks in catalogue order', () => {
     expect(albumTracks(index, `genshin:${FONTAINE_ALBUM}`).map((track) => track.id)).toEqual([
-      'genshin-fontaine-daydream',
-      'genshin-fontaine-nightfall',
+      'demo-fontaine-daydream',
+      'demo-fontaine-nightfall',
     ])
     expect(albumTracks(index, `hsr:${INSIDE_ALBUM}`).map((track) => track.id)).toEqual([
-      'hsr-hope',
-      'hsr-sway',
+      'demo-hsr-hope',
+      'demo-hsr-sway',
     ])
   })
 
@@ -98,14 +98,36 @@ describe('buildCatalogueIndex — album grouping', () => {
 describe('buildCatalogueIndex — game grouping', () => {
   it('groups tracks by game in catalogue order', () => {
     expect(gameTracks(index, 'genshin').map((track) => track.id)).toEqual([
-      'genshin-fontaine-daydream',
-      'genshin-fontaine-nightfall',
-      'genshin-liyue',
-      'genshin-moon-in-ones-cup',
-      'genshin-la-vaguelette',
+      'demo-fontaine-daydream',
+      'demo-fontaine-nightfall',
+      'demo-liyue',
+      'demo-moon-in-ones-cup',
+      'demo-genshin-study',
     ])
-    expect(gameTracks(index, 'hsr').map((track) => track.id)).toEqual(['hsr-hope', 'hsr-sway'])
-    expect(gameTracks(index, 'zzz').map((track) => track.id)).toEqual(['zzz-tiny-giant'])
+    expect(gameTracks(index, 'hsr').map((track) => track.id)).toEqual(['demo-hsr-hope', 'demo-hsr-sway'])
+    expect(gameTracks(index, 'zzz').map((track) => track.id)).toEqual(['demo-zzz-study'])
+  })
+
+  it.each([
+    ['GD Studio', { provider: 'gd-studio', externalId: 'netease:9000000002:320' }],
+    ['NetEase', { provider: 'chksz', externalId: '9000000002' }],
+  ] as const)('chooses the first %s-capable track when an earlier track is YouTube-only', (_label, source) => {
+    const indexed = buildCatalogueIndex([
+      {
+        ...libraryFixtureTracks()[0]!,
+        id: 'genshin-youtube-first',
+        sources: [{ provider: 'youtube', externalId: 'youtube-only' }],
+      },
+      {
+        ...libraryFixtureTracks()[0]!,
+        id: 'genshin-artwork-second',
+        sources: [source],
+      },
+    ])
+
+    expect(indexed.games.find((game) => game.id === 'genshin')?.representativeTrack?.id).toBe(
+      'genshin-artwork-second',
+    )
   })
 
   it('lists the games in canonical order with their counts', () => {
@@ -149,9 +171,9 @@ describe('buildCatalogueIndex — discoverability', () => {
   it('leaves a track without an album out of every album, but in the catalogue', () => {
     // The catalogue stores no album for this track, so there is no album to open. It must
     // still be browsable, which is why it stays in All Tracks and in its game.
-    expect(index.albumIdByTrackId.get('genshin-la-vaguelette')).toBeUndefined()
-    expect(index.tracks.some((track) => track.id === 'genshin-la-vaguelette')).toBe(true)
-    expect(gameTracks(index, 'genshin').some((track) => track.id === 'genshin-la-vaguelette')).toBe(
+    expect(index.albumIdByTrackId.get('demo-genshin-study')).toBeUndefined()
+    expect(index.tracks.some((track) => track.id === 'demo-genshin-study')).toBe(true)
+    expect(gameTracks(index, 'genshin').some((track) => track.id === 'demo-genshin-study')).toBe(
       true,
     )
   })
@@ -171,15 +193,15 @@ describe('buildCatalogueIndex — determinism and search fields', () => {
   })
 
   it('folds a track’s aliases into its searchable names', () => {
-    const fields = index.trackSearch.get('genshin-la-vaguelette')!
+    const fields = index.trackSearch.get('demo-genshin-study')!
     // Stored as zh-CN (Simplified) and zh-TW (Traditional); both must be present, and both
     // must already be folded so a query in either script matches.
-    expect(fields.names).toContain('轻涟')
-    expect(fields.names).not.toContain('輕漣')
+    expect(fields.names).toContain('示范练习')
+    expect(fields.names).not.toContain('示範練習')
   })
 
   it('folds a track’s album and game labels into its haystack', () => {
-    const fields = index.trackSearch.get('zzz-tiny-giant')!
+    const fields = index.trackSearch.get('demo-zzz-study')!
     expect(fields.album).toBe('极限委托')
     expect(fields.haystack).toContain('极限委托')
     expect(fields.haystack).toContain('绝区零')

@@ -40,7 +40,7 @@ function setupAdminShell() {
     configured: true,
     role: 'owner',
     sheetUrl: 'https://docs.google.com',
-    serviceAccountEmail: 'test@example.com',
+    serviceAccountEmail: 'test@service.com',
     lastBatch: null,
   })
   vi.spyOn(repo, 'listAudit').mockResolvedValue({ entries: [], total: 0, limit: 50, offset: 0 })
@@ -283,7 +283,7 @@ describe('Admin i18n & Localization Coverage', () => {
         configured: true,
         role: 'admin',
         sheetUrl: 'https://docs.google.com',
-        serviceAccountEmail: 'test@example.com',
+        serviceAccountEmail: 'test@service.com',
         lastBatch: batch as any,
       })
 

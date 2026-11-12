@@ -1,7 +1,13 @@
+import { getSharedGdStudioBudget } from '../../gdStudio/budget'
 import {
   LX_RPC_MAX_BYTES,
   LX_VM_CALL_TIMEOUT_MS,
+  LX_INIT_TIMEOUT_MS,
+  LX_RESOLVE_TIMEOUT_MS,
+  LX_RPC_GRACE_MS,
   isWorkerResponse,
+  isBudgetQuery,
+  type LxBudgetReply,
   type LxMusicUrlResult,
   type LxWorkerDisposeRequest,
   type LxWorkerLoadRequest,
@@ -12,6 +18,10 @@ import {
 
 export interface LxRuntimeClientOptions {
   workerFactory?: () => Worker
+  /**
+   * Overrides the RPC deadline. Left unset, each request type uses its own in-worker budget plus
+   * `LX_RPC_GRACE_MS`, so the worker's specific error arrives instead of a generic RPC timeout.
+   */
   callTimeoutMs?: number
 }
 
@@ -28,14 +38,28 @@ export class LxRuntimeClient {
   private worker: Worker | null = null
   private pending = new Map<string, PendingRpc>()
   private workerFactory: () => Worker
-  private callTimeoutMs: number
+  /** Explicit override for every RPC deadline; null means "per request type". */
+  private callTimeoutMs: number | null
   private disposed = false
+  /** The last script the current or previous Worker loaded successfully (M-11 reload). */
+  private loadedScript: string | null = null
+  /** True when the Worker holding `loadedScript` was terminated and its replacement has no source. */
+  private needsReload = false
+  private reloading: Promise<void> | null = null
 
   constructor(options?: LxRuntimeClientOptions) {
     this.workerFactory = options?.workerFactory ?? (() => {
       return new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' })
     })
-    this.callTimeoutMs = options?.callTimeoutMs ?? LX_VM_CALL_TIMEOUT_MS
+    this.callTimeoutMs = options?.callTimeoutMs ?? null
+  }
+
+  /** The RPC deadline for one request type: the in-worker budget plus a delivery grace. */
+  private rpcDeadlineFor(type: LxWorkerRequest['type']): number {
+    if (this.callTimeoutMs !== null) return this.callTimeoutMs
+    if (type === 'load') return LX_INIT_TIMEOUT_MS + LX_RPC_GRACE_MS
+    if (type === 'musicUrl') return LX_RESOLVE_TIMEOUT_MS + LX_RPC_GRACE_MS
+    return LX_VM_CALL_TIMEOUT_MS
   }
 
   private ensureWorker(): Worker {
@@ -46,7 +70,9 @@ export class LxRuntimeClient {
     if (!this.worker) {
       this.worker = this.workerFactory()
 
+      const worker = this.worker
       this.worker.onmessage = (event: MessageEvent) => {
+        if (this.worker !== worker) return
         this.handleMessage(event.data)
       }
 
@@ -63,6 +89,16 @@ export class LxRuntimeClient {
   }
 
   private handleMessage(data: unknown): void {
+    if (isBudgetQuery(data)) {
+      const budget = getSharedGdStudioBudget()
+      if (data.type === 'gd_budget_backoff') {
+        budget.noteRateLimited(data.retryAfterMs!)
+      } else {
+        const reply: LxBudgetReply = { type: 'gd_budget_result', id: data.id, ...budget.tryAcquire() }
+        this.worker?.postMessage(reply)
+      }
+      return
+    }
     if (!isWorkerResponse(data)) {
       this.handleWorkerFatal(new Error('Protocol error: Invalid worker response'))
       return
@@ -122,6 +158,8 @@ export class LxRuntimeClient {
         // ignore
       }
       this.worker = null
+      // M-11: the replacement Worker starts empty; reload the source before its next RPC.
+      if (this.loadedScript !== null) this.needsReload = true
     }
 
     // Reject all pending RPCs
@@ -136,15 +174,16 @@ export class LxRuntimeClient {
 
   private sendRequest<T>(request: LxWorkerRequest): Promise<T> {
     const worker = this.ensureWorker()
+    const deadlineMs = this.rpcDeadlineFor(request.type)
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(request.id)
-        const timeoutError = new Error(`LX call timed out after ${this.callTimeoutMs}ms`)
+        const timeoutError = new Error(`LX call timed out after ${deadlineMs}ms`)
         // Terminate worker on timeout so it doesn't leave orphaned execution
         this.terminateWorkerInternal(timeoutError)
         reject(timeoutError)
-      }, this.callTimeoutMs)
+      }, deadlineMs)
 
       this.pending.set(request.id, {
         resolve,
@@ -171,6 +210,15 @@ export class LxRuntimeClient {
       throw new Error('Script exceeds maximum allowed size (512 KiB)')
     }
 
+    // A fresh load replaces whatever a reload would have restored.
+    this.needsReload = false
+    this.loadedScript = null
+    const result = await this.sendLoad(script)
+    this.loadedScript = script
+    return result
+  }
+
+  private sendLoad(script: string): Promise<{ initedMeta?: unknown }> {
     const id = `load_${clientIdCounter++}_${Date.now()}`
     const request: LxWorkerLoadRequest = {
       type: 'load',
@@ -179,6 +227,23 @@ export class LxRuntimeClient {
     }
 
     return this.sendRequest<{ initedMeta?: unknown }>(request)
+  }
+
+  /** Reloads the current source into a Worker recreated after termination (M-11). */
+  private async ensureSourceLoaded(): Promise<void> {
+    if (!this.needsReload || this.loadedScript === null) return
+    if (!this.reloading) {
+      const script = this.loadedScript
+      this.reloading = (async () => {
+        try {
+          await this.sendLoad(script)
+          if (this.loadedScript === script) this.needsReload = false
+        } finally {
+          this.reloading = null
+        }
+      })()
+    }
+    await this.reloading
   }
 
   async callMusicUrl(
@@ -216,7 +281,17 @@ export class LxRuntimeClient {
       throw new Error('Failed to serialize musicUrl request')
     }
 
+    await this.ensureSourceLoaded()
     return this.sendRequest<LxMusicUrlResult>(request)
+  }
+
+  /** Cancellation releases the whole isolate immediately, even while guest code is awaiting I/O. */
+  abort(reason?: unknown): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.loadedScript = null
+    this.needsReload = false
+    this.terminateWorkerInternal(reason instanceof Error ? reason : new Error('LX resolution aborted'))
   }
 
   async dispose(): Promise<void> {

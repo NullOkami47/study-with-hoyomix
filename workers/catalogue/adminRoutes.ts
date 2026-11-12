@@ -1,4 +1,5 @@
 import type { AuthEnv } from '../auth/routes'
+import type { ProviderEnv } from '../providers/config'
 import type { D1PreparedStatement } from '../env'
 import { createAdminAuthorisation, adminMutationOriginGuard } from '../admin/authz'
 import { readBoundedJsonRequest } from '../providers/boundedJson'
@@ -8,6 +9,7 @@ import { readCatalogueSnapshot } from './repository'
 import { exportWorkbook } from './staging'
 import { publishImportBatch } from './publish'
 import { validateProposalEdit } from './edit'
+import { createDiscoveryAdminHandler, type DiscoveryOptions } from './discovery/routes'
 import {
   applyAdminTrackEdit,
   readAdminCatalogueIndex,
@@ -16,11 +18,28 @@ import {
   validateAdminTrackEdit,
 } from './adminTracks'
 import type { ImportBatch, Decision } from './types'
-export interface CatalogueEnv extends AuthEnv, GoogleSheetsEnv {}
+export interface CatalogueEnv extends AuthEnv, GoogleSheetsEnv,ProviderEnv {
+  CATALOGUE_DISCOVERY_CHANNEL_IDS?: string
+  CATALOGUE_DISCOVERY_INGEST_TOKEN?: string
+  /** `enabled` opts this environment into the unattended discovery cycle. Absent means off. */
+  CATALOGUE_DISCOVERY_AUTOMATION?: string
+  /**
+   * `enabled` additionally lets the cycle publish a staged batch with no human approval,
+   * recorded with a null audit actor. Separate from `CATALOGUE_DISCOVERY_AUTOMATION` so
+   * the scan/classify/stage loop can run while publication still waits for a person.
+   */
+  CATALOGUE_DISCOVERY_AUTO_PUBLISH?: string
+  /** Account ID for the account-wide, read-only daily D1 write preflight. */
+  CATALOGUE_DISCOVERY_CF_ACCOUNT_ID?: string
+  /** Dedicated Account Analytics Read token. Never exposed to the AI or browser. */
+  CATALOGUE_DISCOVERY_QUOTA_API_TOKEN?: string
+}
 export interface CatalogueOptions {
   now?: () => number
   crypto?: Crypto
-  sheets?: Pick<ReturnType<typeof createGoogleSheetsClient>, 'read' | 'write'>
+  sheets?: Pick<ReturnType<typeof createGoogleSheetsClient>, 'read' | 'write'> & Partial<Pick<ReturnType<typeof createGoogleSheetsClient>, 'append'>>
+  fetch?: typeof fetch
+  discovery?: { fetch?: typeof fetch; cache?: Pick<Cache,'match'|'put'> }
   /** @internal Test-only transaction boundary for real D1 failure/interleaving tests. */
   beforePublishBatch?: (
     statements: D1PreparedStatement[],
@@ -101,6 +120,9 @@ export function createCatalogueAdminHandler(env: CatalogueEnv, options: Catalogu
         const admin = await auth.currentAdmin(request)
         if (admin instanceof Response) return admin
         const path = new URL(request.url).pathname.slice('/api/admin/catalogue'.length)
+        if (path === '/discovery' || path.startsWith('/discovery/')) {
+          return createDiscoveryAdminHandler(env, { now, sheets, fetch: options.fetch, discovery: options.discovery }).fetch(request)
+        }
         if (path === '/status') {
           if (request.method !== 'GET') return method('GET')
           const last = await env.DB.prepare(

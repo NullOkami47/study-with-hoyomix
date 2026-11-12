@@ -41,3 +41,16 @@ export interface D1Database {
 export interface Env {
   DB: D1Database
 }
+
+/** The subset of the Workers `ExecutionContext` this Worker uses. */
+export interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void
+  passThroughOnException(): void
+}
+
+/** The subset of the Workers `ScheduledController` passed to `scheduled()`. */
+export interface ScheduledController {
+  readonly scheduledTime: number
+  readonly cron: string
+  noRetry(): void
+}

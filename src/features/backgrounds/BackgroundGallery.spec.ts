@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createBackgroundStore } from './store'
 import type { BackgroundRepository, PublicBackground } from './types'
 import BackgroundGallery from './BackgroundGallery.vue'
+import { createPublicBackground } from '../../test/fixtures/publicBackgrounds'
 
 const item = (id: string): PublicBackground => ({
   id,
@@ -25,13 +26,7 @@ const item = (id: string): PublicBackground => ({
 })
 
 const curated = (id: string, collection: string): PublicBackground => ({
-  ...item(id),
-  title: `Synthetic scene ${collection}`,
-  kind: 'video',
-  contentType: 'video/mp4',
-  durationMs: 20_000,
-  posterUrl: `/backgrounds/zzz/${collection}/posters/${id}.jpg`,
-  mediaUrl: `/backgrounds/zzz/${collection}/${id}.mp4`,
+  ...createPublicBackground(id),
   game: 'zzz',
   collection,
   fps: 24,
@@ -180,34 +175,39 @@ describe('BackgroundGallery', () => {
     store.destroy()
   })
 
-  it('groups curated backgrounds under localised headings and offers a playback order', async () => {
+  it.each([
+    { locale: 'en', game: 'Zenless Zone Zero', collection: 'Urban Stroll', untitled: 'Published background' },
+    { locale: 'zh-Hans', game: '绝区零', collection: '城市漫步', untitled: '已发布背景' },
+    { locale: 'zh-Hant', game: '絕區零', collection: '城市漫步', untitled: '已發佈背景' },
+  ] as const)('groups synthetic choices with localised headings and playback order in $locale', async ({ locale, game, collection, untitled }) => {
     const repo: BackgroundRepository = {
       list: vi.fn().mockResolvedValue([
-        curated('zzz-urban-stroll-anby-billy', 'urban-stroll'),
-        curated('zzz-belle-lofi-girl', 'lofi-girl'),
+        curated('fixture-urban-scene', 'urban-stroll'),
+        curated('fixture-lofi-scene', 'lofi-girl'),
         item('api-image'),
       ]),
       getAccountSelection: vi.fn().mockResolvedValue(null),
       saveAccountSelection: vi.fn(async (selection) => selection),
     }
     const store = createBackgroundStore({ repository: repo, storage: storage() })
-    const wrapper = mount(BackgroundGallery, { props: { store, locale: 'zh-Hans', signedIn: false } })
+    const wrapper = mount(BackgroundGallery, { props: { store, locale, signedIn: false } })
     await flushPromises()
 
     expect(wrapper.findAll('[data-background-choice]')).toHaveLength(3)
     expect(wrapper.findAll('[data-background-group]')).toHaveLength(1)
     expect(wrapper.findAll('[data-background-collection]')).toHaveLength(2)
-    expect(wrapper.text()).toContain('绝区零')
-    expect(wrapper.text()).toContain('城市漫步')
-    expect(wrapper.text()).toContain('Synthetic scene urban-stroll')
-    expect(wrapper.text()).toContain('Synthetic scene lofi-girl')
+    expect(wrapper.text()).toContain(game)
+    expect(wrapper.text()).toContain(collection)
+    expect(wrapper.text()).toContain('Lofi Girl')
+    expect(wrapper.text()).toContain('Synthetic fixture-urban-scene')
+    expect(wrapper.text()).toContain('Synthetic fixture-lofi-scene')
     // API rows without a curated title still get a translated label.
-    expect(wrapper.text()).toContain('已发布背景')
+    expect(wrapper.text()).toContain(untitled)
 
     await wrapper.find('[data-background-playback-mode]').setValue('random')
     expect(store.playbackMode.value).toBe('random')
     expect((wrapper.find('[data-background-playback-mode]').element as HTMLSelectElement).value).toBe('random')
-    store.destroy()
+    wrapper.unmount(); store.destroy()
   })
 
   it('shows a group heading for an administrator-created collection that has no curated label', async () => {

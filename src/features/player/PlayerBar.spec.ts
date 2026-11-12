@@ -4,7 +4,7 @@ import { defineComponent, h, onBeforeUnmount, ref, type Ref } from 'vue'
 
 import PlayerBar from './PlayerBar.vue'
 import CompactPlayback from './CompactPlayback.vue'
-import { createPlaybackStore, type PlaybackStore } from './store'
+import { createPlaybackStore, type FailureOutcome, type PlaybackStore, type RecoveryOutcome } from './store'
 import { ProviderRegistry } from './providers/registry'
 import type { Track } from '../catalog/types'
 import type { AudioProvider, Playable } from './providers/types'
@@ -21,6 +21,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.useRealTimers()
   Reflect.deleteProperty(navigator, 'mediaSession')
 })
 
@@ -35,18 +36,28 @@ function storeStub(): PlaybackStore {
   return {
     shuffle: ref(false), repeatMode: ref('off'), setShuffle: vi.fn(), cycleRepeatMode: vi.fn(), setRepeatMode: vi.fn(),
     replaceQueueSource: vi.fn(), advanceAfterEnded: vi.fn(async () => {}),
+    tryAdvancePreparedAfterEnded: vi.fn(() => false),
     preparedNext: ref(null), preloadHandoff: ref(null), preloadPolicy: ref('none'),
     activeProviderId: ref('youtube'), currentTrack: ref(track), queue: ref([track]), currentIndex: ref(0),
-    enabledProviderIds: ref(['youtube']), manualProviderIds: ref(['youtube']), playbackIntent: ref('playing'), playbackGeneration: ref(1),
-    attempts: ref([]), sourceOverride: ref(undefined), status: ref('playing'), volume, playable: ref(null),
+    enabledProviderIds: ref(['youtube']), automaticProviderIds: ref(['youtube']), manualProviderIds: ref(['youtube']), playbackIntent: ref('playing'), playbackGeneration: ref(1),
+    attempts: ref([]), latestAttempts: ref([]), sourceOverride: ref(undefined), status: ref('playing'), volume, playable: ref(null),
+    pendingResumePosition: ref(undefined), listeningSessionId: ref(1),
     enqueue: vi.fn(), removeQueueIndex: vi.fn(() => false), moveQueueItem: vi.fn(() => false),
     playNext: vi.fn(), clearUpcomingQueue: vi.fn(), reconcileUpcomingQueue: vi.fn(), refreshQueuedTracks: vi.fn(),
-    setPreloadPolicy: vi.fn(), invalidatePreload: vi.fn(), releasePreloadHandoff: vi.fn(), dispose: vi.fn(),
+    setPreloadPolicy: vi.fn(), invalidatePreload: vi.fn(), rejectNextPreparation: vi.fn(), releasePreloadHandoff: vi.fn(), dispose: vi.fn(),
     armNextPreparation: vi.fn(async () => {}),
+    prepareTransition: vi.fn(async () => {}), canHandoffPreparation: vi.fn(() => false), rejectPreparation: vi.fn(), nextPreparationIndex: ref(-1),
+    transitionMode: ref('off'), crossfadeDuration: ref(5), setTransitionMode: vi.fn(), setCrossfadeDuration: vi.fn(),
     playNow: vi.fn(async () => {}), prepareQueueIndex: vi.fn(async () => {}), playQueueIndex: vi.fn(async () => {}),
     next: vi.fn(async () => {}), pause: vi.fn(), play: vi.fn(), previous: vi.fn(async () => {}), stop: vi.fn(),
-    reportMediaState: vi.fn(), reportPlaybackFailure: vi.fn(async () => {}),
+    reportMediaState: vi.fn(), reportPlaybackFailure: vi.fn(async (): Promise<FailureOutcome> => 'stale'), renewMedia: vi.fn(async () => false),
+    requestJellyfinFallback: vi.fn(async () => false),
+    requestJellyfinRecovery: vi.fn(async (): Promise<RecoveryOutcome> => 'stale'),
+    registrySnapshot: () => ({ registry: new ProviderRegistry([]), failedProviderIds: [] }),
+    reportProgress: vi.fn(), awaitingStart: ref(undefined), recoverHandover: vi.fn(async () => false),
+    consumePendingResumePosition: vi.fn(() => undefined),
     setSourceOverride: vi.fn(async () => {}), setVolume: vi.fn(volumeStore.setVolume),
+    playbackNotices: ref([]), dismissNotice: vi.fn(), addPlaybackNotice: vi.fn(), recentFailures: ref([]),
   }
 }
 
@@ -84,7 +95,271 @@ function setBuffered(media: HTMLAudioElement, ranges: [number, number][]): void 
   })
 }
 
+function stalledVkeysStore(providerId: 'lx' | 'vkeys' = 'vkeys') {
+  const track: Track = { ...audioStoreStub().currentTrack.value!, sources: [
+    { provider: providerId, externalId: providerId }, { provider: 'gd-studio', externalId: 'gd' },
+  ] }
+  let version = 0
+  const vkeys = vi.fn(async () => ({ kind: 'audio' as const, url: '/vkeys-' + ++version + '.mp3', mimeType: 'audio/mpeg' }))
+  const gd = vi.fn(async () => ({ kind: 'audio' as const, url: '/gd.mp3', mimeType: 'audio/mpeg' }))
+  const registry = new ProviderRegistry([
+    { provider: { id: providerId, resolve: vkeys }, enabled: true, priority: 1, timeoutMs: 100 },
+    { provider: { id: 'gd-studio', resolve: gd }, enabled: true, priority: 2, timeoutMs: 100 },
+  ])
+  return { track, vkeys, gd, store: createPlaybackStore({ registry }) }
+}
+
 describe('PlayerBar', () => {
+  function recoveryStore(jellyfinEnabled = true, automaticEligible = true) {
+    const track: Track = { ...audioStoreStub().currentTrack.value!, sources: [
+      { provider: 'lx', externalId: 'lx' }, { provider: 'jellyfin', externalId: 'own' },
+    ] }
+    const registry = new ProviderRegistry([
+      { provider: { id: 'lx', resolve: async () => ({ kind: 'audio', url: '/lx.mp3', mimeType: 'audio/mpeg' }) }, enabled: true, priority: 1, timeoutMs: 100 },
+      { provider: { id: 'jellyfin', resolve: async () => ({ kind: 'audio', url: '/own.mp3', mimeType: 'audio/mpeg' }) }, enabled: jellyfinEnabled, automaticEligible, priority: 2, timeoutMs: 100 },
+    ])
+    return { track, store: createPlaybackStore({ registry }) }
+  }
+
+  it.each(['player', 'compact'])('allows the %s control to pause while waiting for recovery seek', async (control) => {
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track } = recoveryStore()
+    await store.playNow(track)
+    await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    const compact = mount(CompactPlayback, { props: { store } })
+    try {
+      expect(store.status.value).toBe('ready')
+      const button = control === 'compact' ? compact.get('[data-compact-play]') : wrapper.get('[data-player-play]')
+      expect(button.attributes('aria-label')).toBe('Pause')
+      await button.trigger('click')
+      expect(store.playbackIntent.value).toBe('paused')
+    } finally { compact.unmount(); wrapper.unmount(); store.dispose() }
+  })
+
+  it.each(['system', 'timer'])('cancels the recovery seek timeout on %s pause', async (command) => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const actions = new Map<string, (() => void) | null>()
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: {
+      metadata: null, playbackState: 'none', setPositionState: vi.fn(),
+      setActionHandler: (action: string, handler: (() => void) | null) => actions.set(action, handler),
+    } })
+    const { store, track } = recoveryStore()
+    await store.playNow(track)
+    await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      playbackCommands.play()
+      await flushPromises()
+      if (command === 'timer') playbackCommands.pauseForInterruption()
+      else actions.get('pause')!()
+      expect(store.playbackIntent.value).toBe('paused')
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(store.status.value).toBe('ready')
+      expect(store.pendingResumePosition.value).toBe(42)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it('cancels the pending recovery seek deadline on native pause and rearms only on explicit Play', async () => {
+    vi.useFakeTimers()
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track } = recoveryStore()
+    await store.playNow(track)
+    await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      playbackCommands.play()
+      await flushPromises()
+      const playCount = mediaPlay.mock.calls.length
+      await wrapper.get('[data-audio-role="active"]').trigger('pause')
+      expect(store.playbackIntent.value).toBe('playing')
+      expect(store.status.value).toBe('paused')
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(store.status.value).toBe('paused')
+      expect(store.pendingResumePosition.value).toBe(42)
+      expect(mediaPlay).toHaveBeenCalledTimes(playCount)
+      expect(store.activeProviderId.value).toBe('jellyfin')
+      const generation = store.playbackGeneration.value
+      playbackCommands.play()
+      await vi.advanceTimersByTimeAsync(10_000)
+      // The rearmed deadline reports the Jellyfin seek failure; the store continues the chain at
+      // the saved position through LX (tasks 8.3/8.4, Property 25) instead of halting in `error`.
+      expect(store.playbackGeneration.value).toBeGreaterThan(generation)
+      expect(store.currentTrack.value).toBe(track)
+      expect(store.activeProviderId.value).toBe('lx')
+      expect(store.pendingResumePosition.value).toBe(42)
+      expect(store.status.value).toBe('ready')
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it.each(['disabled', 'manual-only'])('reports a native error normally when mapped Jellyfin is %s', async (policy) => {
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track } = recoveryStore(policy !== 'disabled', policy !== 'manual-only')
+    await store.playNow(track)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      // The first error renews the same provider's URL (an expired ticket is not a failure).
+      const generation = store.playbackGeneration.value
+      await wrapper.get('[data-audio-role="active"]').trigger('error')
+      await flushPromises()
+      expect(store.activeProviderId.value).toBe('lx')
+      expect(store.playbackGeneration.value).toBe(generation + 1)
+      expect(store.attempts.value.some(attempt => attempt.providerId === 'lx' && !attempt.ok)).toBe(false)
+      // A second error before any playback progress is a real failure.
+      await wrapper.get('[data-audio-role="active"]').trigger('error')
+      await flushPromises()
+      expect(store.status.value).toBe('error')
+      expect(store.attempts.value.some(attempt => attempt.providerId === 'lx' && !attempt.ok)).toBe(true)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it.each(['lx', 'vkeys'] as const)('recovers a hung %s stream after explicit Play following an OS native pause', async providerId => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(() => new Promise<void>(() => {}))
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track, vkeys, gd } = stalledVkeysStore(providerId)
+    await store.playNow(track)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await wrapper.get('[data-audio-role="active"]').trigger('pause')
+      expect(store.status.value).toBe('paused')
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(store.activeProviderId.value).toBe(providerId)
+      expect(vkeys).toHaveBeenCalledTimes(1)
+      const generation = store.playbackGeneration.value
+      await wrapper.get('[data-player-play]').trigger('click')
+      await vi.advanceTimersByTimeAsync(7_000)
+      await flushPromises()
+      expect(store.activeProviderId.value).toBe(providerId)
+      expect(vkeys).toHaveBeenCalledTimes(2)
+      expect(store.playbackGeneration.value).toBe(generation + 1)
+      expect(gd).not.toHaveBeenCalled()
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it.each(['user', 'native'])('does not replay a late buffered Repeat One ended event after %s pause', async (pauseOwner) => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track } = recoveryStore()
+    await store.playNow(track)
+    store.setRepeatMode('one')
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+      setDuration(media.element, 60)
+      setBuffered(media.element, [[0, 60]])
+      media.element.currentTime = 60
+      const session = store.listeningSessionId.value
+      if (pauseOwner === 'user') playbackCommands.pause()
+      else await media.trigger('pause')
+      const playCount = play.mock.calls.length
+      await media.trigger('ended')
+      await flushPromises()
+      expect(play).toHaveBeenCalledTimes(playCount)
+      expect(store.listeningSessionId.value).toBe(session)
+      expect(store.playbackIntent.value).toBe(pauseOwner === 'user' ? 'paused' : 'playing')
+      playbackCommands.play()
+      await flushPromises()
+      expect(store.listeningSessionId.value).toBe(session + 1)
+      expect(play).toHaveBeenCalledTimes(playCount + 1)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it('repeats naturally completed buffered audio after its native ended pause', async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track } = recoveryStore()
+    await store.playNow(track)
+    store.setRepeatMode('one')
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+      setDuration(media.element, 60)
+      setBuffered(media.element, [[0, 60]])
+      media.element.currentTime = 60
+      Object.defineProperty(media.element, 'ended', { configurable: true, value: true })
+      const session = store.listeningSessionId.value
+      const playCount = play.mock.calls.length
+      await media.trigger('pause')
+      await media.trigger('ended')
+      await flushPromises()
+      expect(play).toHaveBeenCalledTimes(playCount + 1)
+      expect(store.listeningSessionId.value).toBe(session + 1)
+      expect(media.element.currentTime).toBe(0)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it('starts a new listening session for fully buffered Repeat One without replacing the deck or resolving again', async () => {
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const resolve = vi.fn(async () => ({ ok: true as const, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio' as const, url: '/buffered-repeat.mp3', mimeType: 'audio/mpeg' },
+    }))
+    const store = createPlaybackStore({ resolve })
+    await store.playNow(audioStoreStub().currentTrack.value!)
+    store.setRepeatMode('one')
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+      const session = store.listeningSessionId.value
+      const generation = store.playbackGeneration.value
+      const resolveCount = resolve.mock.calls.length
+      const source = media.attributes('src')
+      setDuration(media.element, 60)
+      setBuffered(media.element, [[0, 60]])
+      media.element.currentTime = 60
+      await media.trigger('ended')
+      await flushPromises()
+      expect(store.listeningSessionId.value).toBe(session + 1)
+      expect(store.playbackIntent.value).toBe('playing')
+      expect(store.playbackGeneration.value).toBe(generation)
+      expect(wrapper.get('[data-audio-role="active"]').element).toBe(media.element)
+      expect(media.attributes('src')).toBe(source)
+      expect(media.element.currentTime).toBe(0)
+      expect(resolve).toHaveBeenCalledTimes(resolveCount)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it('finishes the listening intent at the end of the last track without requesting recovery', async () => {
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const mediaPause = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const mapped = { ...audioStoreStub().currentTrack.value!, sources: [{ provider: 'r2', externalId: 'last.ogg' }] }
+    const store = createPlaybackStore({ resolve: async () => ({ ok: true, providerId: 'r2', attempts: [], playable: { kind: 'audio', url: '/last.ogg', mimeType: 'audio/ogg' } }) })
+    await store.playNow(mapped)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await wrapper.get('[data-audio-role="active"]').trigger('ended')
+      expect(store.status.value).toBe('ended')
+      expect(store.playbackIntent.value).toBe('paused')
+    } finally { wrapper.unmount(); store.dispose(); mediaPlay.mockRestore(); mediaPause.mockRestore() }
+  })
+  it('does not restart recovery when stalled arrives after an OS native pause', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const store = audioStoreStub()
+    store.requestSourceRecovery = vi.fn(async (): Promise<RecoveryOutcome> => 'stale')
+    store.activeProviderId = ref('vkeys')
+    store.enabledProviderIds = ref(['vkeys', 'gd-studio'])
+    store.automaticProviderIds = ref(['vkeys', 'gd-studio'])
+    store.playbackIntent = ref('playing')
+    store.currentTrack = ref({ ...store.currentTrack.value!, sources: [{ provider: 'vkeys', externalId: 'vkeys' }, { provider: 'gd-studio', externalId: 'own' }] })
+    const registry = new ProviderRegistry([
+      { provider: { id: 'vkeys', resolve: async () => ({ kind: 'audio', url: '/lx.mp3', mimeType: 'audio/mpeg' }) }, enabled: true, priority: 1, timeoutMs: 100 },
+      { provider: { id: 'gd-studio', resolve: async () => ({ kind: 'audio', url: '/own.mp3', mimeType: 'audio/mpeg' }) }, enabled: true, priority: 2, timeoutMs: 100 },
+    ])
+    store.registrySnapshot = () => ({ registry, failedProviderIds: [] })
+    const wrapper = mount(PlayerBar, { props: { store } })
+    const media = wrapper.get('[data-audio-role="active"]')
+    await media.trigger('pause')
+    await media.trigger('stalled')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(store.requestSourceRecovery).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
   it('tolerates browsers that reject individual system media actions and position state', async () => {
     vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
     const actions = new Map<string, ((details: MediaSessionActionDetails) => void) | null>()
@@ -227,6 +502,183 @@ describe('PlayerBar', () => {
     expect(session.metadata).toBeNull()
     expect(session.playbackState).toBe('none')
     Reflect.deleteProperty(navigator, 'mediaSession')
+  })
+
+  it.each([['lx', 'manual'], ['vkeys', 'automatic'], ['vkeys', 'manual']] as const)('renews stalled %s at the same position before the %s failure path', async (providerId, mode) => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const fallbackTrack: Track = {
+      id: 'same-track',
+      title: 'Same track',
+      aliases: {},
+      games: ['hsr'],
+      relationIds: [],
+      tabs: ['focus'],
+      workGroupId: 'wg',
+      vocalStatus: 'instrumental',
+      needsClassification: false,
+      sources: [
+        { provider: providerId, externalId: 'vkeys-same-track' },
+        { provider: 'gd-studio', externalId: 'gd-same-track' },
+      ],
+    }
+    const selectedProvider: AudioProvider = {
+      id: providerId,
+      resolve: vi.fn(async () => ({
+        kind: 'audio' as const,
+        url: 'https://media.invalid/vkeys-same-track.mp3',
+        mimeType: 'audio/mpeg',
+      })),
+    }
+    const gdProvider: AudioProvider = {
+      id: 'gd-studio',
+      resolve: vi.fn(async () => ({
+        kind: 'audio' as const,
+        url: 'https://media.invalid/gd-same-track.flac',
+        mimeType: 'audio/flac',
+      })),
+    }
+    const registry = new ProviderRegistry([
+      { provider: selectedProvider, enabled: true, priority: 1, timeoutMs: 100 },
+      { provider: gdProvider, enabled: true, priority: 2, timeoutMs: 100 },
+    ])
+    const store = createPlaybackStore({ registry })
+
+    await store.playNow(fallbackTrack)
+    if (mode === 'manual') await store.setSourceOverride(providerId)
+    vi.mocked(selectedProvider.resolve).mockClear()
+    vi.mocked(selectedProvider.resolve).mockResolvedValueOnce({ kind: 'audio', url: 'https://media.invalid/vkeys-fresh.mp3', mimeType: 'audio/mpeg' })
+    const listeningSession = store.listeningSessionId.value
+    const wrapper = mount(PlayerBar, { props: { store } })
+    const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+    setDuration(media.element, 240)
+    media.element.currentTime = 102
+    await media.trigger('timeupdate')
+    await media.trigger('waiting')
+
+    await vi.advanceTimersByTimeAsync(9_000)
+    await flushPromises()
+
+    expect(selectedProvider.resolve).toHaveBeenCalledTimes(1)
+    expect(gdProvider.resolve).not.toHaveBeenCalled()
+    expect(store.sourceOverride.value).toBe(mode === 'manual' ? providerId : undefined)
+    expect(store.activeProviderId.value).toBe(providerId)
+    expect(store.playable.value).toEqual({
+      kind: 'audio',
+      url: 'https://media.invalid/vkeys-fresh.mp3',
+      mimeType: 'audio/mpeg',
+    })
+    expect(store.currentTrack.value).toBe(fallbackTrack)
+    expect(store.listeningSessionId.value).toBe(listeningSession)
+
+    const replacement = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+    expect(vi.mocked(HTMLMediaElement.prototype.play).mock.instances).not.toContain(replacement.element)
+    setDuration(replacement.element, 240)
+    await replacement.trigger('loadedmetadata')
+    expect(replacement.element.currentTime).toBe(102)
+    Object.defineProperty(replacement.element, 'seeking', { configurable: true, value: true })
+    await replacement.trigger('seeking')
+    expect(store.pendingResumePosition.value).toBe(102)
+    expect(vi.mocked(HTMLMediaElement.prototype.play).mock.instances).not.toContain(replacement.element)
+    Object.defineProperty(replacement.element, 'seeking', { configurable: true, value: false })
+    await replacement.trigger('seeked')
+    await flushPromises()
+    expect(store.consumePendingResumePosition()).toBeUndefined()
+    expect(vi.mocked(HTMLMediaElement.prototype.play).mock.instances).toContain(replacement.element)
+
+    // A reload/playing event alone is not progress and cannot buy another renewal at 102 s.
+    await replacement.trigger('playing')
+    await replacement.trigger('waiting')
+    vi.setSystemTime(Date.now() + 60_000)
+    await vi.advanceTimersByTimeAsync(9_000)
+    await flushPromises()
+    expect(selectedProvider.resolve).toHaveBeenCalledTimes(1)
+    expect(store.sourceOverride.value).toBe(mode === 'manual' ? providerId : undefined)
+    expect(store.currentTrack.value).toBe(fallbackTrack)
+    expect(store.listeningSessionId.value).toBe(listeningSession)
+    expect(store.pendingResumePosition.value).toBe(102)
+    if (mode === 'automatic') {
+      expect(gdProvider.resolve).toHaveBeenCalledTimes(1)
+      expect(store.activeProviderId.value).toBe('gd-studio')
+    } else {
+      expect(gdProvider.resolve).not.toHaveBeenCalled()
+      expect(store.status.value).toBe('error')
+    }
+
+    const nextTrack: Track = { ...fallbackTrack, id: 'next-track', title: 'Next track' }
+    store.enqueue(nextTrack)
+    await wrapper.get('[data-player-next]').trigger('click')
+    await flushPromises()
+    expect(store.currentTrack.value?.id).toBe('next-track')
+    wrapper.unmount()
+    store.dispose()
+    vi.useRealTimers()
+  })
+
+  it('does not recover through another source after an explicit user pause', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const track: Track = {
+      id: 'paused-track',
+      title: 'Paused track',
+      aliases: {},
+      games: ['hsr'],
+      relationIds: [],
+      tabs: ['focus'],
+      workGroupId: 'wg',
+      vocalStatus: 'instrumental',
+      needsClassification: false,
+      sources: [
+        { provider: 'vkeys', externalId: 'vkeys-paused-track' },
+        { provider: 'gd-studio', externalId: 'gd-paused-track' },
+      ],
+    }
+    const gdProvider: AudioProvider = {
+      id: 'gd-studio',
+      resolve: vi.fn(async () => ({
+        kind: 'audio' as const,
+        url: 'https://media.invalid/gd-paused-track.flac',
+        mimeType: 'audio/flac',
+      })),
+    }
+    const vkeysProvider: AudioProvider = {
+      id: 'vkeys',
+      resolve: vi.fn(async () => ({
+        kind: 'audio' as const,
+        url: 'https://media.invalid/vkeys-paused-track.mp3',
+        mimeType: 'audio/mpeg',
+      })),
+    }
+    const registry = new ProviderRegistry([
+      { provider: vkeysProvider, enabled: true, priority: 1, timeoutMs: 100 },
+      { provider: gdProvider, enabled: true, priority: 2, timeoutMs: 100 },
+    ])
+    const store = createPlaybackStore({ registry })
+    await store.playNow(track)
+    await store.setSourceOverride('vkeys')
+    vi.mocked(gdProvider.resolve).mockClear()
+
+    const wrapper = mount(PlayerBar, { props: { store } })
+    const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+    setDuration(media.element, 180)
+    media.element.currentTime = 42
+    await media.trigger('timeupdate')
+    await media.trigger('playing')
+    await wrapper.vm.$nextTick()
+    await wrapper.get('[data-player-play]').trigger('click')
+    await media.trigger('waiting')
+    await vi.advanceTimersByTimeAsync(9_000)
+    await flushPromises()
+
+    expect(store.playbackIntent.value).toBe('paused')
+    expect(store.status.value).toBe('buffering')
+    expect(gdProvider.resolve).not.toHaveBeenCalled()
+    expect(store.activeProviderId.value).toBe('vkeys')
+    wrapper.unmount()
+    store.dispose()
+    vi.useRealTimers()
   })
   it('publishes native seek availability rather than assuming every known duration can seek', async () => {
     vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
@@ -699,7 +1151,11 @@ describe('PlayerBar', () => {
     const lease = playbackCommands.pauseForInterruption()
     if (finalCommand === 'pause') {
       await wrapper.vm.$nextTick()
+      ;(store.status as Ref<PlaybackStore['status']['value']>).value = 'paused'
+      await wrapper.vm.$nextTick()
       await wrapper.get('[aria-label="Play"]').trigger('click')
+      await wrapper.vm.$nextTick()
+      ;(store.status as Ref<PlaybackStore['status']['value']>).value = 'playing'
       await wrapper.vm.$nextTick()
       await wrapper.get('[aria-label="Pause"]').trigger('click')
     } else {
@@ -746,7 +1202,7 @@ describe('PlayerBar', () => {
 
     expect(store.reportMediaState).toHaveBeenCalledWith('playing', 10)
     expect(store.reportMediaState).toHaveBeenCalledWith('paused', 10)
-    expect(store.play).not.toHaveBeenCalled()
+    expect(store.play).toHaveBeenCalledOnce()
     wrapper.unmount()
   })
 
@@ -828,7 +1284,7 @@ describe('PlayerBar', () => {
     expect(store.next).not.toHaveBeenCalled()
   })
 
-  it('waits for the lead window before loading a speculative Jellyfin URL, then promotes the same deck', async () => {
+  it('waits for the lead window before resolving a third-party URL, then promotes the same deck', async () => {
     const originalConnection = Object.getOwnPropertyDescriptor(navigator, 'connection')
     const connection = {
       effectiveType: '4g', saveData: false,
@@ -838,10 +1294,10 @@ describe('PlayerBar', () => {
     const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
     const base = storeStub().currentTrack.value!
     const tracks = ['a', 'b', 'c'].map((id) => ({
-      ...base, id, title: id, sources: [{ provider: 'jellyfin', externalId: id + '.ogg' }],
+      ...base, id, title: id, sources: [{ provider: 'lx', externalId: id + '.ogg' }],
     } as Track))
     const resolve = vi.fn(async (track: Track) => ({
-      ok: true as const, providerId: 'jellyfin', attempts: [],
+      ok: true as const, providerId: 'lx', attempts: [],
       playable: { kind: 'audio' as const, url: 'https://media.invalid/' + track.id + '.ogg', mimeType: 'audio/ogg' },
     }))
     const store = createPlaybackStore({ resolve })
@@ -851,14 +1307,25 @@ describe('PlayerBar', () => {
     await flushPromises()
 
     const active = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
-    expect(store.preparedNext.value?.track).toBe(tracks[1])
+    expect(store.preloadPolicy.value).toBe('auto')
+    expect(store.preparedNext.value).toBeNull()
+    expect(resolve).toHaveBeenCalledTimes(1)
     expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
     setDuration(active.element, 240)
+    await active.trigger('loadedmetadata')
+    await active.trigger('timeupdate')
+    await flushPromises()
+    expect(store.preparedNext.value).toBeNull()
+    expect(resolve).toHaveBeenCalledTimes(1)
+
     active.element.currentTime = 225
     await active.trigger('loadedmetadata')
     await active.trigger('timeupdate')
     await flushPromises()
     const standby = wrapper.get<HTMLAudioElement>('[data-audio-role="standby"]')
+    expect(store.preparedNext.value?.track).toBe(tracks[1])
+    expect(store.preparedNext.value?.armed).toBe(true)
+    expect(resolve).toHaveBeenCalledTimes(2)
     expect(standby.attributes('preload')).toBe('auto')
     expect(standby.attributes('src')).toBe('https://media.invalid/b.ogg')
     expect(mediaPlay).not.toHaveBeenCalled()
@@ -878,6 +1345,7 @@ describe('PlayerBar', () => {
     await flushPromises()
     const promoted = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
     expect(promoted.element).toBe(standby.element)
+    expect(resolve).toHaveBeenCalledTimes(2)
     expect(promoted.element).not.toBe(active.element)
     expect(store.currentTrack.value).toBe(tracks[1])
     await promoted.trigger('timeupdate')
@@ -1002,15 +1470,15 @@ describe('PlayerBar', () => {
     expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
     expect(resolvedTracks).toEqual(['a'])
 
-    // 2. Just outside lead window (remaining 21s > 20s): still not armed
-    active.element.currentTime = 219
+    // 2. Just outside lead window (remaining 61s > 60s): still not armed
+    active.element.currentTime = 179
     await active.trigger('timeupdate')
     await flushPromises()
     expect(store.preparedNext.value).toBeNull()
     expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
     expect(resolvedTracks).toEqual(['a'])
 
-    // 3. Inside lead window (remaining 15s <= 20s): armed with preload="auto" even without navigator.connection
+    // 3. Inside lead window (remaining 15s <= 60s): armed with preload="auto" even without navigator.connection
     active.element.currentTime = 225
     await active.trigger('timeupdate')
     await flushPromises()
@@ -1036,7 +1504,7 @@ describe('PlayerBar', () => {
     else Reflect.deleteProperty(navigator, 'connection')
   })
 
-  it('uses preload="metadata" on standby deck when Save-Data is enabled', async () => {
+  it('avoids speculative requests and media loads when Save-Data is enabled', async () => {
     const originalConnection = Object.getOwnPropertyDescriptor(navigator, 'connection')
     Object.defineProperty(navigator, 'connection', {
       configurable: true,
@@ -1066,8 +1534,8 @@ describe('PlayerBar', () => {
     await active.trigger('timeupdate')
     await flushPromises()
 
-    const standby = wrapper.get<HTMLAudioElement>('[data-audio-role="standby"]')
-    expect(standby.attributes('preload')).toBe('metadata')
+    expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
+    expect(resolve).toHaveBeenCalledTimes(1)
 
     wrapper.unmount()
     store.dispose()
@@ -1076,7 +1544,7 @@ describe('PlayerBar', () => {
     else Reflect.deleteProperty(navigator, 'connection')
   })
 
-  it('uses preload="metadata" on standby deck on slow connections (2g)', async () => {
+  it('avoids speculative requests and media loads on slow connections (2g)', async () => {
     const originalConnection = Object.getOwnPropertyDescriptor(navigator, 'connection')
     Object.defineProperty(navigator, 'connection', {
       configurable: true,
@@ -1106,8 +1574,8 @@ describe('PlayerBar', () => {
     await active.trigger('timeupdate')
     await flushPromises()
 
-    const standby = wrapper.get<HTMLAudioElement>('[data-audio-role="standby"]')
-    expect(standby.attributes('preload')).toBe('metadata')
+    expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
+    expect(resolve).toHaveBeenCalledTimes(1)
 
     wrapper.unmount()
     store.dispose()
@@ -1367,6 +1835,7 @@ describe('PlayerBar', () => {
   it('replays a fully buffered Repeat One deck without resolving another source', async () => {
     const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
     const store = audioStoreStub()
+    store.playbackIntent = ref('playing')
     store.repeatMode = ref('one') as never
     const wrapper = mount(PlayerBar, { props: { store } })
     const audio = wrapper.get<HTMLAudioElement>('audio')
@@ -1472,8 +1941,8 @@ describe('PlayerBar', () => {
 
     expect(play).toHaveBeenCalledOnce()
     expect(reportPlaybackFailure).not.toHaveBeenCalled()
-    expect(store.status.value).toBe('ready')
-    expect(store.playbackIntent.value).toBe('paused')
+    expect(store.status.value).toBe('paused')
+    expect(store.playbackIntent.value).toBe('playing')
     expect(wrapper.get('[aria-label="Play"]').element).toBeTruthy()
     expect(store.currentTrack.value).toBe(preserved.track)
     expect(store.currentTrack.value?.id).toBe('selected-track')
@@ -1507,7 +1976,10 @@ describe('PlayerBar', () => {
     const store = storeStub()
     store.activeProviderId = { value: 'r2' } as never
     store.status = { value: 'paused' } as never
-    store.playbackIntent = { value: 'paused' } as never
+    const intent = ref<'playing' | 'paused'>('paused')
+    store.playbackIntent = intent
+    // Mirror the real store command: an explicit Play changes intent before native play rejects.
+    vi.mocked(store.play).mockImplementation(async () => { intent.value = 'playing' })
     store.playable = { value: { kind: 'audio', url: 'https://media.invalid/broken.ogg', mimeType: 'audio/ogg' } } as never
     const wrapper = mount(PlayerBar, { props: { store } })
 
@@ -1635,6 +2107,7 @@ describe('PlayerBar custom controls', () => {
     const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
     const mediaPause = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
     const wrapper = mount(PlayerBar, { props: { store, compact: true } })
+    ;(store.status as Ref<PlaybackStore['status']['value']>).value = 'paused'
     expect(wrapper.findAll('audio')).toHaveLength(1)
     expect(wrapper.get('audio').attributes('controls')).toBeUndefined()
     for (const label of ['Previous track', 'Play', 'Next track']) {
@@ -1646,6 +2119,7 @@ describe('PlayerBar custom controls', () => {
     expect(mediaPlay).toHaveBeenCalledOnce()
     expect(store.next).toHaveBeenCalledOnce()
     ;(store.playbackIntent as Ref<'playing' | 'paused'>).value = 'playing'
+    ;(store.status as Ref<PlaybackStore['status']['value']>).value = 'playing'
     await wrapper.vm.$nextTick()
     expect(wrapper.findAll('button[aria-label="Pause"]')).toHaveLength(1)
     await wrapper.get('button[aria-label="Pause"]').trigger('click')
@@ -2115,7 +2589,9 @@ describe('PlayerBar custom controls', () => {
       expect(lxProvider.resolve).toHaveBeenCalled()
     })
 
-    it('surfaces LX failure and does not invoke Jellyfin when manual LX override fails in the production UI', async () => {
+    it('halts a failed manual LX without Jellyfin and without changing the picker preference', async () => {
+      // D16 = No, Property 30 (tasks 8.1, 8.4): a manual source runs alone; its failure halts on the
+      // track and never starts the Jellyfin recovery.
       const lxProvider: AudioProvider = {
         id: 'lx',
         canResolve: (_track) => true,
@@ -2163,6 +2639,8 @@ describe('PlayerBar custom controls', () => {
       expect(store.sourceOverride.value).toBe('lx')
       expect(store.status.value).toBe('error')
       expect(store.activeProviderId.value).toBeUndefined()
+      expect(store.currentTrack.value).toBe(track)
+      expect(lxProvider.resolve).toHaveBeenCalled()
       expect(jellyfinResolve).not.toHaveBeenCalled()
       expect(select.element.value).toBe('lx')
       const statusText = wrapper.get('.player-bar__status').text()
@@ -2702,5 +3180,184 @@ describe('PlayerBar custom controls', () => {
       expect(status).not.toContain('ChKSz')
       expect(status).not.toContain('Playing from')
     })
+  })
+})
+
+// Wave A verify-first checks (P95-03, P95-04). A pass on 8309e3a refutes the finding.
+describe('PlayerBar verify first (Wave A)', () => {
+  function stalledLxStore() {
+    const track: Track = {
+      id: 'verify-first', title: 'Verify first', aliases: {}, games: ['genshin'], relationIds: [], tabs: ['focus'],
+      workGroupId: 'wg', vocalStatus: 'instrumental', needsClassification: false,
+      sources: [{ provider: 'lx', externalId: 'lx' }, { provider: 'gd-studio', externalId: 'netease:123:320' }],
+    }
+    const gd = vi.fn(async () => ({ kind: 'audio' as const, url: '/gd.mp3', mimeType: 'audio/mpeg' }))
+    const lx = vi.fn(async () => ({ kind: 'audio' as const, url: '/lx.mp3', mimeType: 'audio/mpeg' }))
+    const registry = new ProviderRegistry([
+      { provider: { id: 'lx', resolve: lx }, enabled: true, priority: 1, timeoutMs: 300_000 },
+      { provider: { id: 'gd-studio', resolve: gd }, enabled: true, priority: 2, timeoutMs: 100 },
+    ])
+    return { track, lx, gd, store: createPlaybackStore({ registry }) }
+  }
+
+  it('P95-03: a timer lease taken after a native pause does not call play() on release', async () => {
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track } = stalledVkeysStore()
+    await store.playNow(track)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await flushPromises()
+      const media = wrapper.get('[data-audio-role="active"]')
+      await media.trigger('playing')
+      // The OS pauses the element (not a user pause, not the end of the track).
+      await media.trigger('pause')
+      const playCount = mediaPlay.mock.calls.length
+      const lease = playbackCommands.pauseForInterruption()
+      lease?.resumeIfStillOwned()
+      await flushPromises()
+      expect(mediaPlay).toHaveBeenCalledTimes(playCount)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it('P95-04: a 9 s stall timer delivered after 60 s three times with currentTime unchanged starts one recovery', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track, lx, gd } = stalledLxStore()
+    lx.mockResolvedValueOnce({ kind: 'audio', url: '/lx.mp3', mimeType: 'audio/mpeg' })
+      .mockImplementation(() => new Promise<never>(() => {}))
+    await store.playNow(track)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+      await media.trigger('playing')
+      expect(store.activeProviderId.value).toBe('lx')
+      for (let firing = 0; firing < 3; firing += 1) {
+        // The tab was throttled: the clock jumps 60 s, then the 9 s timer is finally delivered.
+        vi.setSystemTime(Date.now() + 60_000)
+        await vi.advanceTimersByTimeAsync(9_000)
+      }
+      await vi.advanceTimersByTimeAsync(0)
+      expect(media.element.currentTime).toBe(0)
+      expect(lx).toHaveBeenCalledTimes(2)
+      expect(gd).not.toHaveBeenCalled()
+      expect(store.activeProviderId.value).toBe('lx')
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
+  it('P95-04: a 9 s stall timer delivered after 60 s three times with currentTime unchanged renews each source once and exhausts the stalled chain', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
+    const { store, track, vkeys, gd } = stalledVkeysStore()
+    await store.playNow(track)
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      const media = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]')
+      await media.trigger('playing')
+      expect(store.activeProviderId.value).toBe('vkeys')
+      for (let firing = 0; firing < 3; firing += 1) {
+        // The tab was throttled: the clock jumps 60 s, then the 9 s timer is finally delivered.
+        vi.setSystemTime(Date.now() + 60_000)
+        await vi.advanceTimersByTimeAsync(9_000)
+        if (firing === 0) {
+          expect(vkeys).toHaveBeenCalledTimes(2)
+          expect(gd).not.toHaveBeenCalled()
+        }
+
+      }
+      await vi.advanceTimersByTimeAsync(0)
+      expect(media.element.currentTime).toBe(0)
+      expect(vkeys).toHaveBeenCalledTimes(2)
+      expect(gd).toHaveBeenCalledTimes(2)
+      expect(store.activeProviderId.value).toBe('gd-studio')
+      // Neither source made progress: the next normal deadline halts instead of looping.
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(vkeys).toHaveBeenCalledTimes(2)
+      expect(gd).toHaveBeenCalledTimes(2)
+      expect(store.status.value).toBe('error')
+      expect(store.currentTrack.value).toBe(track)
+      expect(store.pendingResumePosition.value).toBe(0)
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+})
+
+describe('LX same-track artwork presentation',()=>{
+ beforeEach(()=>vi.spyOn(HTMLMediaElement.prototype,'pause').mockImplementation(()=>{}))
+ function lxStore(sources:Track['sources']=[{provider:'chksz',externalId:'2155423467'}]){
+  const store=audioStoreStub();store.activeProviderId=ref('lx');store.enabledProviderIds=ref(['lx']);store.manualProviderIds=ref(['lx']);store.playbackIntent=ref('paused')
+  ;(store.currentTrack as Ref<Track|undefined>).value={...store.currentTrack.value!,id:'lx-first',sources}
+  return store
+ }
+ it('uses the exact NetEase binding through the LX proxy while Jellyfin is disabled and audio state stays unchanged',async()=>{
+  const store=lxStore(),playable=store.playable.value,generation=store.playbackGeneration.value,queue=store.queue.value,resolveSpy=vi.spyOn(globalThis,'fetch');const wrapper=mount(PlayerBar,{props:{store}})
+  const compact=mount(CompactPlayback,{props:{store}})
+  await flushPromises();expect(wrapper.get('[data-player-artwork-image]').attributes('src')).toBe('/api/providers/lx/artwork/2155423467')
+  expect(compact.get('.compact-playback__artwork img').attributes('src')).toBe('/api/providers/lx/artwork/2155423467')
+  expect(store.playable.value).toBe(playable);expect(store.playbackGeneration.value).toBe(generation);expect(store.queue.value).toBe(queue);expect(store.activeProviderId.value).toBe('lx');expect(store.setSourceOverride).not.toHaveBeenCalled();expect(resolveSpy).not.toHaveBeenCalled();compact.unmount();wrapper.unmount()
+ })
+ it('accepts a wy LX binding without a ChKSz source',async()=>{
+  const store=lxStore([{provider:'lx',externalId:'wy:2155423467:128k'}]);const wrapper=mount(PlayerBar,{props:{store}});await flushPromises();expect(wrapper.get('[data-player-artwork-image]').attributes('src')).toBe('/api/providers/lx/artwork/2155423467');wrapper.unmount()
+ })
+ it.each([
+  {label:'non-NetEase platform',sources:[{provider:'lx',externalId:'tx:2155423467'}]},
+  {label:'invalid wy id',sources:[{provider:'lx',externalId:'wy:../private'}]},
+  {label:'Jellyfin-only binding',sources:[{provider:'jellyfin',externalId:'6213b704a0d954293110f4d561b0f614'}]},
+ ])('does not guess cover identity for $label',async ({sources})=>{
+  const wrapper=mount(PlayerBar,{props:{store:lxStore(sources)}});await flushPromises();expect(wrapper.find('[data-player-artwork-image]').exists()).toBe(false);wrapper.unmount()
+ })
+ it('refuses to use the LX proxy when LX is no longer enabled',async()=>{const store=lxStore();store.enabledProviderIds=ref([]);const wrapper=mount(PlayerBar,{props:{store}});await flushPromises();expect(wrapper.find('[data-player-artwork-image]').exists()).toBe(false);wrapper.unmount()})
+ it('shows a fallback on image failure without switching or resolving audio',async()=>{
+  const store=lxStore(),playable=store.playable.value,wrapper=mount(PlayerBar,{props:{store}});await flushPromises();await wrapper.get('[data-player-artwork-image]').trigger('error');await flushPromises();expect(wrapper.find('[data-player-artwork-fallback]').exists()).toBe(true);expect(store.playable.value).toBe(playable);expect(store.setSourceOverride).not.toHaveBeenCalled();wrapper.unmount()
+ })
+ it('ignores a previous track image error after a generation change',async()=>{
+  const store=lxStore(),wrapper=mount(PlayerBar,{props:{store}});await flushPromises();const previous=wrapper.get<HTMLImageElement>('[data-player-artwork-image]').element
+  ;(store.currentTrack as Ref<Track|undefined>).value={...store.currentTrack.value!,id:'lx-second',sources:[{provider:'chksz',externalId:'123456'}]};(store.playbackGeneration as Ref<number>).value++
+  await wrapper.vm.$nextTick();previous.dispatchEvent(new Event('error'));await flushPromises();expect(wrapper.get('[data-player-artwork-image]').attributes('src')).toBe('/api/providers/lx/artwork/123456');wrapper.unmount()
+ })
+})
+
+
+describe('independent GD Studio artwork presentation', () => {
+  it.each([
+    { label: 'canonical fallback', sources: [{ provider: 'chksz', externalId: '2155423467' }], expected: '/api/providers/gd-studio/artwork/2155423467' },
+    { label: 'explicit ID takes priority', sources: [{ provider: 'chksz', externalId: '123456' }, { provider: 'gd-studio', externalId: 'netease:2155423467:320' }], expected: '/api/providers/gd-studio/artwork/2155423467' },
+    { label: 'explicit non-NetEase source', sources: [{ provider: 'gd-studio', externalId: 'tencent:123456:320' }, { provider: 'chksz', externalId: '2155423467' }], expected: null },
+    { label: 'invalid explicit source', sources: [{ provider: 'gd-studio', externalId: 'netease:../private' }, { provider: 'chksz', externalId: '2155423467' }], expected: null },
+  ])('matches the resolved binding for $label', async ({ sources, expected }) => {
+    const store = audioStoreStub()
+    store.activeProviderId = ref('gd-studio')
+    store.enabledProviderIds = ref(['gd-studio'])
+    store.playbackIntent = ref('paused')
+    ;(store.currentTrack as Ref<Track | undefined>).value = { ...store.currentTrack.value!, sources }
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await flushPromises()
+      const image = wrapper.find('[data-player-artwork-image]')
+      if (expected) expect(image.attributes('src')).toBe(expected)
+      else expect(image.exists()).toBe(false)
+    } finally { wrapper.unmount() }
+  })
+
+  it('uses its own cover route with LX disabled and preserves audio state', async () => {
+    const store = audioStoreStub()
+    store.activeProviderId = ref('gd-studio')
+    store.enabledProviderIds = ref(['gd-studio'])
+    store.playbackIntent = ref('paused')
+    ;(store.currentTrack as Ref<Track | undefined>).value = {
+      ...store.currentTrack.value!,
+      sources: [{ provider: 'gd-studio', externalId: 'netease:2155423467:320' }],
+    }
+    const playable = store.playable.value
+    const wrapper = mount(PlayerBar, { props: { store } })
+    try {
+      await flushPromises()
+      expect(wrapper.get('[data-player-artwork-image]').attributes('src')).toBe('/api/providers/gd-studio/artwork/2155423467')
+      expect(store.playable.value).toBe(playable)
+      expect(store.setSourceOverride).not.toHaveBeenCalled()
+    } finally { wrapper.unmount() }
   })
 })

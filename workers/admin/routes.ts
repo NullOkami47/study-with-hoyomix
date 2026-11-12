@@ -16,10 +16,11 @@ import {
   readChkszOwnerFallbackEnabled,
 } from '../providers/chkszCredentials'
 import {
-  ChkszAdminSearchRateLimiter,
+  chkszAdminSearchRateLimiter,
   executeChkszAdminSearch,
   validateChkszAdminSearchBody,
 } from '../providers/chkszSearchProxy'
+import type { RateLimiter } from '../rateLimit'
 
 export interface AdminEnv extends ProviderEnv, BackgroundEnv {}
 
@@ -27,7 +28,8 @@ export interface AdminOptions {
   crypto?: Crypto
   now?: () => number
   fetch?: typeof fetch
-  chkszSearchLimiter?: ChkszAdminSearchRateLimiter
+  /** Omitted: the shared binding when configured, else the module-scope fallback (M-06). */
+  chkszSearchLimiter?: RateLimiter
   /** @internal Test-only: bypass in-memory inFlightPurges guard to model separate isolates. */
   __test_disableInFlightGuard?: boolean
 }
@@ -176,7 +178,7 @@ export function createAdminHandler(env: AdminEnv, options: AdminOptions = {}) {
   const now = options.now ?? Date.now
   const cryptoApi = options.crypto ?? globalThis.crypto
   const fetchImpl = options.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init))
-  const searchLimiter = options.chkszSearchLimiter ?? new ChkszAdminSearchRateLimiter(now)
+  const searchLimiter = options.chkszSearchLimiter ?? chkszAdminSearchRateLimiter(env.AUTH_START_LIMITER)
   const publicOrigin = new URL(env.PUBLIC_ORIGIN).origin
 
   const {currentUser,currentAdmin}=createAdminAuthorisation(env,{now,crypto:cryptoApi})

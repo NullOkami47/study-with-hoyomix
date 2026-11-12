@@ -1,15 +1,16 @@
+import { GD_STUDIO_API_ORIGIN } from '../../src/shared/gdStudio'
 import type { AuthEnv } from '../auth/routes'
 import type { D1Database } from '../env'
 import { parseJellyfinUserId } from './jellyfin'
 
-export const PLAYBACK_PROVIDER_IDS = ['chksz', 'lx', 'jellyfin'] as const
+export const PLAYBACK_PROVIDER_IDS = ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'] as const
 export type PlaybackProviderId = typeof PLAYBACK_PROVIDER_IDS[number]
 
 export type LegacyProviderId =
   | 'r2' | 'meting'
   | 'lx-huibq' | 'lx-ikun' | 'lx-juhe' | 'lx-qdy'
   | 'lx-flower' | 'lx-lx' | 'lx-grass' | 'lx-sixyin'
-  | 'piped' | 'invidious' | 'youtube' | 'qijie' | 'gd-studio'
+  | 'piped' | 'invidious' | 'youtube' | 'qijie'
   | 'lx-huanyin'
 
 export type CanonicalProviderId = PlaybackProviderId | LegacyProviderId
@@ -39,6 +40,8 @@ export interface ProviderEnv extends AuthEnv {
   JELLYFIN_BASE_URL?: string
   JELLYFIN_API_TOKEN?: string
   JELLYFIN_USER_ID?: string
+  /** Opt-in rollout flag; never a credential. Provider also requires admin enablement. */
+  VKEYS_ENABLED?: string
   GD_STUDIO_API_BASE_URL?: string
   GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES?: string
   HUANYIN_API_BASE_URL?: string
@@ -80,7 +83,9 @@ interface ProviderHealthRow {
 export const CANONICAL_PROVIDERS: readonly CanonicalProviderDefinition[] = Object.freeze([
   Object.freeze({ id: 'chksz' as const, defaults: Object.freeze({ enabled: true, priority: 10 }), automaticPolicy: 'direct' as const }),
   Object.freeze({ id: 'lx' as const, defaults: Object.freeze({ enabled: true, priority: 20 }), automaticPolicy: 'direct' as const }),
-  Object.freeze({ id: 'jellyfin' as const, defaults: Object.freeze({ enabled: true, priority: 30 }), automaticPolicy: 'direct' as const }),
+  Object.freeze({ id: 'jellyfin' as const, defaults: Object.freeze({ enabled: false, priority: 30 }), automaticPolicy: 'direct' as const }),
+  Object.freeze({ id: 'gd-studio' as const, defaults: Object.freeze({ enabled: true, priority: 40 }), automaticPolicy: 'direct' as const }),
+  Object.freeze({ id: 'vkeys' as const, defaults: Object.freeze({ enabled: false, priority: 50 }), automaticPolicy: 'direct' as const }),
 ])
 
 const validStatuses = new Set<ProviderState['status']>(['unknown', 'healthy', 'degraded', 'unavailable'])
@@ -273,8 +278,10 @@ export const configuredJellyfinUserId = (env: ProviderEnv): string | null => {
   return parseJellyfinUserId(value)
 }
 
-export const configuredGdStudioOrigin = (env: ProviderEnv): string | null =>
-  parseConfiguredResolverOrigin(env.GD_STUDIO_API_BASE_URL)
+export const configuredGdStudioOrigin = (env: ProviderEnv): string | null => {
+  const origin = parseConfiguredResolverOrigin(env.GD_STUDIO_API_BASE_URL)
+  return origin === GD_STUDIO_API_ORIGIN ? origin : null
+}
 
 export const configuredGdStudioMediaHostnames = (env: ProviderEnv): string[] | null =>
   parseMetingAllowedHostnames(env.GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES)
@@ -309,9 +316,9 @@ export const deploymentAvailable = (id: CanonicalProviderId, env: ProviderEnv) =
         configuredLxMediaHostnames(id, env) !== null &&
         configuredLxRequestKey(id, env) !== null
     case 'jellyfin':
-      return configuredJellyfinOrigin(env) !== null &&
-        configuredJellyfinApiToken(env) !== null &&
-        configuredJellyfinUserId(env) !== null
+      return false // Retired by the owner; saved legacy configuration cannot restore it.
+    case 'vkeys':
+      return env.VKEYS_ENABLED === 'true'
     case 'gd-studio':
       return configuredGdStudioOrigin(env) !== null &&
         configuredGdStudioMediaHostnames(env) !== null

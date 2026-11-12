@@ -10,6 +10,11 @@ export {
   type ChkszQuality,
 }
 
+export const GD_STUDIO_QUALITIES = ['auto', '128', '192', '320', '740', '999'] as const
+export type GdStudioQuality = typeof GD_STUDIO_QUALITIES[number]
+export const isGdStudioQuality = (value: unknown): value is GdStudioQuality =>
+  typeof value === 'string' && (GD_STUDIO_QUALITIES as readonly string[]).includes(value)
+
 export const LX_QUALITIES = ['standard', 'high', 'lossless', 'hires'] as const
 export type LxQuality = typeof LX_QUALITIES[number]
 
@@ -25,9 +30,12 @@ export interface PlaybackQualityPreferencesEnvelope {
   version: 1
   chksz: ChkszQuality
   lx: LxQuality
+  gdStudio?: GdStudioQuality
 }
 
 export interface PlaybackQualityPreferencesStore {
+  gdStudioQuality(): GdStudioQuality
+  setGdStudioQuality(quality: GdStudioQuality): void
   chkszQuality(): ChkszQuality
   setChkszQuality(quality: ChkszQuality): void
   lxQuality(): LxQuality
@@ -60,6 +68,7 @@ export function createPlaybackQualityPreferencesStore(
   const storage = options.storage ?? defaultStorage()
   let chksz: ChkszQuality = 'standard'
   let lx: LxQuality = 'standard'
+  let gdStudio: GdStudioQuality = 'auto'
   let currentRevision = 0
   const listeners = new Set<() => void>()
 
@@ -70,6 +79,7 @@ export function createPlaybackQualityPreferencesStore(
         version: 1,
         chksz,
         lx,
+        ...(gdStudio !== 'auto' ? { gdStudio } : {}),
       }
       storage.setItem(PLAYBACK_QUALITY_STORAGE_KEY, JSON.stringify(payload))
     } catch {
@@ -103,6 +113,7 @@ export function createPlaybackQualityPreferencesStore(
       if (isLxQuality(parsed.lx)) {
         lx = parsed.lx
       }
+      if (isGdStudioQuality(parsed.gdStudio)) gdStudio = parsed.gdStudio
       if (migrated) {
         writeLocal()
       }
@@ -125,6 +136,13 @@ export function createPlaybackQualityPreferencesStore(
   readLocal()
 
   return {
+    gdStudioQuality: () => gdStudio,
+    setGdStudioQuality(quality: GdStudioQuality) {
+      if (!isGdStudioQuality(quality) || quality === gdStudio) return
+      gdStudio = quality
+      writeLocal()
+      notify()
+    },
     chkszQuality: () => chksz,
     setChkszQuality(quality: ChkszQuality) {
       if (!isChkszQuality(quality) || quality === chksz) return

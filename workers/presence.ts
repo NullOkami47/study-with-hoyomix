@@ -4,8 +4,17 @@ import { hashSessionToken, readCookie, SESSION_COOKIE } from './auth/session'
 const VISITOR_COOKIE = '__Host-presence'
 const STALE_MS = 90_000
 const OWNER_RECHECK_MS = 300_000
+// Connection caps mirror community chat (M-07): per visitor and per object.
+export const PRESENCE_MAX_SOCKETS_PER_VISITOR = 5
+export const PRESENCE_MAX_SOCKETS = 2000
+// Aggregate broadcasts are sent only on change and at most once per interval.
+export const PRESENCE_BROADCAST_INTERVAL_MS = 1000
 export interface PresenceNamespace { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } }
-export interface PresenceEnv extends AuthEnv { PRESENCE?: PresenceNamespace }
+export interface PresenceEnv extends AuthEnv {
+  PRESENCE?: PresenceNamespace
+  /** HMAC key for server-issued visitor tokens (decision D5). Set only as a Worker secret. */
+  PRESENCE_SECRET?: string
+}
 export interface PresenceIdentity { visitor: string; sessionHash: string; owner: boolean; expiresAt: number; checkedAt: number; lastSeen: number }
 interface PresenceSocket extends WebSocket { serializeAttachment(value: PresenceIdentity): void; deserializeAttachment(): PresenceIdentity }
 interface PresenceState {
@@ -37,6 +46,41 @@ export const presenceSummary = (identities: PresenceIdentity[], now: number) => 
 })
 
 const room = (env: PresenceEnv) => env.PRESENCE?.get(env.PRESENCE.idFromName('study-with-hoyomix'))
+
+// Visitor token (M-07, D5): `<uuid>.<base64url(HMAC-SHA256(PRESENCE_SECRET, "presence:v1:" + uuid))>`,
+// 80 cookie-safe characters. The UUID is always server-random; the browser never chooses it.
+const TOKEN_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/
+const TOKEN_CONTEXT = 'presence:v1:'
+let signingKey: { secret: string; key: Promise<CryptoKey> } | undefined
+const presenceKey = (secret: string) => {
+  if (signingKey?.secret !== secret) {
+    signingKey = { secret, key: crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']) }
+  }
+  return signingKey.key
+}
+const base64url = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const fromBase64url = (value: string) => Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4)), char => char.charCodeAt(0))
+/** A missing or blank secret means presence is unavailable; unsigned IDs are never issued. */
+export const presenceSecret = (env: Pick<PresenceEnv, 'PRESENCE_SECRET'>) => env.PRESENCE_SECRET?.trim() ? env.PRESENCE_SECRET : ''
+
+export async function issuePresenceVisitor(secret: string, id: string = crypto.randomUUID()): Promise<string> {
+  const signature = await crypto.subtle.sign('HMAC', await presenceKey(secret), new TextEncoder().encode(TOKEN_CONTEXT + id))
+  return `${id}.${base64url(new Uint8Array(signature))}`
+}
+
+/** Returns the visitor ID for a valid server-issued token, otherwise null. The MAC check is constant-time. */
+export async function verifyPresenceVisitor(token: string, secret: string): Promise<string | null> {
+  const match = TOKEN_PATTERN.exec(token)
+  if (!match || !secret) return null
+  let signature: Uint8Array
+  try { signature = fromBase64url(match[2]) } catch { return null }
+  if (signature.byteLength !== 32 || base64url(signature) !== match[2]) return null
+  const valid = await crypto.subtle.verify('HMAC', await presenceKey(secret), signature, new TextEncoder().encode(TOKEN_CONTEXT + match[1]))
+  return valid ? match[1] : null
+}
+
+const noStore = { 'cache-control': 'no-store' }
+const unavailable = () => Response.json({ error: 'presence_unavailable' }, { status: 503, headers: noStore })
 export async function readPresenceVisitorBody(request: Request): Promise<string | null> {
   const length = Number(request.headers.get('content-length'))
   if (Number.isFinite(length) && length > 100) return null
@@ -62,18 +106,22 @@ export async function readPresenceVisitorBody(request: Request): Promise<string 
 export const presenceRoute = async (request: Request, env: PresenceEnv): Promise<Response> => {
   const url = new URL(request.url)
   if (request.headers.get('origin') !== env.PUBLIC_ORIGIN || url.origin !== env.PUBLIC_ORIGIN) return new Response(null, { status: 403 })
-  if (!env.PRESENCE) return Response.json({ error: 'presence_unavailable' }, { status: 503 })
+  if (!env.PRESENCE) return unavailable()
+  // Fail closed for bootstrap and upgrade alike: without the key no identity can be issued or verified.
+  const secret = presenceSecret(env)
+  if (!secret) return unavailable()
   if (url.pathname === '/api/presence/visitor') {
     if (request.method !== 'POST') return new Response(null, { status: 405 })
     const prior = readCookie(request, VISITOR_COOKIE)
-    const supplied = await readPresenceVisitorBody(request)
-    if (supplied === null) return new Response(null, { status: 413 })
-    const visitor = /^[a-f0-9-]{36}$/.test(prior) ? prior : /^[a-f0-9-]{36}$/.test(supplied) ? supplied : crypto.randomUUID()
-    return new Response(null, { status: 204, headers: { 'cache-control': 'no-store', 'set-cookie': `${VISITOR_COOKIE}=${visitor}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400` } })
+    // The body is bounded but ignored: a client-supplied ID is never adopted (M-07).
+    if (await readPresenceVisitorBody(request) === null) return new Response(null, { status: 413 })
+    // A valid issued token stays stable; a forged, unsigned (pre-M-07) or stale-key token is replaced.
+    const token = await verifyPresenceVisitor(prior, secret) ? prior : await issuePresenceVisitor(secret)
+    return new Response(null, { status: 204, headers: { ...noStore, 'set-cookie': `${VISITOR_COOKIE}=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400` } })
   }
   if (request.method !== 'GET' || request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response(null, { status: 426 })
-  const visitor = readCookie(request, VISITOR_COOKIE)
-  if (!/^[a-f0-9-]{36}$/.test(visitor)) return new Response(null, { status: 401 })
+  const visitor = await verifyPresenceVisitor(readCookie(request, VISITOR_COOKIE), secret)
+  if (!visitor) return Response.json({ error: 'visitor_invalid' }, { status: 401, headers: noStore })
   const token = readCookie(request, SESSION_COOKIE)
   const sessionHash = token ? await hashSessionToken(token, env.SESSION_HMAC_SECRET, crypto) : ''
   const now = Date.now()
@@ -85,6 +133,11 @@ export const presenceRoute = async (request: Request, env: PresenceEnv): Promise
 
 /** Only transient socket attachments and one alarm are persisted. Never writes D1. */
 export class OnlinePresence {
+  // Coalescing state is in memory only. A pending frame is flushed by the alarm well before the
+  // object could hibernate; after reconstruction the next change is always sent.
+  private lastSent: string | null = null
+  private lastSentAt = -Infinity
+  private pendingAt: number | null = null
   constructor(private state: PresenceState, private env: PresenceEnv) {
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
   }
@@ -99,8 +152,8 @@ export class OnlinePresence {
   private async schedule(exclude?: PresenceSocket): Promise<void> {
     const now = Date.now()
     const identities = this.active(exclude).map(socket => this.identity(socket))
-    if (!identities.length) { await this.state.storage.deleteAlarm(); return }
-    const next = Math.min(...identities.map(identity => Math.min(identity.lastSeen + STALE_MS,
+    if (!identities.length) { this.pendingAt = null; await this.state.storage.deleteAlarm(); return }
+    const next = Math.min(this.pendingAt ?? Infinity, ...identities.map(identity => Math.min(identity.lastSeen + STALE_MS,
       identity.owner ? Math.min(identity.expiresAt, identity.checkedAt + OWNER_RECHECK_MS) : Infinity)))
     await schedulePresenceAlarm(this.state.storage, now, Math.max(now + 1, next))
   }
@@ -114,10 +167,16 @@ export class OnlinePresence {
       return new Response(null, { status: 204 })
     }
     const identity = JSON.parse(request.headers.get('x-presence-identity')!) as PresenceIdentity
+    // Caps are checked before accepting, so a rejected attempt costs no socket and no frame.
+    const live = this.active()
+    if (live.length >= PRESENCE_MAX_SOCKETS ||
+      live.filter(socket => this.identity(socket).visitor === identity.visitor).length >= PRESENCE_MAX_SOCKETS_PER_VISITOR) {
+      return Response.json({ error: 'connection_limit' }, { status: 429, headers: noStore })
+    }
     const pair = new WebSocketPair()
     this.state.acceptWebSocket(pair[1])
     pair[1].serializeAttachment(identity)
-    this.broadcast()
+    this.publish()
     await this.schedule()
     return new Response(null, { status: 101, webSocket: pair[0] } as ResponseInit)
   }
@@ -125,13 +184,26 @@ export class OnlinePresence {
     // Heartbeats are handled by the runtime without waking this object. Refresh
     // requests only read the aggregate; they cannot renew a lease or claim a role.
     if (message !== 'refresh') return
-    socket.send(JSON.stringify(presenceSummary(this.active().map(item => this.identity(item)), Date.now())))
+    const payload = JSON.stringify(presenceSummary(this.active().map(item => this.identity(item)), Date.now()))
+    // This tab now holds a value newer than the last broadcast; if the aggregate reverts before the
+    // deferred frame, the next publish must still send it rather than treat it as unchanged.
+    if (payload !== this.lastSent) this.lastSent = null
+    socket.send(payload)
   }
-  async webSocketClose(socket: PresenceSocket): Promise<void> { socket.close(); this.broadcast(socket); await this.schedule(socket) }
-  async webSocketError(socket: PresenceSocket): Promise<void> { socket.close(1011, 'Connection failed'); this.broadcast(socket); await this.schedule(socket) }
-  private broadcast(exclude?: PresenceSocket): void {
+  async webSocketClose(socket: PresenceSocket): Promise<void> { socket.close(); this.publish(socket); await this.schedule(socket) }
+  async webSocketError(socket: PresenceSocket): Promise<void> { socket.close(1011, 'Connection failed'); this.publish(socket); await this.schedule(socket) }
+  /**
+   * Coalesced broadcast (M-07): the aggregate is sent only when it differs from the last frame,
+   * and at most once per PRESENCE_BROADCAST_INTERVAL_MS. A change inside the interval is deferred
+   * to the alarm (see schedule()), which recomputes the then-current aggregate.
+   */
+  private publish(exclude?: PresenceSocket): void {
+    const now = Date.now()
     const sockets = this.active(exclude)
-    const payload = JSON.stringify(presenceSummary(sockets.map(socket => this.identity(socket)), Date.now()))
+    const payload = JSON.stringify(presenceSummary(sockets.map(socket => this.identity(socket)), now))
+    if (payload === this.lastSent) { this.pendingAt = null; return }
+    if (now - this.lastSentAt < PRESENCE_BROADCAST_INTERVAL_MS) { this.pendingAt = this.lastSentAt + PRESENCE_BROADCAST_INTERVAL_MS; return }
+    this.lastSent = payload; this.lastSentAt = now; this.pendingAt = null
     for (const socket of sockets) { try { socket.send(payload) } catch { socket.close() } }
   }
   async alarm(): Promise<void> {
@@ -154,7 +226,7 @@ export class OnlinePresence {
         changed ||= identity.owner !== (account?.role === 'owner')
       }
     }
-    if (changed) this.broadcast()
+    if (changed || this.pendingAt !== null) this.publish()
     await this.schedule()
   }
 }

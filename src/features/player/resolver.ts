@@ -13,6 +13,7 @@ export interface ResolveOptions {
   excludeProviderIds?: readonly string[]
   signal?: AbortSignal
   sourceOverride?: string
+  /** Streams composite sub-source attempts too; the returned attempts remain provider summaries. */
   onAttempt?: (attempt: ProviderAttempt) => void
 }
 
@@ -60,11 +61,19 @@ function projectPlayable(value: unknown): Playable | null {
     ) {
       return null
     }
+    let expiresAt: number | undefined
+    if ('expiresAt' in candidate) {
+      if (typeof candidate.expiresAt !== 'number' || !Number.isSafeInteger(candidate.expiresAt) || candidate.expiresAt <= 0) {
+        return null
+      }
+      expiresAt = candidate.expiresAt
+    }
     return {
       kind: 'audio',
       url: candidate.url,
       mimeType: candidate.mimeType,
       ...(metadata ? { metadata } : {}),
+      ...(expiresAt === undefined ? {} : { expiresAt }),
     }
   }
   return null
@@ -89,11 +98,22 @@ function failureCode(error: unknown): ResolveFailureCode {
   return error instanceof ProviderResolveError ? error.code : 'unavailable'
 }
 
+/**
+ * Whether a provider failure may succeed on a retry (task 41.7): a provider that marked it so, or
+ * the `TypeError` that `fetch` rejects with when a request is dropped (network change, radio
+ * waking on a backgrounded phone).
+ */
+function isTransientError(error: unknown): boolean {
+  if (error instanceof ProviderResolveError) return error.transient === true
+  return error instanceof TypeError
+}
+
 async function resolveProvider(
   track: Track,
   registration: ProviderRegistrationSnapshot,
   callerSignal?: AbortSignal,
-): Promise<{ playable: Playable | null; code?: ResolveFailureCode; latencyMs: number }> {
+  onSubAttempt?: (attempt: ProviderAttempt) => void,
+): Promise<{ playable: Playable | null; code?: ResolveFailureCode; transient?: true; latencyMs: number }> {
   const startedAt = Date.now()
   const providerController = new AbortController()
   let timedOut = false
@@ -118,8 +138,14 @@ async function resolveProvider(
   providerController.signal.addEventListener('abort', handleProviderAbort, { once: true })
 
   try {
+    // Keep the sink on this invocation: a cached provider can resolve multiple tracks at once.
+    const context = onSubAttempt ? {
+      onSubAttempt(attempt: ProviderAttempt): void {
+        try { onSubAttempt(attempt) } catch { /* Diagnostic sinks cannot break playback. */ }
+      },
+    } : undefined
     const value = await Promise.race([
-      registration.provider.resolve(track, providerController.signal),
+      registration.provider.resolve(track, providerController.signal, context),
       abortPromise,
     ])
     const latencyMs = Math.max(0, Date.now() - startedAt)
@@ -132,6 +158,7 @@ async function resolveProvider(
     return {
       playable: null,
       code: timedOut ? 'timeout' : failureCode(error),
+      ...(!timedOut && isTransientError(error) ? { transient: true as const } : {}),
       latencyMs: Math.max(0, Date.now() - startedAt),
     }
   } finally {
@@ -170,7 +197,7 @@ export async function resolveTrack(
       continue
     }
 
-    const resolved = await resolveProvider(track, registration, options.signal)
+    const resolved = await resolveProvider(track, registration, options.signal, options.onAttempt)
     if (resolved.playable) {
       emitAttempt(
         attempts,
@@ -186,6 +213,7 @@ export async function resolveTrack(
         providerId,
         ok: false,
         code: resolved.code ?? 'unavailable',
+        ...(resolved.transient ? { transient: true as const } : {}),
         latencyMs: resolved.latencyMs,
       },
       options.onAttempt,

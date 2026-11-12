@@ -48,8 +48,8 @@ describe('resolveDisplayTitle', () => {
 
   it('never invents a translation or transliteration', () => {
     // The whole point: a missing alias yields the English title, not a guess.
-    const track = { title: 'Sway to My Beat in Cosmos', aliases: { ja: ['コスモス'] } }
-    expect(resolveDisplayTitle(track, 'zh-Hant')).toBe('Sway to My Beat in Cosmos')
+    const track = { title: 'Demo Cosmic Rhythm', aliases: { ja: ['コスモス'] } }
+    expect(resolveDisplayTitle(track, 'zh-Hant')).toBe('Demo Cosmic Rhythm')
   })
 
   it('skips empty and whitespace-only alias entries instead of rendering a blank label', () => {

@@ -93,12 +93,16 @@ describe('canonical playback provider configuration', () => {
   })
 
   it('uses literal canonical defaults and ascending priority order for missing rows', async () => {
+    await database.prepare('DELETE FROM provider_health WHERE provider_key IN (?, ?, ?, ?, ?)')
+      .bind('chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys').run()
     const states = await readProviderStates(database, providerEnv())
 
     expect(states.map(({ id, adminEnabled, priority }) => [id, adminEnabled, priority])).toEqual([
       ['chksz', true, 10],
       ['lx', true, 20],
-      ['jellyfin', true, 30],
+      ['jellyfin', false, 30],
+      ['gd-studio', true, 40],
+      ['vkeys', false, 50],
     ])
     expect(deploymentAvailableProviderIds(providerEnv())).toEqual(['chksz', 'lx'])
     expect(deploymentAvailableProviderIds(providerEnv({ CHKSZ_API_KEY: 'test-key' })))
@@ -107,10 +111,18 @@ describe('canonical playback provider configuration', () => {
       JELLYFIN_BASE_URL: 'https://jellyfin.example',
       JELLYFIN_API_TOKEN: 'valid-token',
       JELLYFIN_USER_ID: '8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f',
-    }))).toEqual(['chksz', 'lx', 'jellyfin'])
+    }))).toEqual(['chksz', 'lx'])
     expect(CANONICAL_PROVIDERS.map(({ id }) => id)).toEqual([
-      'chksz', 'lx', 'jellyfin',
+      'chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys',
     ])
+    expect(CANONICAL_PROVIDERS.map(({ id, defaults }) => [id, defaults.enabled, defaults.priority]))
+      .toEqual([
+        ['chksz', true, 10],
+        ['lx', true, 20],
+        ['jellyfin', false, 30],
+        ['gd-studio', true, 40],
+        ['vkeys', false, 50],
+      ])
   })
 
   it('keeps LX structurally available client-side without operator env vars', () => {
@@ -171,14 +183,14 @@ describe('canonical playback provider configuration', () => {
     }))
     const serialised = JSON.stringify(states)
 
-    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
     for (const secret of [
       'huibq-private.example', 'huibq-media-private.example', 'HUIBQ_PRIVATE_KEY_SENTINEL',
       'ikun-private.example', 'ikun-media-private.example', 'IKUN_PRIVATE_KEY_SENTINEL',
     ]) expect(serialised).not.toContain(secret)
   })
 
-  it('derives global effective enablement from deployment availability and persisted Admin intent', async () => {
+  it('keeps Jellyfin retired regardless of valid deployment configuration or persisted Admin intent', async () => {
     await seedProvider(database, 'jellyfin', 1, 9)
     await seedProvider(database, 'chksz', 1, 4)
 
@@ -195,7 +207,7 @@ describe('canonical playback provider configuration', () => {
     }))
     expect(project(withKey)).toEqual([
       ['chksz', true, true, true, 4],
-      ['jellyfin', true, true, true, 9],
+      ['jellyfin', true, false, false, 9],
     ])
 
     await database.prepare('UPDATE provider_health SET enabled = 0 WHERE provider_key IN (?, ?)')
@@ -248,7 +260,13 @@ describe('canonical playback provider configuration', () => {
         ['chksz', true, 10],
         ['lx', true, 20],
         ['jellyfin', true, 30],
+        // Restoration preserves the historical administrator policy; reset/order remains explicit.
+        ['gd-studio', false, 5],
+        ['vkeys', false, 50],
       ])
+      expect(states.find(({ id }) => id === 'jellyfin')).toMatchObject({
+        adminEnabled: true, deploymentAvailable: false, effectiveEnabled: false,
+      })
     } finally {
       await migrated.dispose()
     }
@@ -342,7 +360,7 @@ describe('canonical playback provider configuration', () => {
     expect(deploymentAvailable('meting', env)).toBe(true)
 
     const states = await readProviderStates(database, env)
-    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
     expect(JSON.stringify(states)).not.toContain('meting-private.example')
     expect(JSON.stringify(states)).not.toContain('meting-media-private.example')
   })
@@ -353,7 +371,7 @@ describe('canonical playback provider configuration', () => {
 
     const states = await readProviderStates(database, providerEnv())
 
-    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
     expect(states.map(({ id }) => id)).not.toContain('public-meting')
     expect(states.map(({ id }) => id)).not.toContain('meting-agent')
     expect(states.map(({ id }) => id)).not.toContain('meting')
@@ -422,7 +440,7 @@ describe('canonical playback provider configuration', () => {
     expect(deploymentAvailable('invidious', env)).toBe(true)
 
     const states = await readProviderStates(database, env)
-    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
     expect(JSON.stringify(states)).not.toContain('piped.example')
     expect(JSON.stringify(states)).not.toContain('invidious.example')
   })
@@ -483,8 +501,8 @@ describe('canonical playback provider configuration', () => {
     }))).toBe(false)
   })
 
-  describe('jellyfin provider configuration', () => {
-    it('requires JELLYFIN_BASE_URL, a non-empty valid JELLYFIN_API_TOKEN, and JELLYFIN_USER_ID', () => {
+  describe('retired Jellyfin configuration', () => {
+    it('remains deployment-unavailable with valid, missing, or partial legacy configuration', () => {
       const valid = providerEnv({
         JELLYFIN_BASE_URL: 'https://jellyfin.example',
         JELLYFIN_API_TOKEN: 'valid-jellyfin-token-12345',
@@ -493,16 +511,14 @@ describe('canonical playback provider configuration', () => {
       expect(configuredJellyfinOrigin(valid)).toBe('https://jellyfin.example')
       expect(configuredJellyfinApiToken(valid)).toBe('valid-jellyfin-token-12345')
       expect(configuredJellyfinUserId(valid)).toBe('8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f')
-      expect(deploymentAvailable('jellyfin', valid)).toBe(true)
+      expect(deploymentAvailable('jellyfin', valid)).toBe(false)
 
       expect(configuredJellyfinOrigin(providerEnv())).toBeNull()
       expect(configuredJellyfinApiToken(providerEnv())).toBeNull()
       expect(configuredJellyfinUserId(providerEnv())).toBeNull()
       expect(deploymentAvailable('jellyfin', providerEnv())).toBe(false)
 
-      // Each of the three is individually required: Jellyfin 12 cannot complete a metadata
-      // lookup without explicit user context, so a partially configured deployment is
-      // reported as unavailable rather than failing later with an upstream HTTP 400.
+      // Legacy configuration remains readable, but no combination can restore this retired provider.
       expect(deploymentAvailable('jellyfin', providerEnv({
         JELLYFIN_BASE_URL: 'https://jellyfin.example',
         JELLYFIN_USER_ID: '8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f',
@@ -585,7 +601,7 @@ describe('canonical playback provider configuration', () => {
       }))
 
       expect(states).toContainEqual(expect.objectContaining({
-        id: 'jellyfin', deploymentAvailable: true, effectiveEnabled: false,
+        id: 'jellyfin', deploymentAvailable: false, effectiveEnabled: false,
       }))
       const serialized = JSON.stringify(states)
       expect(serialized).not.toContain('SUPER_SECRET_JELLYFIN_TOKEN')
@@ -662,15 +678,15 @@ describe('canonical playback provider configuration', () => {
 
     it('redacts GD Studio operational config from provider state output', async () => {
       const env = providerEnv({
-        GD_STUDIO_API_BASE_URL: 'https://gd-private.example',
+        GD_STUDIO_API_BASE_URL: 'https://music-api.gdstudio.xyz',
         GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES: 'gd-media-private.example',
       })
       expect(deploymentAvailable('gd-studio', env)).toBe(true)
 
       const states = await readProviderStates(database, env)
-      expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin'])
+      expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
       const serialized = JSON.stringify(states)
-      expect(serialized).not.toContain('gd-private.example')
+      expect(serialized).not.toContain('music-api.gdstudio.xyz')
       expect(serialized).not.toContain('gd-media-private.example')
     })
   })
@@ -747,10 +763,104 @@ describe('canonical playback provider configuration', () => {
       expect(deploymentAvailable('lx-huanyin', env)).toBe(true)
 
       const states = await readProviderStates(database, env)
-      expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin'])
+      expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
       const serialized = JSON.stringify(states)
       expect(serialized).not.toContain('huanyin-private.example')
       expect(serialized).not.toContain('huanyin-media-private.example')
     })
   })
+
+  describe('restored official GD Studio gate', () => {
+    it('is canonical but unavailable until both explicit deployment policies are present', async () => {
+      const states = await readProviderStates(database, providerEnv())
+      expect(states.find((state) => state.id === 'gd-studio')).toMatchObject({
+        priority: 40, deploymentAvailable: false, effectiveEnabled: false,
+      })
+    })
+    it('rejects a different resolver origin for the restored official provider', () => {
+      expect(configuredGdStudioOrigin(providerEnv({ GD_STUDIO_API_BASE_URL: 'https://gd-private.example' }))).toBeNull()
+    })
+  })
+
+  describe('Vkeys opt-in configuration', () => {
+    it.each([undefined, '', 'false', '1', 'TRUE', ' true', 'true ', 'true\n'])(
+      'requires the exact deployment flag instead of %j', (flag) => {
+        expect(deploymentAvailable('vkeys', providerEnv({ VKEYS_ENABLED: flag }))).toBe(false)
+        expect(deploymentAvailableProviderIds(providerEnv({ VKEYS_ENABLED: flag })))
+          .toEqual(['chksz', 'lx'])
+      },
+    )
+
+    it('requires both explicit deployment opt-in and persisted Admin enablement', async () => {
+      const enabledEnv = providerEnv({ VKEYS_ENABLED: 'true' })
+      expect(deploymentAvailableProviderIds(enabledEnv)).toEqual(['chksz', 'lx', 'vkeys'])
+
+      const defaultStates = await readProviderStates(database, providerEnv())
+      expect(defaultStates.find(({ id }) => id === 'vkeys')).toMatchObject({
+        adminEnabled: false, deploymentAvailable: false, effectiveEnabled: false, priority: 50,
+      })
+      const deploymentOnly = await readProviderStates(database, enabledEnv)
+      expect(deploymentOnly.find(({ id }) => id === 'vkeys')).toMatchObject({
+        adminEnabled: false, deploymentAvailable: true, effectiveEnabled: false, priority: 50,
+      })
+
+      try {
+        await seedProvider(database, 'vkeys', 1, 50)
+        const adminOnly = await readProviderStates(database, providerEnv())
+        expect(adminOnly.find(({ id }) => id === 'vkeys')).toMatchObject({
+          adminEnabled: true, deploymentAvailable: false, effectiveEnabled: false, priority: 50,
+        })
+        const bothEnabled = await readProviderStates(database, enabledEnv)
+        expect(bothEnabled.find(({ id }) => id === 'vkeys')).toMatchObject({
+          adminEnabled: true, deploymentAvailable: true, effectiveEnabled: true, priority: 50,
+        })
+        expect(bothEnabled.filter(({ id }) => id !== 'vkeys'))
+          .toEqual(defaultStates.filter(({ id }) => id !== 'vkeys'))
+
+        await seedProvider(database, 'vkeys', 0, 50)
+        const adminDisabled = await readProviderStates(database, enabledEnv)
+        expect(adminDisabled.find(({ id }) => id === 'vkeys')).toMatchObject({
+          adminEnabled: false, deploymentAvailable: true, effectiveEnabled: false, priority: 50,
+        })
+      } finally {
+        await database.prepare("DELETE FROM provider_health WHERE provider_key = 'vkeys'").run()
+      }
+    })
+
+    it('preserves canonical order and existing provider settings with a custom Vkeys priority', async () => {
+      const env = providerEnv({ VKEYS_ENABLED: 'true' })
+      const before = await readProviderStates(database, env)
+      try {
+        await seedProvider(database, 'vkeys', 1, 3)
+        const states = await readProviderStates(database, env)
+        expect(states.map(({ id }) => id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
+        expect(states.find(({ id }) => id === 'vkeys')).toMatchObject({
+          adminEnabled: true, deploymentAvailable: true, effectiveEnabled: true, priority: 3,
+        })
+        expect(states.filter(({ id }) => id !== 'vkeys'))
+          .toEqual(before.filter(({ id }) => id !== 'vkeys'))
+        expect(await database.prepare(
+          "SELECT enabled, priority FROM provider_health WHERE provider_key = 'vkeys'",
+        ).first()).toEqual({ enabled: 1, priority: 3 })
+      } finally {
+        await database.prepare("DELETE FROM provider_health WHERE provider_key = 'vkeys'").run()
+      }
+    })
+
+    it('exposes only public Vkeys state and redacts deployment and authentication settings', async () => {
+      const env = providerEnv({ VKEYS_ENABLED: 'true' })
+      const states = await readProviderStates(database, env)
+      expect(states.find(({ id }) => id === 'vkeys')).toEqual({
+        id: 'vkeys', adminEnabled: false, deploymentAvailable: true, effectiveEnabled: false,
+        priority: 50, status: 'unknown', failureClass: null, latencyMs: null,
+        checkedAt: null, updatedAt: 0, automaticPolicy: 'direct',
+      })
+      const serialised = JSON.stringify(states)
+      for (const privateSetting of [
+        'VKEYS_ENABLED', env.SESSION_HMAC_SECRET, env.OAUTH_STATE_SECRET,
+        env.GOOGLE_CLIENT_SECRET!, env.GITHUB_CLIENT_SECRET!,
+      ]) expect(serialised).not.toContain(privateSetting)
+    })
+  })
+
 })

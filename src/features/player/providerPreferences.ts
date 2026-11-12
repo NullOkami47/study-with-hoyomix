@@ -6,13 +6,15 @@ const ENDPOINT = '/api/account/provider-preferences'
 
 /**
  * Top-level playback providers a user may disable for themselves.
- * Normal automatic providers are chksz, lx, and jellyfin.
+ * LX and GD Studio retain their order; Vkeys is separately enabled. Legacy saved IDs remain readable.
  * This list mirrors the Worker's `USER_TOGGLEABLE_PROVIDER_IDS`.
  */
 export const USER_TOGGLEABLE_PROVIDER_IDS = [
   'chksz',
   'lx',
   'jellyfin',
+  'gd-studio',
+  'vkeys',
 ] as const
 
 export type UserToggleableProviderId = typeof USER_TOGGLEABLE_PROVIDER_IDS[number]
@@ -69,12 +71,12 @@ const inCanonicalOrder = (ids: Iterable<string>): UserToggleableProviderId[] =>
       (CANONICAL_ORDER.get(left) ?? 0) - (CANONICAL_ORDER.get(right) ?? 0))
 
 /**
- * Pure helper to migrate legacy disabled provider IDs to the three-provider model:
+ * Pure helper to migrate legacy disabled provider IDs to the canonical provider model:
  * 1. Old chksz disabled -> new chksz disabled.
  * 2. All 8 old LX IDs disabled -> new lx disabled.
  * 3. If not all 8 old LX IDs disabled -> new lx remains enabled.
  * 4. Jellyfin absent -> remains enabled (not disabled).
- * 5. Obsolete IDs (r2, meting, piped, invidious, gd-studio, qijie, etc.) -> dropped.
+ * 5. Obsolete IDs (r2, meting, piped, invidious, qijie, etc.) -> dropped.
  * 6. Idempotent: migrating an already migrated array leaves it unchanged.
  */
 export function migrateLegacyDisabledProviderIds(
@@ -95,6 +97,12 @@ export function migrateLegacyDisabledProviderIds(
   if (set.has('jellyfin')) {
     result.push('jellyfin')
   }
+
+  if (set.has('gd-studio')) {
+    result.push('gd-studio')
+  }
+
+  if (set.has('vkeys')) result.push('vkeys')
 
   return inCanonicalOrder(result)
 }

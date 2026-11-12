@@ -28,7 +28,7 @@ import {
 } from './chksz'
 
 const VALID_MEDIA_URL = 'https://m801.music.126.net/20260913/abc123/xyz.mp3'
-const REQUESTED_ID = '3334421408'
+const REQUESTED_ID = '9000000003'
 
 const metadata = (overrides: Record<string, unknown> = {}, dataOverrides: Record<string, unknown> = {}) => ({
   code: 200,
@@ -97,7 +97,7 @@ describe('isChkszQuality and chkszLevel', () => {
 
 describe('isChkszExternalId', () => {
   it('accepts numeric NetEase track ids up to 20 digits', () => {
-    for (const value of ['1', '3334421408', '2100334024', '2155423468', '1'.repeat(20)]) {
+    for (const value of ['1', '9000000003', '9000000001', '9000000002', '1'.repeat(20)]) {
       expect(isChkszExternalId(value)).toBe(true)
     }
   })
@@ -109,8 +109,8 @@ describe('isChkszExternalId', () => {
   })
 
   it('exposes a pattern consistent with the predicate', () => {
-    expect(CHKSZ_ID_PATTERN.test('3334421408')).toBe(true)
-    expect(CHKSZ_ID_PATTERN.test('3334421408x')).toBe(false)
+    expect(CHKSZ_ID_PATTERN.test('9000000003')).toBe(true)
+    expect(CHKSZ_ID_PATTERN.test('9000000003x')).toBe(false)
   })
 })
 
@@ -326,7 +326,7 @@ describe('validateChkszMetadata', () => {
 
   it('rejects a non-string url, a non-integer id and non-object bodies', () => {
     expect(validateChkszMetadata(metadata({}, { url: 123 }), REQUESTED_ID, CHKSZ_LEVEL)).toBeNull()
-    expect(validateChkszMetadata(metadata({}, { id: '3334421408' }), REQUESTED_ID, CHKSZ_LEVEL)).toBeNull()
+    expect(validateChkszMetadata(metadata({}, { id: '9000000003' }), REQUESTED_ID, CHKSZ_LEVEL)).toBeNull()
     expect(validateChkszMetadata(null, REQUESTED_ID, CHKSZ_LEVEL)).toBeNull()
     expect(validateChkszMetadata('x', REQUESTED_ID, CHKSZ_LEVEL)).toBeNull()
     expect(validateChkszMetadata([], REQUESTED_ID, CHKSZ_LEVEL)).toBeNull()
@@ -380,12 +380,12 @@ describe('validateChkszResolveBody', () => {
   })
 
   it('preserves the externalId pattern and type rules', () => {
-    expect(validateChkszResolveBody({ externalId: 3334421408, level: 'sky' })).toBeNull()
-    expect(validateChkszResolveBody({ externalId: '3334421408a', level: 'sky' })).toBeNull()
+    expect(validateChkszResolveBody({ externalId: 9000000003, level: 'sky' })).toBeNull()
+    expect(validateChkszResolveBody({ externalId: '9000000003a', level: 'sky' })).toBeNull()
     expect(validateChkszResolveBody({ externalId: '1'.repeat(21), level: 'sky' })).toBeNull()
     expect(validateChkszResolveBody({ externalId: '', level: 'sky' })).toBeNull()
     expect(validateChkszResolveBody({ level: 'sky' })).toBeNull()
-    expect(validateChkszResolveBody({ externalId: '3334421408', level: 'sky' }, /^abc$/)).toBeNull()
+    expect(validateChkszResolveBody({ externalId: '9000000003', level: 'sky' }, /^abc$/)).toBeNull()
   })
 
   it('rejects non-object bodies', () => {
@@ -524,3 +524,4 @@ describe('createChkszArtworkProxyUrl', () => {
     expect(createChkszArtworkProxyUrl('not a url')).toBeNull()
   })
 })
+

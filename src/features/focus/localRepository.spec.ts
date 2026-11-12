@@ -192,7 +192,8 @@ describe('focus session local repository', () => {
       code: 'memory_limit',
     } satisfies Partial<FocusSessionStorageError>)
     expect(await repository.list()).toHaveLength(FOCUS_SESSION_MEMORY_LIMIT)
-  }, 30_000)
+    // 1,024 sequential writes took about 4.8 s in CI already on Vitest 0.34, at the 5 s default.
+  }, 20_000)
 
   it('rejects unexpected open errors without claiming memory fallback', async () => {
     const brokenFactory = {

@@ -1,4 +1,4 @@
-// Frozen v1 client contract fixture.
+// Frozen v1 client contract from Production source 561d2ba2f215c18cdb272e82f21477e3993318de.
 /**
  * Explicit account preferences contain only current workspace settings.
  * Credentials, library contents, history, player queue and device-only media

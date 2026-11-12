@@ -12,6 +12,7 @@ import { getDefaultRemoteFocusSessionRepository } from '../focus/remoteRepositor
 import { createEmptyLocalLibrary, type LibraryExport } from '../library/types'
 import type { LocalLibraryRepository } from '../library/localRepository'
 import type { PlaybackStore } from '../player/store'
+import { isTransitionMode } from '../player/transitionEngine'
 import {
   getDefaultChkszCredentialStore,
   type ChkszCredentialStore,
@@ -23,6 +24,9 @@ import {
   type UserToggleableProviderId,
 } from '../player/providerPreferences'
 import {
+  GD_STUDIO_QUALITIES,
+  isGdStudioQuality,
+  type GdStudioQuality,
   CHKSZ_QUALITIES,
   LX_QUALITIES,
   getDefaultPlaybackQualityPreferencesStore,
@@ -39,11 +43,13 @@ import {
 } from '../player/runtimeConfig'
 import type { FocusBehaviour, PomodoroStore } from '../timers/pomodoro/store'
 import type { FullscreenState } from '../workspace/fullscreen'
+import DebugLogControls from '../player/DebugLogControls.vue'
 import LxSourceManager from './LxSourceManager.vue'
 import ChkszInfo from './ChkszInfo.vue'
 import ThirdPartyAgreement from './ThirdPartyAgreement.vue'
 import { acceptAgreement, AGREEMENT_STORAGE_KEY, hasCurrentAgreement, withdrawAgreement } from './thirdPartyAgreement'
 import { isChkszApiKey } from '../../shared/chksz'
+import { useGlassRefractionSetting } from '../glass/glassEnvironment'
 import { SETTINGS_SECTION_IDS, type SettingsSectionId } from './sections'
 import { aboutLinks, privacyLinks } from './disclosureLinks'
 import { isLocale, translate, type TranslationKey } from '../../i18n'
@@ -91,9 +97,20 @@ const emit = defineEmits<{
   (event: 'open-calendar'): void
   (event: 'toggle-fullscreen'): void
 }>()
+function onTransitionMode(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value
+  if (isTransitionMode(value)) props.player.setTransitionMode(value)
+}
+function onCrossfadeDuration(event: Event): void {
+  props.player.setCrossfadeDuration(Number((event.target as HTMLInputElement).value))
+}
 const shows = (section: SettingsSectionId): boolean => !props.sections || props.sections.includes(section)
 const visibleSections = computed(() => SETTINGS_SECTION_IDS.filter(shows))
 const text = (key: TranslationKey): string => translate(props.preferences.locale.value, key)
+const refraction = useGlassRefractionSetting()
+function onRefractionChange(event: Event): void {
+  refraction.setEnabled((event.target as HTMLInputElement).checked)
+}
 const librarySnapshot = shallowRef<LibraryExport>(createEmptyLocalLibrary())
 const libraryStatus = ref('')
 const storageMode = ref(props.library.storageMode())
@@ -182,6 +199,18 @@ let unsubscribeProviderPreferences = (): void => undefined
 // store is still subscribed so a second surface cannot leave these showing a stale tier.
 const qualityPreferences = props.qualityPreferences ?? getDefaultPlaybackQualityPreferencesStore()
 const chkszQuality = ref<ChkszQuality>(qualityPreferences.chkszQuality())
+const gdStudioQuality = ref<GdStudioQuality>(qualityPreferences.gdStudioQuality())
+const gdStudioQualityLabel = (quality: GdStudioQuality): string => {
+  if (quality === 'auto') return text('player.automatic')
+  if (quality === '740') return text('settings.playback.qualityLossless')
+  if (quality === '999') return text('settings.playback.qualityHires')
+  return `${quality} kbps`
+}
+function onGdStudioQualityChange(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value
+  if (isGdStudioQuality(value)) qualityPreferences.setGdStudioQuality(value)
+  gdStudioQuality.value = qualityPreferences.gdStudioQuality()
+}
 const lxQuality = ref<LxQuality>(qualityPreferences.lxQuality())
 let unsubscribeQualityPreferences = (): void => undefined
 
@@ -431,6 +460,7 @@ onMounted(() => {
     disabledProviderIds.value = providerPreferences.disabledProviderIds()
   })
   unsubscribeQualityPreferences = qualityPreferences.subscribe(() => {
+    gdStudioQuality.value = qualityPreferences.gdStudioQuality()
     chkszQuality.value = qualityPreferences.chkszQuality()
     lxQuality.value = qualityPreferences.lxQuality()
   })
@@ -501,6 +531,22 @@ onBeforeUnmount(() => {
             <option value="studio">{{ text('settings.appearance.studio') }}</option>
           </select>
         </label>
+        <template v-if="preferences.visualStyle.value === 'studio' && refraction.visible.value">
+          <label class="settings-sheet__toggle">
+            <input
+              data-settings-glass-refraction
+              type="checkbox"
+              role="switch"
+              :checked="refraction.checked.value"
+              :disabled="!refraction.supported.value || refraction.blockedBy.value !== null"
+              :aria-describedby="refraction.hintKey.value ? 'settings-glass-refraction-help settings-glass-refraction-hint' : 'settings-glass-refraction-help'"
+              @change="onRefractionChange"
+            />
+            <span>{{ text('settings.appearance.refraction') }}</span>
+          </label>
+          <small id="settings-glass-refraction-help">{{ text('settings.appearance.refractionHelp') }}</small>
+          <small v-if="refraction.hintKey.value" id="settings-glass-refraction-hint" data-settings-glass-refraction-hint>{{ text(refraction.hintKey.value) }}</small>
+        </template>
         <template v-if="preferences.visualStyle.value === 'studio'">
         <label class="settings-sheet__range">
           <span class="settings-sheet__range-label">
@@ -609,6 +655,19 @@ onBeforeUnmount(() => {
           <span>{{ text('player.volume') }}</span>
           <input data-settings-volume type="range" min="0" max="1" step="0.05" :value="player.volume.value" @input="onVolume" />
         </label>
+        <label>
+          <span>{{ text('settings.playback.transitionMode') }}</span>
+          <select data-settings-transition-mode :value="player.transitionMode.value" aria-describedby="transition-mode-help" @change="onTransitionMode">
+            <option value="off">{{ text('settings.playback.transitionOff') }}</option>
+            <option value="crossfade">{{ text('settings.playback.transitionCrossfade') }}</option>
+            <option value="smart">{{ text('settings.playback.transitionSmart') }}</option>
+          </select>
+        </label>
+        <p id="transition-mode-help">{{ text('settings.playback.transitionHelp') }}</p>
+        <label v-if="player.transitionMode.value !== 'off'">
+          <span>{{ text('settings.playback.crossfadeDuration') }} · {{ player.crossfadeDuration.value }} {{ text('settings.playback.seconds') }}</span>
+          <input data-settings-crossfade-duration type="range" min="2" max="12" step="1" :value="player.crossfadeDuration.value" @input="onCrossfadeDuration" />
+        </label>
         <fieldset class="settings-sheet__sources" data-settings-automatic-sources>
           <legend>{{ text('settings.playback.automaticSources') }}</legend>
           <p data-settings-provider-order>{{ text('settings.playback.providerOrder') }}</p>
@@ -644,6 +703,15 @@ onBeforeUnmount(() => {
             >{{ text('settings.playback.sourceAdminDisabled') }}</small>
           </label>
         </fieldset>
+        <p data-settings-gd-studio-attribution>
+          <a href="https://music.gdstudio.xyz" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">{{ text('settings.playback.gdStudioAttribution') }}</a>
+        </p>
+        <label>
+          <span>{{ text('settings.playback.gdStudioQuality') }}</span>
+          <select data-settings-gd-studio-quality :value="gdStudioQuality" @change="onGdStudioQualityChange">
+            <option v-for="quality in GD_STUDIO_QUALITIES" :key="quality" :value="quality">{{ gdStudioQualityLabel(quality) }}</option>
+          </select>
+        </label>
         <form class="settings-sheet__credential" data-settings-chksz @submit.prevent="saveChkszCredential">
           <h4>{{ text('settings.playback.chkszTitle') }} <ChkszInfo :locale="preferences.locale.value" /></h4>
           <p>{{ text('settings.playback.chkszExplanation') }}</p>
@@ -768,9 +836,14 @@ onBeforeUnmount(() => {
         <NoticeHistory />
       </section>
 
-      <!-- Accuracy evidence: the original development notes -->
+      <!-- Accuracy evidence: the regression specification -->
       <section v-if="shows('about')" id="settings-about" class="settings-sheet__section settings-sheet__disclosure surface-glass" data-settings-section="about" aria-labelledby="settings-about-title">
         <h3 id="settings-about-title">{{ text('settings.section.about') }}</h3>
+        <div class="settings-sheet__debug-log" data-settings-debug-log>
+          <h4>{{ text('settings.application.debugLog') }}</h4>
+          <p>{{ text('settings.application.debugLogHelp') }}</p>
+          <DebugLogControls :player="player" :locale="preferences.locale.value" />
+        </div>
         <p data-about-identity>{{ text('settings.about.identity') }}</p>
         <p class="settings-sheet__notice" data-about-unofficial>{{ text('settings.about.unofficial') }}</p>
 
@@ -816,6 +889,11 @@ onBeforeUnmount(() => {
         <p data-privacy-provider-key>{{ text('settings.privacy.providerKey') }}</p>
         <p data-privacy-operator-keys>{{ text('settings.privacy.operatorKeys') }}</p>
         <p data-privacy-media-urls>{{ text('settings.privacy.mediaUrls') }}</p>
+
+        <h4>{{ text('settings.privacy.chatHeading') }}</h4>
+        <p data-privacy-chat>{{ text('settings.privacy.chat') }}</p>
+        <p data-privacy-chat-location>{{ text('settings.privacy.chatLocation') }}</p>
+        <p data-privacy-chat-moderation>{{ text('settings.privacy.chatModeration') }}</p>
 
         <h4>{{ text('settings.privacy.controlsHeading') }}</h4>
         <p data-privacy-export>{{ text('settings.privacy.export') }}</p>

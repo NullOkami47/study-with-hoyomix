@@ -363,3 +363,32 @@ describe('ChKSz and LX quality sets stay independent', () => {
     expect(store.lxQuality()).toBe('lossless')
   })
 })
+
+
+describe('independent GD Studio quality preferences', () => {
+  it('preserves existing catalogue defaults until the listener selects a bitrate', () => {
+    const storage = memoryStorage({ [PLAYBACK_QUALITY_STORAGE_KEY]: JSON.stringify({ version: 1, chksz: 'hires', lx: 'lossless' }) })
+    const store = createPlaybackQualityPreferencesStore({ storage })
+    expect(store.gdStudioQuality()).toBe('auto')
+    const notify = vi.fn()
+    store.subscribe(notify)
+    store.setGdStudioQuality('999')
+    expect(createPlaybackQualityPreferencesStore({ storage }).gdStudioQuality()).toBe('999')
+    expect(store.chkszQuality()).toBe('hires')
+    expect(store.lxQuality()).toBe('lossless')
+    expect(store.revision()).toBe(1)
+    expect(notify).toHaveBeenCalledTimes(1)
+    store.setGdStudioQuality('999')
+    expect(notify).toHaveBeenCalledTimes(1)
+    store.setGdStudioQuality('auto')
+    expect(createPlaybackQualityPreferencesStore({ storage }).gdStudioQuality()).toBe('auto')
+  })
+
+  it.each(['1000', 999, null, {}, 'lossless'])('ignores an invalid persisted GD quality: %s', gdStudio => {
+    const storage = memoryStorage({ [PLAYBACK_QUALITY_STORAGE_KEY]: JSON.stringify({ version: 1, chksz: 'hires', lx: 'high', gdStudio }) })
+    const store = createPlaybackQualityPreferencesStore({ storage })
+    expect(store.gdStudioQuality()).toBe('auto')
+    expect(store.chkszQuality()).toBe('hires')
+    expect(store.lxQuality()).toBe('high')
+  })
+})

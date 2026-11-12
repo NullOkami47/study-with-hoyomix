@@ -90,6 +90,8 @@ describe('authenticated user provider preferences', () => {
       'chksz',
       'lx',
       'jellyfin',
+      'gd-studio',
+      'vkeys',
     ])
   })
 
@@ -123,21 +125,21 @@ describe('authenticated user provider preferences', () => {
   })
 
   it('persists and reads back a canonical selection in canonical order', async () => {
-    const written = await put({ disabledProviderIds: ['jellyfin', 'lx'] }, tokenA)
+    const written = await put({ disabledProviderIds: ['vkeys', 'lx'] }, tokenA)
 
     expect(written.status).toBe(200)
-    expect(await written.json()).toEqual({ disabledProviderIds: ['lx', 'jellyfin'] })
+    expect(await written.json()).toEqual({ disabledProviderIds: ['lx', 'vkeys'] })
 
     const read = await handler.fetch(request(tokenA))
-    expect(await read.json()).toEqual({ disabledProviderIds: ['lx', 'jellyfin'] })
+    expect(await read.json()).toEqual({ disabledProviderIds: ['lx', 'vkeys'] })
   })
 
   it('keeps one row per account and replaces the previous selection', async () => {
     await put({ disabledProviderIds: ['chksz'] }, tokenA)
-    await put({ disabledProviderIds: ['jellyfin', 'lx'] }, tokenA)
+    await put({ disabledProviderIds: ['vkeys', 'lx'] }, tokenA)
 
     const read = await handler.fetch(request(tokenA))
-    expect(await read.json()).toEqual({ disabledProviderIds: ['lx', 'jellyfin'] })
+    expect(await read.json()).toEqual({ disabledProviderIds: ['lx', 'vkeys'] })
     expect(await database.prepare(
       'SELECT COUNT(*) AS total FROM user_provider_preferences WHERE user_id = ?',
     ).bind('user-a').first<number>('total')).toBe(1)
@@ -167,6 +169,10 @@ describe('authenticated user provider preferences', () => {
     ['a nested object', { disabledProviderIds: [{ id: 'chksz' }] }],
     ['a non-string member', { disabledProviderIds: [3] }],
     ['a duplicate member', { disabledProviderIds: ['chksz', 'chksz'] }],
+    ['a duplicate Vkeys member', { disabledProviderIds: ['vkeys', 'vkeys'] }],
+    ['a non-canonical Vkeys case', { disabledProviderIds: ['Vkeys'] }],
+    ['a deployment flag', { disabledProviderIds: ['vkeys'], VKEYS_ENABLED: 'true' }],
+    ['an Admin enablement field', { disabledProviderIds: ['vkeys'], adminEnabled: true }],
     ['an unknown provider', { disabledProviderIds: ['lx-unknown'] }],
     ['a non-canonical case', { disabledProviderIds: ['ChKSz'] }],
     ['a legacy provider r2', { disabledProviderIds: ['r2'] }],
@@ -177,7 +183,6 @@ describe('authenticated user provider preferences', () => {
     ['a legacy lx provider lx-sixyin', { disabledProviderIds: ['lx-sixyin'] }],
     ['a manual-only provider', { disabledProviderIds: ['youtube'] }],
     ['an inert legacy provider', { disabledProviderIds: ['qijie'] }],
-    ['an inert legacy provider', { disabledProviderIds: ['gd-studio'] }],
     ['a credential field', { disabledProviderIds: [], chkszApiKey: 'must-not-persist' }],
     ['a resolver URL field', { disabledProviderIds: [], baseUrl: 'https://attacker.example' }],
     ['a health field', { disabledProviderIds: [], status: 'healthy' }],
@@ -222,16 +227,20 @@ describe('authenticated user provider preferences', () => {
     expect(response.status).toBe(400)
   })
 
-  it('accepts the complete user-toggleable set', async () => {
+  it('persists a complete canonical permutation including Vkeys in canonical order', async () => {
     const response = await put(
-      { disabledProviderIds: [...USER_TOGGLEABLE_PROVIDER_IDS] },
+      { disabledProviderIds: ['vkeys', 'gd-studio', 'jellyfin', 'lx', 'chksz'] },
       tokenA,
     )
+    const expected = { disabledProviderIds: ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'] }
 
     expect(response.status).toBe(200)
-    expect(await response.json()).toEqual({
-      disabledProviderIds: [...USER_TOGGLEABLE_PROVIDER_IDS],
-    })
+    expect(await response.json()).toEqual(expected)
+    expect(await handler.fetch(request(tokenA)).then((value) => value.json())).toEqual(expected)
+    const stored = await database.prepare(
+      'SELECT disabled_provider_ids_json AS json FROM user_provider_preferences WHERE user_id = ?',
+    ).bind('user-a').first<{ json: string }>()
+    expect(stored?.json).toBe(JSON.stringify(expected.disabledProviderIds))
   })
 
   it.each(['POST', 'PATCH', 'DELETE'])('rejects the unsupported method %s', async (method) => {
@@ -265,12 +274,12 @@ describe('authenticated user provider preferences', () => {
   })
 
   it('includes the non-sensitive preference in the account export', async () => {
-    await put({ disabledProviderIds: ['lx', 'chksz'] }, tokenA)
+    await put({ disabledProviderIds: ['vkeys', 'lx', 'chksz'] }, tokenA)
 
     const exported = await exportAccountData(database as unknown as Database, 'user-a')
 
     expect(exported.providerPreferences).toEqual({
-      disabledProviderIds: ['chksz', 'lx'],
+      disabledProviderIds: ['chksz', 'lx', 'vkeys'],
     })
     expect(JSON.stringify(exported)).not.toMatch(/x-request-key|apikey|api_key|MUSIC_U/i)
   })
@@ -341,17 +350,17 @@ describe('authenticated user provider preferences', () => {
       expect(row?.json).toBe(JSON.stringify([]))
     })
 
-    it('does not write back to D1 when stored preferences are already canonical and migrated', async () => {
+    it('preserves canonical Vkeys preferences without writing back to D1', async () => {
       const existingUpdatedAt = NOW - 10_000
       await database.prepare(`
         INSERT INTO user_provider_preferences (user_id, disabled_provider_ids_json, updated_at)
         VALUES (?, ?, ?)
-      `).bind('user-a', JSON.stringify(['chksz', 'lx']), existingUpdatedAt).run()
+      `).bind('user-a', JSON.stringify(['chksz', 'lx', 'vkeys']), existingUpdatedAt).run()
 
       const response = await handler.fetch(request(tokenA))
 
       expect(response.status).toBe(200)
-      expect(await response.json()).toEqual({ disabledProviderIds: ['chksz', 'lx'] })
+      expect(await response.json()).toEqual({ disabledProviderIds: ['chksz', 'lx', 'vkeys'] })
 
       const row = await database.prepare(`
         SELECT updated_at AS updatedAt
@@ -380,4 +389,17 @@ describe('authenticated user provider preferences', () => {
       expect(row?.json).toBe(JSON.stringify([]))
     })
   })
+
+  it.each(['gd-studio', 'vkeys'] as const)(
+    'round-trips an independent %s exclusion without changing LX or another account', async (id) => {
+      const response = await put({ disabledProviderIds: [id] }, tokenA)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({ disabledProviderIds: [id] })
+      expect(await handler.fetch(request(tokenA)).then((value) => value.json()))
+        .toEqual({ disabledProviderIds: [id] })
+      expect(await handler.fetch(request(tokenB)).then((value) => value.json()))
+        .toEqual({ disabledProviderIds: [] })
+    },
+  )
+
 })

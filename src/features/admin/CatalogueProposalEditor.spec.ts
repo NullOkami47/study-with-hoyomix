@@ -51,7 +51,7 @@ function mountCatalogueWithProposal(
     configured: true,
     role: 'admin',
     sheetUrl: 'https://docs.google.com',
-    serviceAccountEmail: 'test@example.com',
+    serviceAccountEmail: 'test@service.com',
     lastBatch: batch,
   })
 

@@ -4,12 +4,12 @@
  * ## Architecture & Resolution Pipeline
  *
  * Each album card and track row resolves a real cover image whenever available:
- * 1. Primary candidate: `/api/providers/jellyfin/artwork/:itemId` (proxied by the Worker
- *    with upstream authorization, strict CSP, and `Cache-Control: public, max-age=3600`).
- * 2. Fallback candidate: If Jellyfin is absent or returns an error, fallback to ChKSz via
+ * 1. Canonical NetEase bindings use the existing LX/GD artwork GET routes, without audio
+ *    resolution or a ChKSz key. Both retain their server-side provider enablement guards.
+ * 2. Legacy fallback: If those candidates are unavailable, fallback to ChKSz via
  *    `POST /api/providers/chksz/resolve`, which returns `/api/providers/chksz/artwork?url=...`
  *    (proxied with strict CSP and `Cache-Control: public, max-age=86400`).
- * 3. Graceful fallback: If neither is available or both fail, render the deterministic
+ * 3. Graceful fallback: If every candidate fails, render the deterministic
  *    FNV-1a gradient fallback. No broken-image icons are ever displayed.
  *
  * ## Quota, Concurrency & Caching Guardrails
@@ -34,6 +34,8 @@ import {
 
 import type { Track, TrackSource } from '../catalog/types'
 import type { AlbumEntry } from './catalogueIndex'
+import { isChkszExternalId } from '../../shared/chksz'
+import { deriveLxCandidates } from '../player/lx/candidates'
 
 /** FNV-1a, 32-bit. Small, dependency-free, and stable across engines. */
 function hashSeed(seed: string): number {
@@ -101,16 +103,27 @@ function findSource(track: Track | undefined, provider: string): TrackSource | u
   return track?.sources?.find((s) => s.provider === provider)
 }
 
-export function getJellyfinArtworkUrl(externalId: string): string {
-  return `/api/providers/jellyfin/artwork/${encodeURIComponent(externalId)}`
+const NETEASE_ARTWORK_PATH = /^\/api\/providers\/(?:lx|gd-studio)\/artwork\/[0-9]{1,20}$/u
+
+function neteaseArtworkCandidates(track: Track | undefined): string[] {
+  if (!track) return []
+  const binding = deriveLxCandidates(track).find(candidate => candidate.source === 'wy' && isChkszExternalId(candidate.id))
+  const explicit = findSource(track, 'gd-studio')?.externalId.match(/^netease:([0-9]{1,20})(?::(?:128|192|320|740|999))?$/u)?.[1]
+  const id = binding?.id ?? explicit
+  if (!id) return []
+  const providers = binding ? ['lx','gd-studio'] : ['gd-studio','lx']
+  return providers.map(provider => `/api/providers/${provider}/artwork/${id}`)
+}
+
+/** Uses the same candidates as image loading; never resolves audio to choose a cover. */
+export function hasArtworkSource(track: Track | undefined): boolean {
+  return Boolean(findSource(track, 'chksz') || neteaseArtworkCandidates(track).length)
 }
 
 export function isValidArtworkUrl(url: string): boolean {
   if (typeof url !== 'string' || !url.trim()) return false
-  if (
-    url.startsWith('/api/providers/chksz/artwork?url=') ||
-    url.startsWith('/api/providers/jellyfin/artwork/')
-  ) {
+  if (NETEASE_ARTWORK_PATH.test(url)) return true
+  if (url.startsWith('/api/providers/chksz/artwork?url=')) {
     return true
   }
   try {
@@ -121,7 +134,7 @@ export function isValidArtworkUrl(url: string): boolean {
     const parsed = new URL(url, origin)
     return (
       (parsed.pathname.startsWith('/api/providers/chksz/artwork') ||
-        parsed.pathname.startsWith('/api/providers/jellyfin/artwork')) &&
+        NETEASE_ARTWORK_PATH.test(parsed.pathname) && !parsed.search && !parsed.hash) &&
       parsed.origin === origin
     )
   } catch {
@@ -191,11 +204,25 @@ export function useArtwork(
   const isLoaded = ref(false)
   const hasFailed = ref(false)
   let currentKey = ''
-  let currentCandidatePhase: 'jellyfin' | 'chksz' | 'none' = 'none'
+  let currentCandidatePhase: 'netease' | 'chksz' | 'none' = 'none'
+  let candidates: string[] = []
+  let candidateIndex = -1
+
+  const nextNeteaseCandidate = (): boolean => {
+    const next = candidates[++candidateIndex]
+    if (!next) return false
+    currentCandidatePhase = 'netease'
+    isLoaded.value = false
+    hasFailed.value = false
+    artworkUrl.value = next
+    return true
+  }
 
   const update = () => {
     const key = toValue(keyRef)
     const track = toValue(trackRef)
+    candidates = neteaseArtworkCandidates(track)
+    candidateIndex = -1
     currentKey = key
     isLoaded.value = false
     hasFailed.value = false
@@ -209,7 +236,8 @@ export function useArtwork(
         currentCandidatePhase = 'none'
       } else {
         artworkUrl.value = cached
-        currentCandidatePhase = cached.includes('/jellyfin/') ? 'jellyfin' : 'chksz'
+        candidateIndex = candidates.indexOf(cached)
+        currentCandidatePhase = candidateIndex >= 0 ? 'netease' : 'chksz'
       }
       return
     }
@@ -221,12 +249,11 @@ export function useArtwork(
       return
     }
 
-    const jellyfin = findSource(track, 'jellyfin')
     const chksz = findSource(track, 'chksz')
 
-    if (jellyfin) {
-      currentCandidatePhase = 'jellyfin'
-      artworkUrl.value = getJellyfinArtworkUrl(jellyfin.externalId)
+    // Historical Jellyfin bindings remain catalogue data after the Azure host retires.
+    if (nextNeteaseCandidate()) {
+      // Native image loading stays lazy and provider-owned; no audio/key resolution is needed.
     } else if (chksz) {
       currentCandidatePhase = 'chksz'
       artworkUrl.value = undefined
@@ -259,8 +286,12 @@ export function useArtwork(
   const onError = () => {
     const key = currentKey
     const track = toValue(trackRef)
+    // A successfully cached URL can fail later; do not hand the same failed URL
+    // straight back from the legacy resolver's shared cache.
+    if (artworkCache.get(key) === artworkUrl.value) artworkCache.delete(key)
 
-    if (currentCandidatePhase === 'jellyfin') {
+    if (currentCandidatePhase === 'netease') {
+      if (nextNeteaseCandidate()) return
       const chksz = findSource(track, 'chksz')
       if (chksz) {
         currentCandidatePhase = 'chksz'

@@ -30,6 +30,14 @@ import {
  */
 const CHKSZ_AUDIO_MIME_TYPE = 'audio/mpeg'
 
+/**
+ * The Worker's answer when owner-key fallback is on but the request has no session (M-05, D4).
+ * Both the resolve fallback (through the shared proxy, which ignores unknown codes) and
+ * discovery map it to `unavailable`, a non-credential failure, so the resolver tries the next
+ * provider instead of stopping on a credential prompt.
+ */
+export const CHKSZ_KEY_REQUIRED = 'chksz_key_required'
+
 export interface ChkszProviderOptions {
   credentialStore?: Pick<ChkszCredentialStore, 'key'>
   qualityStore?: Pick<PlaybackQualityPreferencesStore, 'chkszQuality'>
@@ -143,12 +151,15 @@ async function resolveClientDirect(
     })
   } catch (error) {
     if (isAbort(signal, error)) throw abortReason(signal)
-    throw new ProviderResolveError('unavailable')
+    // A dropped request says nothing about the track (task 41.7).
+    throw new ProviderResolveError('unavailable', { transient: true })
   }
 
   // Status first: a 402 must never be reported as a malformed body.
   const failure = chkszFailureCode(response.status)
-  if (failure) throw new ProviderResolveError(failure)
+  // A 5xx outage reported as `unavailable` may answer on a retry (task 41.6, as in proxy.ts);
+  // 4xx statuses are answers about the key or the track.
+  if (failure) throw new ProviderResolveError(failure, { transient: response.status >= 500 && failure === 'unavailable' })
 
   const body = await readBoundedJson(response, CHKSZ_MAX_RESPONSE_BYTES, signal)
   const playbackMetadata = validateChkszPlaybackMetadata(body, source.externalId, level)
@@ -225,7 +236,8 @@ async function discoverChkszTrackClient(
     })
   } catch (error) {
     if (isAbort(signal, error)) throw abortReason(signal)
-    throw new ProviderResolveError('unavailable')
+    // A dropped request says nothing about the track (task 41.7).
+    throw new ProviderResolveError('unavailable', { transient: true })
   }
 
   if (response.status === 429) {
@@ -239,13 +251,17 @@ async function discoverChkszTrackClient(
     } catch {}
     if (errorCode === 'invalid_credential') throw new ProviderResolveError('invalid_credential')
     if (errorCode === 'credential_required') throw new ProviderResolveError('credential_required')
+    // M-05 / D4: the owner key needs a signed-in session. This is not the listener's credential
+    // failing, so it must not prompt for a key: report a plain outage and let the chain move on.
+    if (errorCode === CHKSZ_KEY_REQUIRED) throw new ProviderResolveError('unavailable')
     throw new ProviderResolveError('unavailable')
   }
   if (response.status === 403) {
     throw new ProviderResolveError('unavailable')
   }
   if (!response.ok) {
-    throw new ProviderResolveError('unavailable')
+    // A 5xx outage may answer on a retry (task 41.7); other statuses are answers.
+    throw new ProviderResolveError('unavailable', { transient: response.status >= 500 })
   }
 
   const data = (await readBoundedJson(response, 4096, signal)) as Record<string, unknown>

@@ -25,69 +25,69 @@ interface TrackSeed {
 
 const SEEDS: TrackSeed[] = [
   {
-    id: 'genshin-fontaine-daydream',
-    title: 'Fontaine Daydream',
+    id: 'demo-fontaine-daydream',
+    title: 'Demo Fontaine Daydream',
     game: 'genshin',
-    album: 'Genshin Impact - Fountain of Belleau (Original Game Soundtrack)',
-    aliases: { 'zh-CN': ['枫丹白日梦'] },
+    album: 'Genshin Impact - Demo Fountain (Original Game Soundtrack)',
+    aliases: { 'zh-CN': ['示范白日梦'] },
     workGroupId: 'work_group_genshin_fontaine',
   },
   {
-    id: 'genshin-fontaine-nightfall',
-    title: 'Nightfall over Fontaine',
+    id: 'demo-fontaine-nightfall',
+    title: 'Demo Nightfall over Fontaine',
     game: 'genshin',
-    album: 'Genshin Impact - Fountain of Belleau (Original Game Soundtrack)',
+    album: 'Genshin Impact - Demo Fountain (Original Game Soundtrack)',
     workGroupId: 'work_group_genshin_fontaine',
   },
   {
-    id: 'genshin-liyue',
+    id: 'demo-liyue',
     title: 'Liyue',
     game: 'genshin',
-    album: 'Genshin Impact - Jade Moon Upon a Sea of Clouds (Original Game Soundtrack)',
+    album: 'Genshin Impact - Demo Moon (Original Game Soundtrack)',
     aliases: { 'zh-CN': ['璃月'] },
     workGroupId: 'work_group_genshin_liyue',
   },
   {
-    id: 'genshin-moon-in-ones-cup',
-    title: "Moon in One's Cup",
+    id: 'demo-moon-in-ones-cup',
+    title: "Demo Moon in One's Cup",
     game: 'genshin',
-    album: 'Genshin Impact - Jade Moon Upon a Sea of Clouds (Original Game Soundtrack)',
+    album: 'Genshin Impact - Demo Moon (Original Game Soundtrack)',
     workGroupId: 'work_group_genshin_liyue',
   },
   {
     // No album: the catalogue permits it, and such a track must stay reachable.
-    id: 'genshin-la-vaguelette',
-    title: 'La vaguelette',
+    id: 'demo-genshin-study',
+    title: 'Demo Genshin Study',
     game: 'genshin',
-    aliases: { 'zh-CN': ['轻涟'], 'zh-TW': ['輕漣'] },
+    aliases: { 'zh-CN': ['示范练习'], 'zh-TW': ['示範練習'] },
     workGroupId: 'work_group_genshin_singles',
   },
   {
-    id: 'hsr-hope',
-    title: 'Hope Is the Thing With Feathers',
+    id: 'demo-hsr-hope',
+    title: 'Demo HSR Study',
     game: 'hsr',
     album: 'INSIDE - EP',
-    aliases: { 'zh-CN': ['使一颗心免于哀伤'] },
+    aliases: { 'zh-CN': ['示范星轨练习'] },
     workGroupId: 'work_group_hsr_penacony',
   },
   {
-    id: 'hsr-sway',
-    title: 'Sway to My Beat in Cosmos',
+    id: 'demo-hsr-sway',
+    title: 'Demo Cosmic Rhythm',
     game: 'hsr',
     album: 'INSIDE - EP',
     workGroupId: 'work_group_hsr_penacony',
   },
   {
-    id: 'zzz-tiny-giant',
-    title: 'Tiny Giant',
+    id: 'demo-zzz-study',
+    title: 'Demo ZZZ Study',
     game: 'zzz',
     album: '极限委托',
-    aliases: { 'zh-CN': ['微小的巨人'] },
+    aliases: { 'zh-CN': ['示范巨人'] },
     workGroupId: 'work_group_zzz_singles',
   },
 ]
 
-function toTrack(seed: TrackSeed): Track {
+function toTrack(seed: TrackSeed, index: number): Track {
   const track: Track = {
     id: seed.id,
     title: seed.title,
@@ -98,7 +98,10 @@ function toTrack(seed: TrackSeed): Track {
     workGroupId: seed.workGroupId ?? `work-${seed.id}`,
     needsClassification: false,
     vocalStatus: 'instrumental',
-    sources: [{ provider: 'jellyfin', externalId: `ext-${seed.id}` }],
+    sources: [
+      { provider: 'chksz', externalId: String(100001 + index) },
+      { provider: 'jellyfin', externalId: `ext-${seed.id}` },
+    ],
   }
   if (seed.album !== undefined) track.album = seed.album
   return track
@@ -112,7 +115,7 @@ export function libraryFixtureTracks(): Track[] {
 /** Ids of the fixture's tracks, in catalogue order. */
 export const LIBRARY_FIXTURE_IDS: readonly string[] = SEEDS.map((seed) => seed.id)
 
-export const FONTAINE_ALBUM = 'Genshin Impact - Fountain of Belleau (Original Game Soundtrack)'
-export const LIYUE_ALBUM = 'Genshin Impact - Jade Moon Upon a Sea of Clouds (Original Game Soundtrack)'
+export const FONTAINE_ALBUM = 'Genshin Impact - Demo Fountain (Original Game Soundtrack)'
+export const LIYUE_ALBUM = 'Genshin Impact - Demo Moon (Original Game Soundtrack)'
 export const INSIDE_ALBUM = 'INSIDE - EP'
 export const HAN_ALBUM = '极限委托'

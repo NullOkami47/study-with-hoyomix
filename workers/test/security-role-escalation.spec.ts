@@ -32,7 +32,7 @@ describe('role escalation and admin authorization', () => {
   let ownerToken: string
 
   beforeEach(async () => {
-    // Session issuance and request validation must share the fixture clock.
+    // Sessions and direct Worker requests share a deterministic clock; real timers stay active.
     vi.spyOn(Date, 'now').mockReturnValue(NOW)
     miniflare = new Miniflare({
       compatibilityDate: '2025-12-01',
@@ -78,8 +78,7 @@ describe('role escalation and admin authorization', () => {
   })
 
   afterEach(async () => {
-    vi.restoreAllMocks()
-    await miniflare.dispose()
+    try { await miniflare.dispose() } finally { vi.restoreAllMocks() }
   })
 
   const request = (path: string, token: string, init: RequestInit = {}) => {

@@ -10,8 +10,8 @@ import {
 
 const JELLYFIN_ORIGIN = 'https://jellyfin.example.invalid'
 const API_TOKEN = 'secret-jellyfin-token-xyz-12345'
-const ITEM_ID = '1234abcda0d954293110f4d561b0f614'
-const ITEM_ID_HYPHENATED = '1234abcd-a0d9-5429-3110-f4d561b0f614'
+const ITEM_ID = '6213b704a0d954293110f4d561b0f614'
+const ITEM_ID_HYPHENATED = '6213b704-a0d9-5429-3110-f4d561b0f614'
 const USER_ID = '8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f'
 const EXPECTED_MEDIA_URL = `${JELLYFIN_ORIGIN}/Audio/${ITEM_ID}/stream?static=true`
 // Jellyfin 12 requires the modern `Authorization: MediaBrowser Token="…"` form and rejects the
@@ -59,10 +59,10 @@ const resolve = (
 
 describe('Jellyfin external ID parser', () => {
   it.each([
-    ['1234abcda0d954293110f4d561b0f614', '1234abcda0d954293110f4d561b0f614'],
-    ['1234ABCDA0D954293110F4D561B0F614', '1234abcda0d954293110f4d561b0f614'],
-    ['1234abcd-a0d9-5429-3110-f4d561b0f614', '1234abcda0d954293110f4d561b0f614'],
-    ['1234ABCD-A0D9-5429-3110-F4D561B0F614', '1234abcda0d954293110f4d561b0f614'],
+    ['6213b704a0d954293110f4d561b0f614', '6213b704a0d954293110f4d561b0f614'],
+    ['6213B704A0D954293110F4D561B0F614', '6213b704a0d954293110f4d561b0f614'],
+    ['6213b704-a0d9-5429-3110-f4d561b0f614', '6213b704a0d954293110f4d561b0f614'],
+    ['6213B704-A0D9-5429-3110-F4D561B0F614', '6213b704a0d954293110f4d561b0f614'],
     ['00000000000000000000000000000001', '00000000000000000000000000000001'],
   ] as const)('accepts canonical GUID/UUID external ID: %s -> %s', (input, expected) => {
     expect(parseJellyfinExternalId(input)).toBe(expected)
@@ -71,19 +71,19 @@ describe('Jellyfin external ID parser', () => {
   it.each([
     '',
     '   ',
-    ' 1234abcda0d954293110f4d561b0f614',
-    '1234abcda0d954293110f4d561b0f614 ',
-    '1234abcda0d954293110f4d561b0f61g', // invalid hex
-    '1234abcd-a0d9-5429-3110-f4d561b0f61g',
-    '1234abcda0d954293110f4d561b0f61', // 31 chars
-    '1234abcda0d954293110f4d561b0f6140', // 33 chars
-    '1234abcd-a0d9-5429-3110', // partial
-    '../1234abcda0d954293110f4d561b0f614',
-    '1234abcda0d954293110f4d561b0f614/stream',
-    '1234abcda0d954293110f4d561b0f614?static=true',
-    'https://jellyfin.example.invalid/Items/1234abcda0d954293110f4d561b0f614',
+    ' 6213b704a0d954293110f4d561b0f614',
+    '6213b704a0d954293110f4d561b0f614 ',
+    '6213b704a0d954293110f4d561b0f61g', // invalid hex
+    '6213b704-a0d9-5429-3110-f4d561b0f61g',
+    '6213b704a0d954293110f4d561b0f61', // 31 chars
+    '6213b704a0d954293110f4d561b0f6140', // 33 chars
+    '6213b704-a0d9-5429-3110', // partial
+    '../6213b704a0d954293110f4d561b0f614',
+    '6213b704a0d954293110f4d561b0f614/stream',
+    '6213b704a0d954293110f4d561b0f614?static=true',
+    'https://jellyfin.example.invalid/Items/6213b704a0d954293110f4d561b0f614',
     'La Vaguelette',
-    'zzz-tiny-giant',
+    'demo-zzz-study',
   ])('rejects non-canonical or malformed external ID: %s', (input) => {
     expect(parseJellyfinExternalId(input)).toBeNull()
   })
@@ -429,7 +429,7 @@ describe('Jellyfin metadata adapter', () => {
     ['a non-JSON response MIME', new Response(JSON.stringify(validAudioMetadata()), {
       headers: { 'content-type': 'text/html' },
     })],
-    ['malformed JSON', new Response('{"Id":"1234abcda0d954293110f4d561b0f614"', {
+    ['malformed JSON', new Response('{"Id":"6213b704a0d954293110f4d561b0f614"', {
       headers: { 'content-type': 'application/json' },
     })],
   ])('rejects %s without exposing secrets or body content', async (_label, response) => {
@@ -637,11 +637,9 @@ describe('Jellyfin user ID parsing', () => {
   })
 })
 
-// The resolver cannot complete a metadata lookup without user context on Jellyfin 12, so a
-// deployment that supplies only an origin and a token is not actually available.
-describe('Jellyfin deployment availability requires user context', () => {
-  // `deploymentAvailable` reads only the Jellyfin fields, so the envelope is narrowed to those
-  // keys rather than standing up the full auth/catalogue environment this suite does not need.
+// Retirement takes precedence over any saved legacy deployment configuration.
+describe('Retired Jellyfin deployment availability', () => {
+  // Reuse the legacy configuration cases to guard against accidental re-enablement.
   const envWith = (overrides: Partial<Record<
     'JELLYFIN_BASE_URL' | 'JELLYFIN_API_TOKEN' | 'JELLYFIN_USER_ID',
     string
@@ -653,8 +651,9 @@ describe('Jellyfin deployment availability requires user context', () => {
     JELLYFIN_USER_ID: USER_ID,
   }
 
-  it('requires origin, token, and user ID together', () => {
-    expect(deploymentAvailable('jellyfin', envWith(complete))).toBe(true)
+  it('remains unavailable with complete, incomplete, or invalid legacy configuration', () => {
+    expect(deploymentAvailable('jellyfin', envWith({}))).toBe(false)
+    expect(deploymentAvailable('jellyfin', envWith(complete))).toBe(false)
     expect(deploymentAvailable('jellyfin', envWith({
       JELLYFIN_BASE_URL: JELLYFIN_ORIGIN,
       JELLYFIN_API_TOKEN: API_TOKEN,

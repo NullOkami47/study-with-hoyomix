@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { LxRuntimeClient } from './client'
 import { setupWorkerHandler } from './worker'
 import { LX_RPC_MAX_BYTES } from './protocol'
+import { ProviderResolveError } from '../../providers/types'
 
 class TestWorker implements Partial<Worker> {
   onmessage: ((ev: MessageEvent) => void) | null = null
@@ -76,6 +77,10 @@ describe('LxRuntimeClient', () => {
     })
   })
 
+  // Deliberately changed by M-11 (task 23.5): this used to return `headers` from the guest and pin
+  // their passthrough as `requestHeaders`. The sandbox now refuses results that need custom headers
+  // (3.6), so the RPC round trip is checked with a header-free result, and the refusal crossing the
+  // Worker boundary is checked separately below.
   it('resolves musicUrl through worker RPC', async () => {
     client = new LxRuntimeClient({
       workerFactory: () => new TestWorker() as unknown as Worker,
@@ -86,7 +91,6 @@ describe('LxRuntimeClient', () => {
         if (action === 'musicUrl') {
           return {
             url: 'https://cdn.example.com/audio/' + info.musicInfo.id + '.flac',
-            headers: { 'X-Custom-Auth': 'allowed' },
             quality: 'lossless'
           };
         }
@@ -97,9 +101,19 @@ describe('LxRuntimeClient', () => {
     const result = await client.callMusicUrl('wy', { id: 'song_123' }, 'flac')
     expect(result).toEqual({
       url: 'https://cdn.example.com/audio/song_123.flac',
-      requestHeaders: { 'X-Custom-Auth': 'allowed' },
       actualQuality: 'lossless',
     })
+    expect(result.requestHeaders).toBeUndefined()
+  })
+
+  it('surfaces the sandbox refusal of a result needing custom headers through worker RPC', async () => {
+    client = new LxRuntimeClient({
+      workerFactory: () => new TestWorker() as unknown as Worker,
+    })
+    await client.loadSource(`
+      lx.on(lx.EVENT_NAMES.request, () => ({ url: 'https://cdn.example.com/a.flac', headers: { 'X-Custom-Auth': 'needed' } }));
+    `)
+    await expect(client.callMusicUrl('wy', { id: 'song_123' }, 'flac')).rejects.toThrow(/^invalid_response:/)
   })
 
   it('enforces call timeout and terminates unresponsive worker', async () => {
@@ -201,4 +215,28 @@ describe('LxRuntimeClient', () => {
     // Cannot call after dispose
     await expect(client.loadSource('// test')).rejects.toThrow(/disposed/i)
   })
+})
+
+
+it('abort terminates a busy Worker synchronously and rejects all pending RPCs',async()=>{
+ const worker=new TestWorker(()=>()=>new Promise(()=>{}))
+ const client=new LxRuntimeClient({workerFactory:()=>worker as unknown as Worker})
+ const pending=client.loadSource('// pending')
+ const rejection=expect(pending).rejects.toThrow(/abort/i)
+ try{client.abort();expect(worker.terminated).toBe(true);await rejection;await client.dispose()}finally{worker.terminate();await client.dispose()}
+})
+
+it('retains the caller timeout reason when aborting a busy Worker', async () => {
+  const worker = new TestWorker(() => () => new Promise(() => {}))
+  const client = new LxRuntimeClient({ workerFactory: () => worker as unknown as Worker })
+  const reason = new ProviderResolveError('timeout')
+  const rejection = expect(client.loadSource('// pending')).rejects.toBe(reason)
+  try {
+    client.abort(reason)
+    expect(worker.terminated).toBe(true)
+    await rejection
+  } finally {
+    worker.terminate()
+    await client.dispose()
+  }
 })

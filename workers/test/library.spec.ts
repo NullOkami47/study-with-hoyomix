@@ -148,7 +148,7 @@ describe('cross-device library routes', () => {
       .toMatchObject({ results: [{ id: 'history-b' }] })
   })
 
-  it('exports only favourites, private playlists, benign settings, and the account reports', async () => {
+  it('exports only favourites, private playlists, benign settings, the account reports and own chat messages', async () => {
     await database.batch([
       database.prepare('INSERT INTO favourites VALUES (?, ?, ?)').bind('user-a', 'track-a', NOW),
       database.prepare('INSERT INTO listening_history VALUES (?, ?, ?, ?)').bind('history-secret', 'user-a', 'private-listening', NOW),
@@ -198,9 +198,15 @@ describe('cross-device library routes', () => {
       userUiPreferences: null,
       backgroundSelection: null,
       reports: [expect.objectContaining({ id: 'report-a', note: 'helpful note' })],
+      // L-21 (D7): the export now includes the account's own chat messages (key `chatMessages`).
+      chatMessages: [{
+        id: 'message-a', roomId: 'global', type: 'text', content: 'private chat content',
+        stickerId: null, trackId: null, location: null, createdAt: NOW_ISO, updatedAt: null,
+        deletedAt: null, expiresAt: new Date(NOW + 1_000).toISOString(), versions: [],
+      }],
     })
     const serialised = JSON.stringify(exported)
-    for (const excluded of ['private-listening', 'history-secret', 'private chat content', 'avatars/user-a', '__Host-session', 'provider_subject', tokenA, '550e8400-e29b-41d4-a716-446655440009']) {
+    for (const excluded of ['private-listening', 'history-secret', 'avatars/user-a', '__Host-session', 'provider_subject', tokenA, '550e8400-e29b-41d4-a716-446655440009']) {
       expect(serialised).not.toContain(excluded)
     }
   })
@@ -285,8 +291,9 @@ describe('cross-device library routes', () => {
       const value = table === 'playlist_tracks' ? 'playlist-a' : 'user-a'
       expect(await database.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`).bind(value).first('count'), table).toBe(0)
     }
+    // L-21 (D7): the retained row keeps its place but loses the author and the text (tombstone '').
     expect(await database.prepare('SELECT user_id, author_display_name, content FROM chat_messages WHERE id = ?').bind('message-a').first()).toEqual({
-      user_id: null, author_display_name: 'Deleted user', content: 'retained content',
+      user_id: null, author_display_name: 'Deleted user', content: '',
     })
     expect(await database.prepare('SELECT reporter_user_id, status FROM catalog_reports WHERE id = ?').bind('catalog-report-a').first()).toEqual({ reporter_user_id: null, status: 'withdrawn' })
     expect(await database.prepare('SELECT reporter_user_id, status FROM chat_reports WHERE id = ?').bind('chat-report-a').first()).toEqual({ reporter_user_id: null, status: 'withdrawn' })

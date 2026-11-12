@@ -34,11 +34,11 @@ describe('validateAliasLocales', () => {
   })
 
   it('flags zh-CN, the exact defect found in the staging CSV', () => {
-    const report = validateAliasLocales([{ id: 'zzz-tiny-giant', aliases: { 'zh-CN': ['微小的巨人'] } }])
+    const report = validateAliasLocales([{ id: 'demo-zzz-study', aliases: { 'zh-CN': ['示范巨人'] } }])
     expect(report.unreachableLocales).toEqual(['zh-CN'])
     expect(report.issues).toHaveLength(1)
     expect(report.issues[0]).toEqual({
-      trackId: 'zzz-tiny-giant',
+      trackId: 'demo-zzz-study',
       storedLocale: 'zh-CN',
       // Region tags do not encode the script, so the target is genuinely ambiguous.
       likelyLocale: null,
@@ -47,7 +47,7 @@ describe('validateAliasLocales', () => {
   })
 
   it('flags fr-FR as unreachable, because the app has no French interface', () => {
-    const report = validateAliasLocales([{ id: 'a', aliases: { 'fr-FR': ['La vaguelette'] } }])
+    const report = validateAliasLocales([{ id: 'a', aliases: { 'fr-FR': ['Demo Genshin Study'] } }])
     expect(report.unreachableLocales).toEqual(['fr-FR'])
     expect(report.issues[0]!.likelyLocale).toBeNull()
     expect(isChineseLocaleTag('fr-FR')).toBe(false)
@@ -137,9 +137,9 @@ describe('renderAliasLocaleReport', () => {
 
   it('names each affected track and locale without silently rewriting it', () => {
     const text = renderAliasLocaleReport(
-      validateAliasLocales([{ id: 'zzz-tiny-giant', aliases: { 'zh-CN': ['微小的巨人'] } }]),
+      validateAliasLocales([{ id: 'demo-zzz-study', aliases: { 'zh-CN': ['示范巨人'] } }]),
     )
-    expect(text).toContain('zzz-tiny-giant')
+    expect(text).toContain('demo-zzz-study')
     expect(text).toContain('zh-CN')
     expect(text).toContain('does not rewrite')
   })

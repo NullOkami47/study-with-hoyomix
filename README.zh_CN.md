@@ -45,7 +45,7 @@
 
 ## 📝 项目简介
 
-**Study with HOYO-MiX**（[`NullOkami47/study-with-hoyomix`](https://github.com/NullOkami47/study-with-hoyomix)）是 [`NullOkami47/hoyomix_web_player`](https://github.com/NullOkami47/hoyomix_web_player) 的公开开源版本——一个以 **HOYO-MiX** 游戏原声音乐陪伴学习与专注的非官方深色系 Web 工作台。项目围绕 WebGPU / WebGL2 / CSS **Liquid Glass（液态玻璃）** 光学材质构建，内置持久化番茄钟与睡眠定时器、多音源播放编排引擎、基于原生 `IndexedDB` 的匿名本地优先曲库与可选 OAuth 跨设备云同步，以及基于 Cloudflare Workers + D1 + R2 + Durable Objects 的边缘后端架构。
+**Study with HOYO-MiX**（[`NullOkami47/study-with-hoyomix`](https://github.com/NullOkami47/study-with-hoyomix)）是 [`Study with HOYO-MiX`](https://github.com/NullOkami47/study-with-hoyomix) 的公开开源版本——一个以 **HOYO-MiX** 游戏原声音乐陪伴学习与专注的非官方深色系 Web 工作台。项目围绕 WebGPU / WebGL2 / CSS **Liquid Glass（液态玻璃）** 光学材质构建，内置持久化番茄钟与睡眠定时器、多音源播放编排引擎、基于原生 `IndexedDB` 的匿名本地优先曲库与可选 OAuth 跨设备云同步，以及基于 Cloudflare Workers + D1 + R2 + Durable Objects 的边缘后端架构。
 
 公开生产环境应用部署于 **[Study with HOYO-MiX](https://app.study-with-hoyomix.workers.dev)**，由 Cloudflare Worker `app` 提供服务。
 

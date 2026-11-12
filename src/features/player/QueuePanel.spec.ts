@@ -19,6 +19,12 @@ const track = (id: string, title = id): Track => ({
   sources: [],
 })
 
+// These tracks carry no sources. A resolver that always succeeds keeps them playing, so the
+// unavailable-track skip does not move the queue while these tests inspect it.
+const playable = async () => ({
+  ok: true as const, providerId: 'jellyfin', attempts: [],
+  playable: { kind: 'audio' as const, url: '/queue.mp3', mimeType: 'audio/mpeg' },
+})
 const pointerDescriptors = [
   [Element.prototype, 'setPointerCapture', Object.getOwnPropertyDescriptor(Element.prototype, 'setPointerCapture')],
   [Element.prototype, 'releasePointerCapture', Object.getOwnPropertyDescriptor(Element.prototype, 'releasePointerCapture')],
@@ -59,7 +65,7 @@ function storeFor(queue: Track[], currentIndex: number): Pick<PlaybackStore,
 describe('QueuePanel', () => {
   it('exposes accessible shuffle and repeat controls backed by persisted store state', async () => {
     const storage = { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() }
-    const store = createPlaybackStore({ storage, random: () => 0 })
+    const store = createPlaybackStore({ storage, random: () => 0, resolve: playable })
     store.reconcileUpcomingQueue([track('first'), track('second'), track('third')])
     const wrapper = mount(QueuePanel, { props: { store } })
     expect(wrapper.get('[data-queue-shuffle]').attributes('aria-pressed')).toBe('false')
@@ -87,7 +93,7 @@ describe('QueuePanel', () => {
   })
 
   it('shows played history after advancing without duplicating queue tracks', async () => {
-    const store = createPlaybackStore({ storage: { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() } })
+    const store = createPlaybackStore({ resolve: playable, storage: { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() } })
     store.reconcileUpcomingQueue([track('first'), track('second'), track('third')])
     await store.playQueueIndex(0)
     await store.next()
@@ -161,7 +167,7 @@ describe('QueuePanel', () => {
   })
 
   it('hands keyboard focus to the same row\'s inverse control after a move, in both directions', async () => {
-    const store = createPlaybackStore()
+    const store = createPlaybackStore({ resolve: playable })
     store.enqueue(track('first'))
     store.enqueue(track('second'))
     store.enqueue(track('third'))
@@ -260,7 +266,7 @@ describe('QueuePanel', () => {
   })
 
   it('cleans up a drag when its source row disappears so another row can start', async () => {
-    const store = createPlaybackStore()
+    const store = createPlaybackStore({ resolve: playable })
     store.enqueue(track('first'))
     store.enqueue(track('second'))
     store.enqueue(track('third'))
@@ -287,7 +293,7 @@ describe('QueuePanel', () => {
   })
 
   it('cancels a drop when its candidate becomes Now Playing before pointerup', async () => {
-    const store = createPlaybackStore()
+    const store = createPlaybackStore({ resolve: playable })
     store.enqueue(track('first'))
     store.enqueue(track('second'))
     store.enqueue(track('third'))

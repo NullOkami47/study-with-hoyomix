@@ -27,6 +27,27 @@ function volumeControl() {
 }
 
 describe('scoped account preferences', () => {
+  it('echoes a Cloudflare-weakened ETag as a strong If-Match (issue I: W/"123" made the Worker answer 400)', async () => {
+    const snapshot = captureAccountPreferences(preferences(), volumeControl())
+    const fetcher = vi.fn(async () => Response.json({ preferences: snapshot }, { headers: { etag: 'W/"1793601484700"' } }))
+    const repository = createAccountPreferencesRepository(fetcher)
+    await repository.load()
+    await repository.save(snapshot)
+    const put = (fetcher.mock.calls as unknown as [string, RequestInit][])[1][1]
+    expect(new Headers(put.headers).get('if-match')).toBe('"1793601484700"')
+  })
+
+  it('keeps strong and bare entity tags unchanged', async () => {
+    const snapshot = captureAccountPreferences(preferences(), volumeControl())
+    for (const [etag, expected] of [['"77"', '"77"'], ['77', '77']] as const) {
+      const fetcher = vi.fn(async () => Response.json({ preferences: snapshot }, { headers: { etag } }))
+      const repository = createAccountPreferencesRepository(fetcher)
+      await repository.load()
+      await repository.save(snapshot)
+      const put = (fetcher.mock.calls as unknown as [string, RequestInit][])[1][1]
+      expect(new Headers(put.headers).get('if-match')).toBe(expected)
+    }
+  })
   it('explicitly negotiates the retired-field-free v2 wire format on reads and writes', async () => {
     const snapshot = captureAccountPreferences(preferences(), volumeControl())
     const fetcher = vi.fn(async () => Response.json({ preferences: snapshot }))
@@ -38,6 +59,22 @@ describe('scoped account preferences', () => {
       expect(new Headers(init.headers).get('x-account-preferences-schema')).toBe('2')
       if (init.body) expect(JSON.parse(String(init.body)).preferences).not.toHaveProperty('lowPower')
     }
+  })
+  // L-24 (D9): every write is conditional, so the Worker can later require If-Match.
+  it('always sends If-Match on writes: the row-less tag before any ETag, then the server ETag verbatim', async () => {
+    const snapshot = captureAccountPreferences(preferences(), volumeControl())
+    const etags = ['"1700000000001"', '"1700000000002"']
+    const fetcher = vi.fn(async () => {
+      const etag = etags.shift() ?? null
+      return Response.json({ preferences: snapshot }, etag ? { headers: { etag } } : {})
+    })
+    const repository = createAccountPreferencesRepository(fetcher)
+    await repository.save(snapshot)
+    await repository.save(snapshot)
+    await repository.save(snapshot)
+    const sent = (fetcher.mock.calls as unknown as [string, RequestInit][])
+      .map(([, init]) => new Headers(init.headers).get('if-match'))
+    expect(sent).toEqual(['absent', '"1700000000001"', '"1700000000002"'])
   })
   it('captures only live language, volume, low-power, appearance and tip preferences', () => {
     const snapshot = captureAccountPreferences(preferences(), volumeControl())

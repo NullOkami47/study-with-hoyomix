@@ -1,19 +1,82 @@
-vi.mock('../backgrounds/staticDefinitions', async () => import('../../test/fixtures/staticBackgrounds'))
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import { ref } from 'vue'
 import { usePreferences } from '../../stores/preferences'
 import { createBackgroundStore } from '../backgrounds/store'
-import { listStaticBackgrounds } from '../backgrounds/catalogue'
+import { createPublicBackgrounds, PUBLIC_BACKGROUND_FIXTURE_IDS } from '../../test/fixtures/publicBackgrounds'
 import { createAccountFocusRepository } from '../focus/accountRepository'
 import type { FocusSessionRecord } from '../focus/types'
 import { captureAccountPreferences } from './accountPreferences'
 import { resetAccountSession, useAccountSession } from './session'
 import { createWorkspaceAccountSync } from './workspaceSync'
+import { automaticSyncStatus } from './automaticSync'
 
 const cleanup: (() => void)[] = []
 beforeEach(() => { vi.useFakeTimers(); resetAccountSession(); localStorage.clear() })
 afterEach(() => { cleanup.splice(0).reverse().forEach(stop => stop()); resetAccountSession(); vi.useRealTimers(); vi.unstubAllGlobals() })
+
+it.each(['pageshow','resume'])('retries retained edits after a failed Android/PWA sync on %s', async eventName => {
+  const preferences=usePreferences()
+  const player={volume:ref(.4),setVolume(value:number){this.volume.value=value}}
+  const session=useAccountSession()
+  const focus=createAccountFocusRepository(session.userId)
+  cleanup.push(focus.destroy)
+  let offline=true
+  let sessionReads=0
+  let saved={...captureAccountPreferences(preferences,player),backgroundPlaybackMode:'random' as const,backgroundQualityMode:'auto' as const}
+  const writes:typeof saved[]=[]
+  vi.stubGlobal('fetch',async(input:RequestInfo|URL,init?:RequestInit)=>{
+    const path=String(input)
+    if(path==='/api/session') {sessionReads++;return Response.json({user:{id:`android-resume-${eventName}`}})}
+    if(path==='/api/account/ui-preferences') {
+      if(offline)return Response.json({error:'unavailable'},{status:503})
+      if(init?.method==='PUT'){saved=JSON.parse(String(init.body)).preferences;writes.push(saved)}
+      return Response.json({preferences:saved},{headers:{etag:'"1"'}})
+    }
+    if(path.startsWith('/api/focus-sessions'))return Response.json({sessions:[],nextCursor:null})
+    return new Response(null,{status:404})
+  })
+  const selection={selectedIds:[PUBLIC_BACKGROUND_FIXTURE_IDS[0]],autoRotate:true,intervalSeconds:1200 as const}
+  const backgrounds=createBackgroundStore({repository:{list:async()=>createPublicBackgrounds(),getAccountSelection:async()=>selection,saveAccountSelection:async value=>value}})
+  cleanup.push(backgrounds.destroy)
+  const sync=createWorkspaceAccountSync({preferences,player,backgrounds,focus})
+  cleanup.push(sync.destroy)
+  await flushPromises()
+  player.setVolume(.37)
+  await vi.advanceTimersByTimeAsync(20_000)
+  await flushPromises()
+  expect(automaticSyncStatus.value).toBe('failed')
+  expect(writes).toEqual([])
+  offline=false
+  // An initial pageshow is not a restore, and hidden resumes must not start I/O.
+  window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:false}))
+  const visibility=vi.spyOn(document,'visibilityState','get').mockReturnValue('hidden')
+  document.dispatchEvent(new Event('resume'))
+  await flushPromises()
+  await vi.advanceTimersByTimeAsync(800)
+  expect(automaticSyncStatus.value).toBe('failed')
+  expect(writes).toEqual([])
+  visibility.mockRestore()
+  const beforeResume=sessionReads
+  if(eventName==='pageshow')window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}))
+  else document.dispatchEvent(new Event('resume'))
+  window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}))
+  document.dispatchEvent(new Event('resume'))
+  window.dispatchEvent(new Event('focus'))
+  await flushPromises()
+  await vi.advanceTimersByTimeAsync(800)
+  await flushPromises()
+  expect(automaticSyncStatus.value).toBe('synced')
+  expect(player.volume.value).toBe(.37)
+  expect(writes.at(-1)?.volume).toBe(.37)
+  expect(sessionReads).toBe(beforeResume+1)
+  sync.destroy()
+  window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}))
+  document.dispatchEvent(new Event('resume'))
+  window.dispatchEvent(new Event('focus'))
+  await vi.advanceTimersByTimeAsync(6000)
+  expect(sessionReads).toBe(beforeResume+1)
+})
 it.each([false, true])('restores settings, multi-selection and Focus at workspace startup (legacy profile: %s)', async legacy => {
   const preferences = usePreferences(), player = { volume: ref(.4), setVolume(value: number) { this.volume.value = value } }
   preferences.setLocale('en'); preferences.setVisualStyle('cinematic')
@@ -52,10 +115,10 @@ it.each([false, true])('restores settings, multi-selection and Focus at workspac
     }
     return new Response(null, { status: 404 })
   })
-  const choices = ['zzz-belle-lofi-girl', listStaticBackgrounds().find(b => b.id !== 'zzz-belle-lofi-girl')!.id]
+  const choices = PUBLIC_BACKGROUND_FIXTURE_IDS.slice(0, 2)
   let remoteSelection = { selectedIds: choices, autoRotate: true, intervalSeconds: 600 as const }
   const writes: typeof remoteSelection[] = []
-  const backgrounds = createBackgroundStore({ repository: { list: async () => listStaticBackgrounds(),
+  const backgrounds = createBackgroundStore({ repository: { list: async () => createPublicBackgrounds(),
     getAccountSelection: async () => remoteSelection,
     saveAccountSelection: async value => { remoteSelection = value as typeof remoteSelection; writes.push(remoteSelection); return value },
   } })
@@ -80,6 +143,6 @@ it.each([false, true])('restores settings, multi-selection and Focus at workspac
   focus.claimRun(completed.id); await focus.timerRepository.recordIfAbsent(completed)
   await vi.advanceTimersByTimeAsync(800); await flushPromises()
   expect(saved.studioBlur).toBe(20); expect(saved.volume).toBe(.7)
-  expect(writes.at(-1)?.selectedIds).toEqual(['zzz-belle-lofi-girl'])
+  expect(writes.at(-1)?.selectedIds).toEqual([PUBLIC_BACKGROUND_FIXTURE_IDS[0]])
   expect(remoteRecords.map(record => record.id)).toContain(completed.id)
 })

@@ -1,0 +1,37 @@
+/* Accessibility is shared policy, not a Studio material. Keep Cinematic's
+   original appearance in normal conditions, without dropping user preferences. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root:is([data-theme="cinematic"], [data-theme="studio"]) :is(.liquid-shell, .liquid-popover, .surface-glass) {
+    background: var(--colour-surface-opaque) !important;
+    color: var(--colour-text-primary);
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+    text-shadow: none;
+  }
+  :root:is([data-theme="cinematic"], [data-theme="studio"]) :is(.liquid-shell, .liquid-popover, .surface-glass) {
+    --colour-surface-opaque: #161820;
+    --colour-text-muted: #f7f8fa;
+    --liquid-text-secondary: #f7f8fa;
+  }
+  :root:is([data-theme="cinematic"], [data-theme="studio"]) .liquid-glass {
+    display: none;
+  }
+  :root:is([data-theme="cinematic"], [data-theme="studio"]) .overlay-sheet__backdrop {
+    background: rgb(4 8 14 / 65%);
+  }
+}
+
+@media (forced-colors: active) {
+  :root:is([data-theme="cinematic"], [data-theme="studio"]) :is(.liquid-shell, .liquid-popover, .surface-glass) {
+    background: Canvas !important;
+    color: CanvasText;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+    box-shadow: none !important;
+    outline: 1px solid CanvasText;
+    text-shadow: none;
+  }
+  :root:is([data-theme="cinematic"], [data-theme="studio"]) .liquid-glass {
+    display: none;
+  }
+}

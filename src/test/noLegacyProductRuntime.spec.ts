@@ -8,7 +8,8 @@ const runtimeFiles = [
   'src/App.vue',
   'src/main.js',
   'src/style.css',
-  'workers/online-counter.js',
+  // The legacy chat Worker under workers/ was deleted in Wave G (L-14, D12), so it is no
+  // longer a runtime file to scan; src/test/repositoryHygiene.spec.ts checks it stays absent.
 ]
 
 const legacyFiles = [

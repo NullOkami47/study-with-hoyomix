@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import worker from '../index'
 import { issueSession, SESSION_LIFETIME_MS } from '../auth/session'
-import type { LibraryEnv } from '../library/routes'
+import { createLibraryHandler, type LibraryEnv } from '../library/routes'
 
 const ORIGIN = 'https://study.example'
 const NOW = 1_786_480_000_000
@@ -40,7 +40,7 @@ describe('export and account deletion isolation', () => {
   let userBToken: string
 
   beforeEach(async () => {
-    // Session issuance and request validation must share the fixture clock.
+    // Sessions and direct Worker requests share a deterministic clock; real timers stay active.
     vi.spyOn(Date, 'now').mockReturnValue(NOW)
     miniflare = new Miniflare({
       compatibilityDate: '2025-12-01',
@@ -70,8 +70,7 @@ describe('export and account deletion isolation', () => {
   })
 
   afterEach(async () => {
-    vi.restoreAllMocks()
-    await miniflare.dispose()
+    try { await miniflare.dispose() } finally { vi.restoreAllMocks() }
   })
 
   it('rejects an expired session before exporting account data', async () => {
@@ -214,5 +213,76 @@ describe('export and account deletion isolation', () => {
 
     expect(serialized).not.toContain('user-b')
     expect(serialized).not.toContain('fav-b')
+  })
+
+  // Wave G exploration (task 25). L-15 (D8 = stop emitting): the Worker has no avatar storage
+  // binding, so deleting an account must not leave an outbox row that nothing will ever process.
+  it('L-15: creates no account_deletion_events row when no avatar storage binding exists', async () => {
+    await database.prepare('UPDATE users SET avatar_url = ? WHERE id = ?')
+      .bind('avatars/user-a/avatar.webp', 'user-a').run()
+    const response = await worker.fetch(request('/api/account/delete', userAToken, {
+      method: 'POST', body: JSON.stringify({ confirmation: 'DELETE' }),
+    }), env as never)
+    expect(response.status).toBe(204)
+    expect(await database.prepare('SELECT COUNT(*) AS total FROM users WHERE id = ?').bind('user-a').first('total')).toBe(0)
+    expect(await database.prepare('SELECT COUNT(*) AS total FROM account_deletion_events').first('total')).toBe(0)
+  })
+
+  // L-15: `sessions.last_seen_at` is written during authentication, at most once per hour.
+  it('L-15: records sessions.last_seen_at on authentication at most once per hour', async () => {
+    const HOUR = 60 * 60 * 1000
+    let clock = NOW + 2 * HOUR
+    const handler = createLibraryHandler(env, { now: () => clock })
+    const lastSeen = () => database.prepare('SELECT last_seen_at AS lastSeenAt FROM sessions WHERE user_id = ?')
+      .bind('user-a').first<number>('lastSeenAt')
+    expect(await lastSeen()).toBe(NOW)
+    expect((await handler.fetch(request('/api/library', userAToken))).status).toBe(200)
+    expect(await lastSeen()).toBe(NOW + 2 * HOUR)
+    clock = NOW + 2 * HOUR + 59 * 60 * 1000
+    expect((await handler.fetch(request('/api/library', userAToken))).status).toBe(200)
+    expect(await lastSeen()).toBe(NOW + 2 * HOUR)
+    clock = NOW + 3 * HOUR + 60 * 1000
+    expect((await handler.fetch(request('/api/library', userAToken))).status).toBe(200)
+    expect(await lastSeen()).toBe(NOW + 3 * HOUR + 60 * 1000)
+  })
+
+  // L-21 (D7 = delete content, include chat in the export).
+  const seedChat = async () => {
+    const now = Date.now()
+    const expires = now + 29 * 24 * 60 * 60 * 1000
+    await database.prepare(`
+      INSERT INTO chat_messages (id, user_id, author_display_name, content, message_type, created_at, expires_at)
+      VALUES ('chat-a', 'user-a', 'user-a', 'wave-g private message from a', 'text', ?, ?),
+             ('chat-b', 'user-b', 'user-b', 'wave-g message from b', 'text', ?, ?)
+    `).bind(now, expires, now, expires).run()
+    await database.prepare(`
+      INSERT INTO chat_message_versions (id, message_id, editor_user_id, original_content, created_at, expires_at)
+      VALUES ('version-a', 'chat-a', 'user-a', 'wave-g earlier draft from a', ?, ?)
+    `).bind(now, expires).run()
+  }
+
+  it('L-21: tombstones the deleted user chat content and edit history', async () => {
+    await seedChat()
+    const response = await worker.fetch(request('/api/account/delete', userAToken, {
+      method: 'POST', body: JSON.stringify({ confirmation: 'DELETE' }),
+    }), env as never)
+    expect(response.status).toBe(204)
+    const messages = (await database.prepare('SELECT content FROM chat_messages').all<{ content: string }>()).results
+    const versions = (await database.prepare('SELECT original_content AS content FROM chat_message_versions').all<{ content: string }>()).results
+    const retained = JSON.stringify([...messages, ...versions])
+    expect(retained).not.toContain('private message from a')
+    expect(retained).not.toContain('earlier draft from a')
+    expect(retained).toContain('wave-g message from b')
+  })
+
+  it('L-21: includes the user own chat messages, and nobody else, in the export', async () => {
+    await seedChat()
+    const response = await worker.fetch(request('/api/export', userAToken), env as never)
+    expect(response.status).toBe(200)
+    const serialized = JSON.stringify(await response.json())
+    expect(serialized).toContain('chat-a')
+    expect(serialized).toContain('wave-g private message from a')
+    expect(serialized).not.toContain('chat-b')
+    expect(serialized).not.toContain('wave-g message from b')
   })
 })

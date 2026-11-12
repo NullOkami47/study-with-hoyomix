@@ -56,7 +56,8 @@ function audioMimeType(response: Response): string | null {
 function checkStatus(response: Response): 'ok' | 'missing' {
   if (response.status === 404 || response.status === 410) return 'missing'
   if (response.status === 429) throw new ProviderResolveError('rate_limited')
-  if (!response.ok) throw new ProviderResolveError('unavailable')
+  // A 5xx outage may answer on a retry (task 41.6, as in proxy.ts); other statuses are answers.
+  if (!response.ok) throw new ProviderResolveError('unavailable', { transient: response.status >= 500 })
   return 'ok'
 }
 
@@ -83,7 +84,8 @@ async function request(
     if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
       throw abortReason(signal)
     }
-    throw new ProviderResolveError('unavailable')
+    // A dropped request says nothing about the object (task 41.6, as in proxy.ts).
+    throw new ProviderResolveError('unavailable', { transient: true })
   }
 }
 

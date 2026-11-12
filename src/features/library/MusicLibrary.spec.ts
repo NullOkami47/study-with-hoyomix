@@ -112,6 +112,24 @@ describe('MusicLibrary — sections and grouping', () => {
     expect(cards[2].get('[data-game-name]').text()).toBe('Zenless Zone Zero')
   })
 
+  it('renders each game’s existing catalogue artwork in browsing and search results', async () => {
+    const wrapper = mountLibrary()
+    await openGames(wrapper)
+
+    for (const [game, url] of [
+      ['genshin', '/api/providers/lx/artwork/100001'],
+      ['hsr', '/api/providers/lx/artwork/100006'],
+      ['zzz', '/api/providers/lx/artwork/100008'],
+    ]) {
+      expect(wrapper.get(`[data-game-id="${game}"] [data-game-artwork]`).attributes('src')).toBe(url)
+    }
+
+    await search(wrapper, 'Genshin Impact')
+    expect(wrapper.get('[data-search-games] [data-game-artwork]').attributes('src')).toBe(
+      '/api/providers/lx/artwork/100001',
+    )
+  })
+
   it('shows only the selected game’s albums and tracks', async () => {
     const wrapper = mountLibrary()
     await openGames(wrapper)
@@ -120,7 +138,7 @@ describe('MusicLibrary — sections and grouping', () => {
     expect(wrapper.get('[data-active-game-name]').text()).toBe('Honkai: Star Rail')
     expect(wrapper.findAll('[data-game-albums] [data-album-card]')).toHaveLength(1)
     expect(wrapper.get('[data-game-albums] [data-album-title]').text()).toBe(INSIDE_ALBUM)
-    expect(rowIds(wrapper, '[data-game-tracks]')).toEqual(['hsr-hope', 'hsr-sway'])
+    expect(rowIds(wrapper, '[data-game-tracks]')).toEqual(['demo-hsr-hope', 'demo-hsr-sway'])
   })
 
   it('returns to the game list', async () => {
@@ -154,8 +172,8 @@ describe('MusicLibrary — sections and grouping', () => {
     expect(wrapper.get('[data-active-album-title]').text()).toBe(LIYUE_ALBUM)
     expect(wrapper.get('[data-active-album-counts]').text()).toContain('2 tracks')
     expect(rowIds(wrapper, '[data-album-tracks]')).toEqual([
-      'genshin-liyue',
-      'genshin-moon-in-ones-cup',
+      'demo-liyue',
+      'demo-moon-in-ones-cup',
     ])
   })
 
@@ -202,8 +220,8 @@ describe('MusicLibrary — search', () => {
     await search(wrapper, 'fontaine')
 
     expect(rowIds(wrapper, '[data-search-tracks]')).toEqual([
-      'genshin-fontaine-daydream',
-      'genshin-fontaine-nightfall',
+      'demo-fontaine-daydream',
+      'demo-fontaine-nightfall',
     ])
   })
 
@@ -219,7 +237,7 @@ describe('MusicLibrary — search', () => {
 
   it('omits empty categories rather than rendering them empty', async () => {
     const wrapper = mountLibrary()
-    await search(wrapper, 'belleau')
+    await search(wrapper, 'fountain')
 
     expect(wrapper.find('[data-search-group="albums"]').exists()).toBe(true)
     expect(wrapper.find('[data-search-group="games"]').exists()).toBe(false)
@@ -271,15 +289,15 @@ describe('MusicLibrary — search', () => {
   it('finds a Han title from either script', async () => {
     const wrapper = mountLibrary()
 
-    await search(wrapper, '輕漣')
-    expect(rowIds(wrapper, '[data-search-tracks]')).toEqual(['genshin-la-vaguelette'])
+    await search(wrapper, '示範練習')
+    expect(rowIds(wrapper, '[data-search-tracks]')).toEqual(['demo-genshin-study'])
 
-    await search(wrapper, '轻涟')
-    expect(rowIds(wrapper, '[data-search-tracks]')).toEqual(['genshin-la-vaguelette'])
+    await search(wrapper, '示范练习')
+    expect(rowIds(wrapper, '[data-search-tracks]')).toEqual(['demo-genshin-study'])
   })
 
   it('prefers a reachable localised alias and keeps the canonical title visible', () => {
-    const localised: Track = { ...byId('genshin-liyue'), aliases: { 'zh-Hant': ['璃月'] } }
+    const localised: Track = { ...byId('demo-liyue'), aliases: { 'zh-Hant': ['璃月'] } }
     const wrapper = mountLibrary(createPlaybackStore(), 'zh-Hant', [localised])
 
     const row = wrapper.get('[data-track-row]')
@@ -292,7 +310,7 @@ describe('MusicLibrary — search', () => {
     await search(wrapper, 'fontaine daydream')
 
     const row = wrapper.get('[data-search-tracks] [data-track-row]')
-    expect(row.get('[data-track-title]').text()).toBe('Fontaine Daydream')
+    expect(row.get('[data-track-title]').text()).toBe('Demo Fontaine Daydream')
     expect(row.find('[data-track-canonical]').exists()).toBe(false)
   })
 })
@@ -300,13 +318,13 @@ describe('MusicLibrary — search', () => {
 describe('MusicLibrary — queue isolation', () => {
   it('adds exactly the requested track to an existing queue', async () => {
     const player = createPlaybackStore()
-    player.enqueue(byId('hsr-sway'))
+    player.enqueue(byId('demo-hsr-sway'))
     const before = player.queue.value
 
     const wrapper = mountLibrary(player)
-    await trackRow(wrapper, 'genshin-liyue').get('[data-track-enqueue]').trigger('click')
+    await trackRow(wrapper, 'demo-liyue').get('[data-track-enqueue]').trigger('click')
 
-    expect(player.queue.value.map((track) => track.id)).toEqual(['hsr-sway', 'genshin-liyue'])
+    expect(player.queue.value.map((track) => track.id)).toEqual(['demo-hsr-sway', 'demo-liyue'])
     // Appended, not replaced: the previously queued track is still the same object.
     expect(player.queue.value[0]).toBe(before[0])
   })
@@ -315,25 +333,25 @@ describe('MusicLibrary — queue isolation', () => {
     const player = createPlaybackStore()
     const wrapper = mountLibrary(player)
 
-    await trackRow(wrapper, 'genshin-liyue').get('[data-track-enqueue]').trigger('click')
-    await trackRow(wrapper, 'zzz-tiny-giant').get('[data-track-enqueue]').trigger('click')
+    await trackRow(wrapper, 'demo-liyue').get('[data-track-enqueue]').trigger('click')
+    await trackRow(wrapper, 'demo-zzz-study').get('[data-track-enqueue]').trigger('click')
 
-    expect(player.queue.value.map((track) => track.id)).toEqual(['genshin-liyue', 'zzz-tiny-giant'])
+    expect(player.queue.value.map((track) => track.id)).toEqual(['demo-liyue', 'demo-zzz-study'])
   })
 
   it('does not touch the queue when the search text changes', async () => {
     const player = createPlaybackStore()
-    player.enqueue(byId('hsr-hope'))
+    player.enqueue(byId('demo-hsr-hope'))
     const before = player.queue.value
 
     const wrapper = mountLibrary(player)
     await search(wrapper, 'fontaine')
     await search(wrapper, 'genshin')
     await search(wrapper, '')
-    await search(wrapper, '輕漣')
+    await search(wrapper, '示範練習')
 
     expect(player.queue.value).toBe(before)
-    expect(player.queue.value.map((track) => track.id)).toEqual(['hsr-hope'])
+    expect(player.queue.value.map((track) => track.id)).toEqual(['demo-hsr-hope'])
   })
 
   it('does not insert search results into the queue', async () => {
@@ -350,7 +368,7 @@ describe('MusicLibrary — queue isolation', () => {
 
   it('does not touch the queue when switching album or game', async () => {
     const player = createPlaybackStore()
-    player.enqueue(byId('hsr-sway'))
+    player.enqueue(byId('demo-hsr-sway'))
     const before = player.queue.value
 
     const wrapper = mountLibrary(player)
@@ -361,12 +379,12 @@ describe('MusicLibrary — queue isolation', () => {
     await wrapper.get('[data-library-back]').trigger('click')
 
     expect(player.queue.value).toBe(before)
-    expect(player.queue.value.map((track) => track.id)).toEqual(['hsr-sway'])
+    expect(player.queue.value.map((track) => track.id)).toEqual(['demo-hsr-sway'])
   })
 
   it('does not touch the queue when switching sections', async () => {
     const player = createPlaybackStore()
-    player.enqueue(byId('hsr-hope'))
+    player.enqueue(byId('demo-hsr-hope'))
     const before = player.queue.value
 
     const wrapper = mountLibrary(player)
@@ -383,9 +401,9 @@ describe('MusicLibrary — queue isolation', () => {
 
     await openAlbums(wrapper)
     await albumCard(wrapper, INSIDE_ALBUM).get('[data-album-open]').trigger('click')
-    await trackRow(wrapper, 'hsr-sway').get('[data-track-enqueue]').trigger('click')
+    await trackRow(wrapper, 'demo-hsr-sway').get('[data-track-enqueue]').trigger('click')
 
-    expect(player.queue.value.map((track) => track.id)).toEqual(['hsr-sway'])
+    expect(player.queue.value.map((track) => track.id)).toEqual(['demo-hsr-sway'])
     expect(wrapper.get('[data-active-album-title]').text()).toBe(INSIDE_ALBUM)
   })
 })
@@ -398,8 +416,8 @@ describe('MusicLibrary — play actions', () => {
       playNext: vi.fn(),
     }
     const wrapper = mountLibrary(player)
-    const row = trackRow(wrapper, 'genshin-liyue')
-    const expected = byId('genshin-liyue')
+    const row = trackRow(wrapper, 'demo-liyue')
+    const expected = byId('demo-liyue')
 
     await row.get('[data-track-play]').trigger('click')
     expect(player.playNow).toHaveBeenCalledTimes(1)
@@ -509,7 +527,7 @@ describe('MusicLibrary — accessibility', () => {
 
   it('labels each track action with the track it acts on', () => {
     const wrapper = mountLibrary()
-    const row = trackRow(wrapper, 'genshin-liyue')
+    const row = trackRow(wrapper, 'demo-liyue')
 
     expect(row.get('[data-track-play]').attributes('aria-label')).toBe('Play Liyue')
     expect(row.get('[data-track-enqueue]').attributes('aria-label')).toBe('Add Liyue to queue')

@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
 
 import type { Track } from '../catalog/types'
 import { ProviderRegistry } from './providers/registry'
+import { publishPlaybackPresentation } from './presentation'
 import type { AudioProvider } from './providers/types'
 import { resolveTrack, type ResolveOptions, type ResolveResult } from './resolver'
 import { createPlaybackStore, shuffleTracks, type PlaybackStore } from './store'
@@ -115,9 +117,17 @@ const multiSource = {
   ],
 } as Track
 
+const jellyfinMultiSource = {
+  ...multiSource,
+  sources: [
+    { provider: 'lx', externalId: 'lx-first' },
+    { provider: 'jellyfin', externalId: 'jellyfin-first' },
+  ],
+} as Track
+
 const provider = (id: string): AudioProvider => ({
   id,
-  resolve: vi.fn(async (track: Track) => {
+  resolve: vi.fn<AudioProvider['resolve']>(async (track) => {
     if (id !== 'youtube') return null
     const source = track.sources.find(({ provider: providerId }) => providerId === id)
     return source ? { kind: 'youtube' as const, videoId: source.externalId } : null
@@ -129,6 +139,446 @@ const registry = (...entries: Array<[id: string, priority: number]>) => new Prov
 )
 
 describe('playback store', () => {
+  it('keeps playback intent when an unexpected native pause reports paused media state', async () => {
+    const resolve = vi.fn(async (): Promise<ResolveResult> => ({
+      ok: true, providerId: 'r2', playable: { kind: 'audio', url: 'https://media.invalid/first.ogg', mimeType: 'audio/ogg' }, attempts: [],
+    }))
+    const store = createPlaybackStore({ resolve, registry: registry(['r2', 1]) })
+
+    await store.playNow(jellyfinMultiSource)
+    const generation = store.playbackGeneration.value
+    store.reportMediaState('playing', generation)
+    store.reportMediaState('paused', generation)
+
+    expect(store.status.value).toBe('paused')
+    expect(store.playbackIntent.value).toBe('playing')
+  })
+
+  it('keeps an explicit user pause separate from observed media state', async () => {
+    const resolve = vi.fn(async (): Promise<ResolveResult> => ({
+      ok: true, providerId: 'r2', playable: { kind: 'audio', url: 'https://media.invalid/first.ogg', mimeType: 'audio/ogg' }, attempts: [],
+    }))
+    const store = createPlaybackStore({ resolve, registry: registry(['r2', 1]) })
+
+    await store.playNow(jellyfinMultiSource)
+    const generation = store.playbackGeneration.value
+    store.reportMediaState('playing', generation)
+    store.pause()
+    store.reportMediaState('paused', generation)
+
+    expect(store.playbackIntent.value).toBe('paused')
+    expect(store.status.value).toBe('paused')
+  })
+
+  it('falls back a stalled third-party source to the same Jellyfin track at the observed position', async () => {
+    const resolve = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true, providerId: 'lx', attempts: [],
+        playable: { kind: 'audio', url: 'https://media.invalid/lx-first.mp3', mimeType: 'audio/mpeg' },
+      })
+      .mockResolvedValueOnce({
+        ok: true, providerId: 'lx', attempts: [],
+        playable: { kind: 'audio', url: 'https://media.invalid/lx-first-selected.mp3', mimeType: 'audio/mpeg' },
+      })
+      .mockResolvedValueOnce({
+        ok: true, providerId: 'jellyfin', attempts: [],
+        playable: { kind: 'audio', url: 'https://media.invalid/jellyfin-first.flac', mimeType: 'audio/flac' },
+      })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+
+    await store.playNow(jellyfinMultiSource)
+    await store.setSourceOverride('lx')
+    const generation = store.playbackGeneration.value
+    const queueBefore = store.queue.value
+
+    const result = await store.requestJellyfinFallback('lx', generation, 102)
+
+    expect(result).toBe(true)
+    expect(resolve).toHaveBeenLastCalledWith(
+      jellyfinMultiSource,
+      expect.anything(),
+      expect.objectContaining({ sourceOverride: 'jellyfin' }),
+    )
+    expect(store.sourceOverride.value).toBe('lx')
+    expect(store.activeProviderId.value).toBe('jellyfin')
+    expect(store.playable.value).toEqual({ kind: 'audio', url: 'https://media.invalid/jellyfin-first.flac', mimeType: 'audio/flac' })
+    expect(store.currentTrack.value).toBe(jellyfinMultiSource)
+    expect(store.queue.value).toBe(queueBefore)
+    expect(store.pendingResumePosition.value).toBe(102)
+    expect(store.consumePendingResumePosition()).toBe(102)
+    expect(store.consumePendingResumePosition()).toBeUndefined()
+  })
+
+  it('renews same-track Jellyfin recovery eligibility after an explicit manual source reselection', async () => {
+    const resolve = vi.fn(async (_track: Track, _registry: ProviderRegistry, options?: ResolveOptions): Promise<ResolveResult> => {
+      const providerId = options?.sourceOverride === 'jellyfin' ? 'jellyfin' : 'lx'
+      return { ok: true, providerId, attempts: [], playable: {
+        kind: 'audio', url: `/${providerId}.mp3`, mimeType: 'audio/mpeg',
+      } }
+    })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    await store.setSourceOverride('lx')
+    const session = store.listeningSessionId.value
+    const queueBefore = store.queue.value
+    expect(await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)).toBe(true)
+    expect(store.consumePendingResumePosition()).toBe(42)
+    publishPlaybackPresentation(store, { currentTime: 45, duration: 200, canSeek: true })
+    await store.setSourceOverride('lx')
+    expect(store.activeProviderId.value).toBe('lx')
+    expect(store.consumePendingResumePosition()).toBe(45)
+    expect(await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 48)).toBe(true)
+    expect(store.activeProviderId.value).toBe('jellyfin')
+    expect(store.pendingResumePosition.value).toBe(48)
+    expect(store.sourceOverride.value).toBe('lx')
+    expect(store.listeningSessionId.value).toBe(session)
+    expect(store.queue.value).toBe(queueBefore)
+    expect(store.currentTrack.value).toBe(jellyfinMultiSource)
+    store.dispose()
+  })
+
+  it.each(['user', 'native', 'progress'])('discards an in-flight Jellyfin recovery after %s invalidates it', async (kind) => {
+    let finish!: (value: ResolveResult) => void
+    const resolve = vi.fn().mockResolvedValueOnce({
+      ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: 'https://media.invalid/lx.mp3', mimeType: 'audio/mpeg' },
+    }).mockImplementationOnce(() => new Promise<ResolveResult>((done) => { finish = done }))
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    const generation = store.playbackGeneration.value
+    let stillStalled = true
+    const recovery = store.requestJellyfinFallback('lx', generation, 102, () => stillStalled)
+    await Promise.resolve()
+    if (kind === 'user') store.pause()
+    else if (kind === 'native') store.reportMediaState('paused', generation)
+    else stillStalled = false
+    await store.play()
+    finish({ ok: true, providerId: 'jellyfin', attempts: [],
+      playable: { kind: 'audio', url: 'https://media.invalid/jellyfin.flac', mimeType: 'audio/flac' } })
+    expect(await recovery).toBe(false)
+    expect(store.activeProviderId.value).toBe('lx')
+    expect(store.pendingResumePosition.value).toBeUndefined()
+    store.dispose()
+  })
+
+  it.each(['pause', 'progress'])('permits a later stalled recovery after an earlier %s cancellation', async (kind) => {
+    let finish!: (value: ResolveResult) => void
+    const resolved: ResolveResult = { ok: true, providerId: 'jellyfin', attempts: [],
+      playable: { kind: 'audio', url: '/own.flac', mimeType: 'audio/flac' } }
+    const resolve = vi.fn().mockResolvedValueOnce({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+      .mockImplementationOnce(() => new Promise<ResolveResult>((done) => { finish = done }))
+      .mockResolvedValue(resolved)
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    const generation = store.playbackGeneration.value
+    let stalled = true
+    const cancelled = store.requestJellyfinFallback('lx', generation, 42, () => stalled)
+    if (kind === 'pause') { store.pause(); await store.play() } else stalled = false
+    finish(resolved)
+    expect(await cancelled).toBe(false)
+    expect(await store.requestJellyfinFallback('lx', generation, 45)).toBe(true)
+    expect(store.pendingResumePosition.value).toBe(45)
+    store.dispose()
+  })
+
+  it('retries exhausted runtime recovery on explicit Play with saved position and preference', async () => {
+    const external: ResolveResult = { ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } }
+    const resolve = vi.fn().mockResolvedValueOnce(external).mockResolvedValueOnce(external)
+      .mockResolvedValueOnce({ ok: false, code: 'exhausted', attempts: [] })
+      .mockResolvedValue({ ok: true, providerId: 'jellyfin', attempts: [],
+        playable: { kind: 'audio', url: '/own.flac', mimeType: 'audio/flac' } })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    await store.setSourceOverride('lx')
+    const session = store.listeningSessionId.value
+    await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)
+    expect(await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)).toBe(false)
+    await store.play()
+    expect(store.activeProviderId.value).toBe('jellyfin')
+    expect(store.pendingResumePosition.value).toBe(42)
+    expect(store.sourceOverride.value).toBe('lx')
+    expect(store.currentTrack.value).toBe(jellyfinMultiSource)
+    expect(store.listeningSessionId.value).toBe(session)
+    store.dispose()
+  })
+
+  it('preserves observed position when a manual source resolve recovers through Jellyfin', async () => {
+    const resolve = vi.fn().mockResolvedValueOnce({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+      .mockResolvedValue({ ok: true, providerId: 'jellyfin', attempts: [],
+        playable: { kind: 'audio', url: '/own.flac', mimeType: 'audio/flac' } })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    expect(store.pendingResumePosition.value).toBeUndefined()
+    publishPlaybackPresentation(store, { currentTime: 42, duration: 200, canSeek: true })
+    await store.setSourceOverride('lx')
+    expect(store.pendingResumePosition.value).toBe(42)
+    expect(resolve).toHaveBeenLastCalledWith(jellyfinMultiSource, expect.anything(), expect.objectContaining({ sourceOverride: 'lx' }))
+    await store.playNow(second)
+    expect(store.pendingResumePosition.value).toBeUndefined()
+    store.dispose()
+  })
+
+  it('respects manual-only Jellyfin policy during runtime automatic recovery', async () => {
+    const resolve = vi.fn().mockResolvedValue({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+    const configured = new ProviderRegistry([
+      { provider: provider('lx'), enabled: true, priority: 1, timeoutMs: 100 },
+      { provider: provider('jellyfin'), enabled: true, automaticEligible: false, priority: 2, timeoutMs: 100 },
+    ])
+    const store = createPlaybackStore({ resolve, registry: configured })
+    await store.playNow(jellyfinMultiSource)
+    expect(await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)).toBe(false)
+    expect(resolve).toHaveBeenCalledOnce()
+    store.dispose()
+  })
+
+  it('releases recovery eligibility when progress resumes while loading the registry', async () => {
+    const configured = registry(['lx', 1], ['jellyfin', 2])
+    let finishRegistry!: (value: ProviderRegistry) => void
+    const loadRegistry = vi.fn().mockResolvedValueOnce(configured)
+      .mockImplementationOnce(() => new Promise<ProviderRegistry>((done) => { finishRegistry = done }))
+      .mockResolvedValue(configured)
+    const resolve = vi.fn().mockResolvedValueOnce({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+      .mockResolvedValue({ ok: true, providerId: 'jellyfin', attempts: [],
+        playable: { kind: 'audio', url: '/own.flac', mimeType: 'audio/flac' } })
+    const store = createPlaybackStore({ resolve, loadRegistry })
+    await store.playNow(jellyfinMultiSource)
+    let stalled = true
+    const recovery = store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42, () => stalled)
+    stalled = false
+    finishRegistry(configured)
+    expect(await recovery).toBe(false)
+    expect(resolve).toHaveBeenCalledOnce()
+    expect(await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 45)).toBe(true)
+    store.dispose()
+  })
+
+  it('releases an aborted active registry request before its promise settles without releasing a later completed attempt', async () => {
+    const configured = registry(['lx', 1], ['jellyfin', 2])
+    let finishOld!: (value: ProviderRegistry) => void
+    const loadRegistry = vi.fn().mockResolvedValueOnce(configured)
+      .mockImplementationOnce(() => new Promise<ProviderRegistry>((done) => { finishOld = done }))
+      .mockResolvedValue(configured)
+    const resolve = vi.fn().mockResolvedValueOnce({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+      .mockResolvedValue({ ok: false, code: 'exhausted', attempts: [] })
+    const store = createPlaybackStore({ resolve, loadRegistry })
+    await store.playNow(jellyfinMultiSource)
+    const generation = store.playbackGeneration.value
+    const oldRecovery = store.requestJellyfinFallback('lx', generation, 42)
+    store.pause()
+    await store.play()
+    expect(await store.requestJellyfinFallback('lx', generation, 45)).toBe(false)
+    expect(resolve).toHaveBeenCalledTimes(2)
+    finishOld(configured)
+    expect(await oldRecovery).toBe(false)
+    expect(await store.requestJellyfinFallback('lx', generation, 46)).toBe(false)
+    expect(resolve).toHaveBeenCalledTimes(2)
+    store.dispose()
+  })
+
+  it('keeps a newer generation recovery bound when an older cancelled request settles late', async () => {
+    let finishOld!: (value: ResolveResult) => void
+    let finishNew!: (value: ResolveResult) => void
+    const external: ResolveResult = { ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } }
+    const exhausted: ResolveResult = { ok: false, code: 'exhausted', attempts: [] }
+    const resolve = vi.fn().mockResolvedValueOnce(external)
+      .mockImplementationOnce(() => new Promise<ResolveResult>((done) => { finishOld = done }))
+      .mockResolvedValueOnce(external)
+      .mockImplementationOnce(() => new Promise<ResolveResult>((done) => { finishNew = done }))
+      .mockResolvedValue(exhausted)
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    const oldRecovery = store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)
+    await store.playNow(jellyfinMultiSource)
+    const newRecovery = store.requestJellyfinFallback('lx', store.playbackGeneration.value, 45)
+    finishOld(exhausted)
+    expect(await oldRecovery).toBe(false)
+    finishNew(exhausted)
+    expect(await newRecovery).toBe(false)
+    expect(await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 46)).toBe(false)
+    expect(resolve).toHaveBeenCalledTimes(4)
+    store.dispose()
+  })
+
+  it('keeps the saved position when an explicit Play retry of a failed Jellyfin seek also exhausts', async () => {
+    // P96-02 (task 8.4): Play after a failed recovery resolves the configured chain at the saved
+    // position; it no longer forces `sourceOverride: 'jellyfin'`.
+    const own: ResolveResult = { ok: true, providerId: 'jellyfin', attempts: [],
+      playable: { kind: 'audio', url: '/own.flac', mimeType: 'audio/flac' } }
+    const exhausted: ResolveResult = { ok: false, code: 'exhausted', attempts: [] }
+    const resolve = vi.fn().mockResolvedValueOnce({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+      .mockResolvedValueOnce(own).mockResolvedValueOnce(exhausted).mockResolvedValueOnce(exhausted)
+      .mockResolvedValue(own)
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 42)
+    await store.reportPlaybackFailure('jellyfin', store.playbackGeneration.value)
+    // The failed Jellyfin stream continues the chain at 42 without Jellyfin (Property 25).
+    expect(resolve).toHaveBeenCalledTimes(3)
+    expect(resolve.mock.calls[2][2]).toEqual(expect.objectContaining({ sourceOverride: undefined, excludeProviderIds: ['jellyfin'] }))
+    expect(store.status.value).toBe('error')
+    expect(store.pendingResumePosition.value).toBe(42)
+    await store.play()
+    expect(resolve).toHaveBeenCalledTimes(4)
+    expect(store.status.value).toBe('error')
+    expect(store.currentTrack.value).toBe(jellyfinMultiSource)
+    expect(store.pendingResumePosition.value).toBe(42)
+    await store.play()
+    expect(resolve).toHaveBeenCalledTimes(5)
+    expect(resolve).toHaveBeenLastCalledWith(jellyfinMultiSource, expect.anything(), expect.objectContaining({ sourceOverride: undefined, excludeProviderIds: [] }))
+    expect(store.pendingResumePosition.value).toBe(42)
+    expect(store.status.value).toBe('ready')
+    store.dispose()
+  })
+
+  it('allows explicit Play to retry a runtime-failed manual source at the saved position', async () => {
+    let available = true
+    const configured = new ProviderRegistry([{ provider: { id: 'lx', resolve: async () => available
+      ? { kind: 'audio' as const, url: '/external.mp3', mimeType: 'audio/mpeg' } : null },
+      enabled: true, priority: 1, timeoutMs: 100 }])
+    const store = createPlaybackStore({ registry: configured })
+    await store.playNow(jellyfinMultiSource)
+    await store.setSourceOverride('lx')
+    publishPlaybackPresentation(store, { currentTime: 42, duration: 200, canSeek: true })
+    available = false
+    await store.reportPlaybackFailure('lx', store.playbackGeneration.value)
+    expect(store.status.value).toBe('error')
+    available = true
+    await store.play()
+    expect(store.status.value).toBe('ready')
+    expect(store.activeProviderId.value).toBe('lx')
+    expect(store.pendingResumePosition.value).toBe(42)
+    expect(store.sourceOverride.value).toBe('lx')
+    store.dispose()
+  })
+
+  it.each(['manual', 'runtime'])('clears the audio resume seek when %s recovery resolves YouTube', async (path) => {
+    const resolve = vi.fn().mockResolvedValueOnce({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+      .mockResolvedValue({ ok: true, providerId: 'youtube', attempts: [],
+        playable: { kind: 'youtube', videoId: 'abcdefghijk' } })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['youtube', 2]) })
+    const mapped = { ...jellyfinMultiSource, sources: [...jellyfinMultiSource.sources,
+      { provider: 'youtube', externalId: 'abcdefghijk' }] }
+    await store.playNow(mapped)
+    publishPlaybackPresentation(store, { currentTime: 42, duration: 200, canSeek: true })
+    if (path === 'manual') await store.setSourceOverride('youtube')
+    else await store.reportPlaybackFailure('lx', store.playbackGeneration.value)
+    expect(store.activeProviderId.value).toBe('youtube')
+    expect(store.pendingResumePosition.value).toBeUndefined()
+    expect(store.playbackIntent.value).toBe('playing')
+    expect(store.status.value).toBe('ready')
+    store.dispose()
+  })
+
+  it('does not seek to the completed duration when changing source after final ended', async () => {
+    const resolve = vi.fn().mockResolvedValue({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    publishPlaybackPresentation(store, { currentTime: 200, duration: 200, canSeek: true })
+    await store.advanceAfterEnded()
+    await store.setSourceOverride('lx')
+    expect(store.pendingResumePosition.value).toBeUndefined()
+    await store.play()
+    expect(store.pendingResumePosition.value).toBeUndefined()
+    expect(store.status.value).toBe('ready')
+    store.dispose()
+  })
+
+  it.each(['same-deck', 'changed-source'])('starts one listening session for a final-ended %s replay', async (path) => {
+    const resolve = vi.fn().mockResolvedValue({ ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/external.mp3', mimeType: 'audio/mpeg' } })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1]) })
+    await store.playNow(jellyfinMultiSource)
+    const session = store.listeningSessionId.value
+    await store.advanceAfterEnded()
+    if (path === 'changed-source') await store.setSourceOverride('lx')
+    await store.play()
+    expect(store.listeningSessionId.value).toBe(session + 1)
+    store.reportMediaState('playing', store.playbackGeneration.value)
+    store.pause()
+    await store.play()
+    expect(store.listeningSessionId.value).toBe(session + 1)
+    if (path === 'same-deck') expect(resolve).toHaveBeenCalledOnce()
+    store.dispose()
+  })
+
+  it('resumes a failed Jellyfin seek at the same saved position through the configured chain', async () => {
+    // P95-02 residual / P96-02 (tasks 8.3, 8.4): the failed recovered Jellyfin stream continues the
+    // chain at the saved position (LX is still usable) instead of halting until Play forces Jellyfin.
+    let call = 0
+    const resolve = vi.fn(async (_track: Track, _registry: ProviderRegistry, options?: ResolveOptions): Promise<ResolveResult> => {
+      call += 1
+      const providerId = call === 1 || options?.excludeProviderIds?.includes('jellyfin') ? 'lx' : 'jellyfin'
+      return { ok: true, providerId, attempts: [],
+        playable: { kind: 'audio', url: `https://media.invalid/stream-${call}.flac`, mimeType: 'audio/flac' } }
+    })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+    await store.playNow(jellyfinMultiSource)
+    await store.requestJellyfinFallback('lx', store.playbackGeneration.value, 102)
+    expect(store.activeProviderId.value).toBe('jellyfin')
+    await store.reportPlaybackFailure('jellyfin', store.playbackGeneration.value)
+    expect(resolve).toHaveBeenCalledTimes(3)
+    expect(resolve).toHaveBeenLastCalledWith(jellyfinMultiSource, expect.anything(), expect.objectContaining({ sourceOverride: undefined, excludeProviderIds: ['jellyfin'] }))
+    expect(store.activeProviderId.value).toBe('lx')
+    expect(store.pendingResumePosition.value).toBe(102)
+    expect(store.status.value).toBe('ready')
+    expect(store.currentTrack.value).toBe(jellyfinMultiSource)
+    store.dispose()
+  })
+
+  it('preserves the current track when the same-track Jellyfin fallback is unavailable', async () => {
+    const resolve = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true, providerId: 'lx', attempts: [],
+        playable: { kind: 'audio', url: 'https://media.invalid/lx-first.mp3', mimeType: 'audio/mpeg' },
+      })
+      .mockResolvedValueOnce({
+        ok: true, providerId: 'lx', attempts: [],
+        playable: { kind: 'audio', url: 'https://media.invalid/lx-first-selected.mp3', mimeType: 'audio/mpeg' },
+      })
+      .mockResolvedValueOnce({ ok: false, code: 'exhausted', attempts: [] })
+    const store = createPlaybackStore({ resolve, registry: registry(['lx', 1], ['jellyfin', 2]) })
+
+    await store.playNow(jellyfinMultiSource)
+    await store.setSourceOverride('lx')
+    const generation = store.playbackGeneration.value
+    const playableBefore = store.playable.value
+
+    const result = await store.requestJellyfinFallback('lx', generation, 102)
+
+    expect(result).toBe(false)
+    expect(store.currentTrack.value).toBe(jellyfinMultiSource)
+    expect(store.sourceOverride.value).toBe('lx')
+    expect(store.activeProviderId.value).toBe('lx')
+    expect(store.playable.value).toBe(playableBefore)
+    expect(store.status.value).toBe('error')
+    expect(store.pendingResumePosition.value).toBeUndefined()
+  })
+
+  it('does not attempt Jellyfin-to-Jellyfin fallback or repeat a completed third-party recovery', async () => {
+    const resolve = vi.fn(async (): Promise<ResolveResult> => ({
+      ok: true, providerId: 'jellyfin', attempts: [],
+      playable: { kind: 'audio', url: 'https://media.invalid/jellyfin-first.flac', mimeType: 'audio/flac' },
+    }))
+    const store = createPlaybackStore({ resolve, registry: registry(['jellyfin', 1]) })
+
+    await store.playNow(jellyfinMultiSource)
+    const generation = store.playbackGeneration.value
+
+    await expect(store.requestJellyfinFallback('jellyfin', generation, 30)).resolves.toBe(false)
+    expect(resolve).toHaveBeenCalledTimes(1)
+  })
   it('keeps queue order deterministic across play, enqueue, next, and previous', async () => {
     const resolve = vi.fn(async (): Promise<ResolveResult> => ({
       ok: true, providerId: 'youtube', playable: { kind: 'youtube', videoId: 'abcdefghijk' }, attempts: [],
@@ -162,7 +612,7 @@ describe('playback store', () => {
 
     store.reportMediaState('paused', generation)
     expect(store.status.value).toBe('paused')
-    expect(store.playbackIntent.value).toBe('paused')
+    expect(store.playbackIntent.value).toBe('playing')
 
     store.reportMediaState('buffering', generation - 1)
     expect(store.status.value).toBe('paused')
@@ -216,7 +666,9 @@ describe('playback store', () => {
       .fn()
       .mockResolvedValueOnce({ ok: true, providerId: 'r2', playable: { kind: 'audio', url: 'https://media.invalid/broken.ogg', mimeType: 'audio/ogg' }, attempts: [] })
       .mockResolvedValueOnce({ ok: true, providerId: 'youtube', playable: { kind: 'youtube', videoId: 'abcdefghijk' }, attempts: [] })
-    const store = createPlaybackStore({ resolve })
+    // The same-position chain (task 8.3) continues only while the registry has another usable
+    // automatic provider, so the store needs a registry with the next mapped source.
+    const store = createPlaybackStore({ resolve, registry: registry(['r2', 1], ['youtube', 2]) })
 
     await store.playNow(first)
     await store.reportPlaybackFailure('r2', store.playbackGeneration.value)
@@ -299,8 +751,8 @@ describe('playback store', () => {
     await store.setSourceOverride('youtube')
 
     expect(loadRegistry).toHaveBeenCalledTimes(4)
-    expect(loadRegistry).toHaveBeenNthCalledWith(1, expect.objectContaining({ forceRefresh: false, onSubAttempt: expect.any(Function) }))
-    expect(loadRegistry).toHaveBeenNthCalledWith(4, expect.objectContaining({ forceRefresh: false, onSubAttempt: expect.any(Function) }))
+    expect(loadRegistry).toHaveBeenNthCalledWith(1, expect.objectContaining({ forceRefresh: false }))
+    expect(loadRegistry).toHaveBeenNthCalledWith(4, expect.objectContaining({ forceRefresh: false }))
   })
 
   it('uses changed Admin priority on the next registry-backed resolution', async () => {
@@ -385,8 +837,8 @@ describe('playback store', () => {
     await store.playNow(multiSource)
     await store.reportPlaybackFailure('r2', store.playbackGeneration.value)
 
-    expect(loadRegistry).toHaveBeenNthCalledWith(1, expect.objectContaining({ forceRefresh: false, onSubAttempt: expect.any(Function) }))
-    expect(loadRegistry).toHaveBeenNthCalledWith(2, expect.objectContaining({ forceRefresh: true, onSubAttempt: expect.any(Function) }))
+    expect(loadRegistry).toHaveBeenNthCalledWith(1, expect.objectContaining({ forceRefresh: false }))
+    expect(loadRegistry).toHaveBeenNthCalledWith(2, expect.objectContaining({ forceRefresh: true }))
     expect(store.activeProviderId.value).toBe('youtube')
   })
 
@@ -407,6 +859,11 @@ describe('playback store', () => {
     }
 
     store.setPreloadPolicy('metadata')
+    await flushPromises()
+    expect(store.preparedNext.value).toBeNull()
+    expect(resolve.mock.calls.map(([track]) => track.id)).toEqual(['first'])
+    store.setPreloadPolicy('auto')
+    await store.armNextPreparation()
     await vi.waitFor(() => expect(store.preparedNext.value?.track.id).toBe('second'))
 
     expect(resolve.mock.calls.map(([track]) => track.id)).toEqual(['first', 'second'])
@@ -1236,7 +1693,9 @@ describe('playback store queue mutations', () => {
   })
 
   describe('strict manual override playback flow', () => {
-    it('never falls through to another provider when an explicit override fails (LX fails, Jellyfin would succeed)', async () => {
+    it('halts a failed manual LX on the track without Jellyfin while retaining the manual preference', async () => {
+      // D16 = No, Property 30 (tasks 8.1, 8.4): an explicit source runs alone; its failure halts
+      // with a trackFailed notice and never starts the Jellyfin recovery.
       const lxResolve = vi.fn().mockResolvedValue(null)
       const jellyfinResolve = vi.fn().mockResolvedValue({
         kind: 'audio' as const,
@@ -1290,10 +1749,14 @@ describe('playback store queue mutations', () => {
       expect(store.status.value).toBe('error')
       expect(store.playable.value).toBeNull()
       expect(store.activeProviderId.value).toBeUndefined()
+      expect(store.currentTrack.value).toBe(track)
+      expect(lxResolve).toHaveBeenCalled()
       expect(jellyfinResolve).not.toHaveBeenCalled()
-      expect(store.attempts.value.length).toBeGreaterThan(0)
-      expect(store.attempts.value.every((a) => a.providerId === 'lx')).toBe(true)
       expect(store.attempts.value.some((a) => a.providerId === 'lx' && !a.ok)).toBe(true)
+      expect(store.attempts.value.some((a) => a.providerId === 'jellyfin')).toBe(false)
+      const failed = store.playbackNotices.value.filter((notice) => notice.kind === 'trackFailed')
+      expect(failed).toHaveLength(1)
+      expect(failed[0]).toEqual(expect.objectContaining({ trackId: track.id, source: 'lx' }))
     })
 
     it('surfaces failure and preserves override when explicit provider is unavailable / disabled', async () => {
@@ -1577,5 +2040,146 @@ describe('playback store queue mutations', () => {
         expect.objectContaining({ providerId: 'jellyfin', ok: true }),
       ])
     })
+  })
+})
+
+
+describe('unavailable tracks and expired media URLs', () => {
+  const tracks = ['a', 'b', 'c', 'd'].map((id) => ({
+    id, title: id, sources: [{ provider: 'jellyfin', externalId: id }],
+  }) as Track)
+  const ok = (url: string): ResolveResult => ({
+    ok: true, providerId: 'jellyfin', attempts: [], playable: { kind: 'audio', url, mimeType: 'audio/mpeg' },
+  })
+  const missing: ResolveResult = { ok: false, code: 'exhausted', attempts: [] } as unknown as ResolveResult
+  const jellyfin = () => new ProviderRegistry([{
+    provider: { id: 'jellyfin', resolve: async () => null } as unknown as AudioProvider,
+    enabled: true, priority: 1, timeoutMs: 100,
+  }])
+  // Microtasks only, so a fake clock left installed by another suite cannot stall these tests.
+  const settle = async () => { for (let i = 0; i < 50; i += 1) await Promise.resolve() }
+  const sequential = { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() }
+  const make = (resolve: (track: Track) => Promise<ResolveResult>) => {
+    const store = createPlaybackStore({ resolve: vi.fn(resolve), registry: jellyfin(), storage: sequential })
+    store.reconcileUpcomingQueue(tracks)
+    return store
+  }
+
+  it('skips to the next track when no provider can play the current one', async () => {
+    const store = make(async (track) => track.id === 'b' ? missing : ok(`/${track.id}.mp3`))
+    await store.playQueueIndex(0)
+    await store.next()
+    await settle()
+    expect(store.currentTrack.value?.id).toBe('c')
+    expect(store.status.value).toBe('ready')
+    expect(store.playbackIntent.value).toBe('playing')
+    store.dispose()
+  })
+
+  it('does not skip a paused, prepared-only selection', async () => {
+    const store = make(async (track) => track.id === 'b' ? missing : ok(`/${track.id}.mp3`))
+    await store.prepareQueueIndex(1)
+    await settle()
+    expect(store.currentTrack.value?.id).toBe('b')
+    expect(store.status.value).toBe('error')
+    store.dispose()
+  })
+
+  it('stops after every other queued track has been tried, even with Repeat All', async () => {
+    const resolve = vi.fn(async () => missing)
+    const store = createPlaybackStore({ resolve, registry: jellyfin(), storage: sequential })
+    store.reconcileUpcomingQueue(tracks)
+    store.setRepeatMode('all')
+    await store.playQueueIndex(0)
+    await settle()
+    expect(resolve).toHaveBeenCalledTimes(tracks.length)
+    expect(store.currentTrack.value?.id).toBe('d')
+    expect(store.status.value).toBe('error')
+    store.dispose()
+  })
+
+  it('does not skip when no provider is enabled at all', async () => {
+    const resolve = vi.fn(async () => missing)
+    const store = createPlaybackStore({ resolve, registry: new ProviderRegistry([]), storage: sequential })
+    store.reconcileUpcomingQueue(tracks)
+    await store.playQueueIndex(0)
+    await settle()
+    expect(resolve).toHaveBeenCalledTimes(1)
+    expect(store.currentTrack.value?.id).toBe('a')
+    expect(store.status.value).toBe('error')
+    store.dispose()
+  })
+
+  it('does not skip while the browser is offline', async () => {
+    const online = vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false)
+    try {
+      const store = make(async (track) => track.id === 'b' ? missing : ok(`/${track.id}.mp3`))
+      await store.playQueueIndex(1)
+      await settle()
+      expect(store.currentTrack.value?.id).toBe('b')
+      expect(store.status.value).toBe('error')
+      store.dispose()
+    } finally { online.mockRestore() }
+  })
+
+  it('renews an expired media URL through the same provider at the same position', async () => {
+    const resolve = vi.fn().mockResolvedValueOnce(ok('/a-first.mp3')).mockResolvedValueOnce(ok('/a-renewed.mp3'))
+    const store = createPlaybackStore({ resolve, registry: jellyfin(), storage: sequential })
+    store.reconcileUpcomingQueue(tracks)
+    await store.playQueueIndex(0)
+    const session = store.listeningSessionId.value
+    const queue = store.queue.value
+    publishPlaybackPresentation(store, { currentTime: 95, duration: 200, canSeek: true })
+    expect(await store.renewMedia('jellyfin', store.playbackGeneration.value)).toBe(true)
+    expect(store.playable.value).toMatchObject({ url: '/a-renewed.mp3' })
+    expect(store.activeProviderId.value).toBe('jellyfin')
+    expect(store.pendingResumePosition.value).toBe(95)
+    expect(store.listeningSessionId.value).toBe(session)
+    expect(store.queue.value).toBe(queue)
+    expect(store.currentTrack.value?.id).toBe('a')
+    expect(store.attempts.value.some(({ ok: succeeded }) => !succeeded)).toBe(false)
+    expect(resolve).toHaveBeenLastCalledWith(tracks[0], expect.anything(), expect.objectContaining({ sourceOverride: 'jellyfin' }))
+    store.dispose()
+  })
+
+  it('renews at most once until media advances again, and not twice within ten seconds', async () => {
+    let now = 1_000_000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const resolve = vi.fn(async () => ({ ...ok('/a.mp3'), providerId: 'lx' }))
+      const registry = new ProviderRegistry([{ provider: { id: 'lx', resolve: async () => null }, enabled: true, priority: 1, timeoutMs: 100 }])
+      const store = createPlaybackStore({ resolve, registry, storage: sequential })
+      store.enqueue({ ...tracks[0]!, sources: [{ provider: 'lx', externalId: 'wy:123:320k' }] })
+      await store.playQueueIndex(0)
+      expect(await store.renewMedia('lx', store.playbackGeneration.value)).toBe(true)
+      store.reportMediaState('playing', store.playbackGeneration.value)
+      store.reportProgress(0, store.playbackGeneration.value)
+      store.reportProgress(1, store.playbackGeneration.value)
+      // Playback advanced, but a second renewal inside ten seconds is refused.
+      now += 5_000
+      expect(await store.renewMedia('lx', store.playbackGeneration.value)).toBe(false)
+      now += 5_000
+      expect(await store.renewMedia('lx', store.playbackGeneration.value)).toBe(true)
+      // No playback since that renewal: a URL that fails again is a real failure.
+      now += 60_000
+      expect(await store.renewMedia('lx', store.playbackGeneration.value)).toBe(false)
+      store.reportMediaState('playing', store.playbackGeneration.value)
+      // A stale generation or another provider never renews.
+      expect(await store.renewMedia('lx', store.playbackGeneration.value - 1)).toBe(false)
+      expect(await store.renewMedia('gd-studio', store.playbackGeneration.value)).toBe(false)
+      store.dispose()
+    } finally { clock.mockRestore() }
+  })
+
+  it('reports no renewal when the same provider can no longer resolve', async () => {
+    const resolve = vi.fn().mockResolvedValueOnce(ok('/a.mp3')).mockResolvedValueOnce(missing)
+    const store = createPlaybackStore({ resolve, registry: jellyfin(), storage: sequential })
+    store.reconcileUpcomingQueue(tracks)
+    await store.playQueueIndex(0)
+    const generation = store.playbackGeneration.value
+    expect(await store.renewMedia('jellyfin', generation)).toBe(false)
+    expect(store.playbackGeneration.value).toBe(generation)
+    expect(store.playable.value).toMatchObject({ url: '/a.mp3' })
+    store.dispose()
   })
 })

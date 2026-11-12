@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { flushPromises } from '@vue/test-utils'
+import { debugLog } from '../player/debugLog'
 import { createAutomaticSync } from './automaticSync'
 
 const disposers: (() => void)[] = []
@@ -164,5 +165,41 @@ describe('workspace automatic sync', () => {
     if (code !== 429) expect(sync.status.value).toBe('failed')
     await vi.advanceTimersByTimeAsync(59_000)
     expect(requests).toBe(2)
+  })
+})
+
+describe('automatic sync banner timing and trace', () => {
+  const failing = (name: string, message: string) => ({ name, capture: () => ({ value: 1 }),
+    load: async () => { throw new Error(message) }, apply() {}, save: async (value: { value: number }) => value })
+
+  it('shows failed only once no retry is scheduled (not at failure 3 of 5)', async () => {
+    vi.useFakeTimers()
+    let loads = 0
+    const channel = { name: 'preferences', capture: () => ({ value: 1 }),
+      load: async () => { loads++; throw new Error('http_500') }, apply() {}, save: async (value: { value: number }) => value }
+    const status = ref<'local' | 'restoring' | 'pending' | 'syncing' | 'synced' | 'failed'>('local')
+    const loadsAtFailed: number[] = []
+    watch(status, value => { if (value === 'failed') loadsAtFailed.push(loads) }, { flush: 'sync' })
+    const sync = createAutomaticSync({ userId: ref<string | null>('A'), status, channels: [channel] }); disposers.push(sync.destroy)
+    await flushPromises(); await vi.advanceTimersByTimeAsync(120_000)
+    expect(loadsAtFailed[0]).toBe(5)
+  })
+  it('fails immediately on a non-retryable status such as 400', async () => {
+    vi.useFakeTimers()
+    const sync = createAutomaticSync({ userId: ref<string | null>('A'), channels: [failing('preferences', 'account_preferences_http_400')] }); disposers.push(sync.destroy)
+    await flushPromises()
+    expect(sync.status.value).toBe('failed')
+  })
+
+  it('traces channel, phase, status and error class without leaking the message', async () => {
+    vi.useFakeTimers()
+    debugLog.clear()
+    const sync = createAutomaticSync({ userId: ref<string | null>('user-id-SECRET'), channels: [failing('preferences', 'account_preferences_http_400 Bearer SECRET')] }); disposers.push(sync.destroy)
+    await flushPromises()
+    const entries = debugLog.snapshot().filter(entry => entry.type.startsWith('sync.'))
+    expect(entries.find(entry => entry.type === 'sync.channel')).toMatchObject({ channel: 'preferences', phase: 'load', ok: false, errorClass: 'http_400', httpStatus: 400 })
+    expect(entries.find(entry => entry.type === 'sync.status' && entry.to === 'failed')).toBeTruthy()
+    expect(entries.find(entry => entry.type === 'sync.state')).toMatchObject({ failedChannel: 'preferences', errorClass: 'http_400' })
+    expect(debugLog.exportJson()).not.toMatch(/SECRET/u)
   })
 })

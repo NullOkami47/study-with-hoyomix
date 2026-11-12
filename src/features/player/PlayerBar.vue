@@ -1,19 +1,25 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
-import { ChevronDown, ListMusic, MoreHorizontal, Music2, Pause, Play, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-vue-next'
+import { type DirectiveBinding, computed, nextTick, onBeforeUnmount, onMounted, onUpdated, ref, shallowRef, watch, watchEffect } from 'vue'
+import { ChevronDown, ListMusic, LoaderCircle, MoreHorizontal, Music2, Pause, Play, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-vue-next'
 
 import YouTubePlayer from './YouTubePlayer.vue'
-import type { PlaybackMediaState, PlaybackStore } from './store'
+import type { FailureOutcome, PlaybackMediaState, PlaybackStore } from './store'
 import { isPreparationFresh } from './store'
 import { translate, type TranslationKey } from '../../i18n'
 import { resolveDisplayTitle } from '../catalog/displayTitle'
 import { usePreferences } from '../../stores/preferences'
 import { registerPlayerCommands, type PlaybackPauseLease, type PlayerCommands } from './commands'
 import { NEXT_TRACK_PRELOAD_LEAD_SECONDS, selectPreloadPolicy } from './preloadPolicy'
+import { inspectBuffer, waitForBuffer } from './bufferReadiness'
+import { boundedOverlapDuration, fadeGains, supportsNativeVolumeControl, transitionDuration } from './transitionEngine'
+import { planSmartMix, startPassiveEnergySampling, type EnergySample } from './smartMix'
 import { formatPlaybackQuality } from './qualityFormat'
+import { deriveLxCandidates } from './lx/candidates'
+import { isChkszExternalId } from '../../shared/chksz'
 import { createJellyfinProvider } from './providers/jellyfin'
 import { formatPlaybackTime, publishPlaybackPresentation } from './presentation'
 import { registerPlaybackMediaSession } from './mediaSession'
+import { describeMediaElement, installPlaybackLogLifecycle, recordPlayback } from './playbackLog'
 
 const props = withDefaults(defineProps<{
   store: PlaybackStore
@@ -39,6 +45,11 @@ interface AudioDeck {
   mimeType: string
   preload: 'metadata' | 'auto'
   preparationId?: number
+  /**
+   * The element that played the previous track, kept mounted without a source during a handover
+   * so ladder step (a) can play the new URL on it (P96-06).
+   */
+  retained?: boolean
   src: string
   trackId: string
 }
@@ -64,10 +75,31 @@ const audioDecks = ref<[AudioDeck, AudioDeck]>([
   emptyDeck(),
 ])
 const audioDeckElements = ref<HTMLAudioElement[]>([])
+const glassHeroRoot = ref<HTMLElement>()
 const activeDeckIndex = ref(0)
+// Only same-track recovery can keep the outgoing source. It stays audible until the new
+// element has sought and started, preserving Chrome's native media session in the background.
+const recoveryRetainedIndex = ref<number>()
+const prerollDeckIndex = ref<number>()
+const prerollRewindIndex = ref<number>()
+const PREROLL_LEAD_SECONDS = 1.2
+let preroll: { index: number; element: HTMLAudioElement; preparationId: number; generation: number } | undefined
+let rejectedPrerollId: number | undefined
+let prerollTimer: ReturnType<typeof setTimeout> | undefined
+let backgroundHandoff: { index: number; element: HTMLAudioElement; preparationId: number; generation: number; trackId: string } | undefined
+let backgroundStartedGeneration: number | undefined
+const expectedPrerollPauses = new WeakMap<HTMLAudioElement, { generation: number; src: string }>()
+let recoveryRetainTimer: ReturnType<typeof setTimeout> | undefined
 const deckElement = (index: number): HTMLAudioElement | null => audioDeckElements.value.find(
   (element) => element.dataset.audioDeck === String(index),
 ) ?? null
+// Render and immediate handoff share an idempotent source writer. Vue's native
+// :src patch would otherwise re-load the URL after the synchronous play request.
+const vAudioSource = (element: HTMLAudioElement, binding: DirectiveBinding<string | undefined>): void => {
+  if (binding.value) {
+    if (element.getAttribute('src') !== binding.value) element.setAttribute('src', binding.value)
+  } else if (element.hasAttribute('src')) element.removeAttribute('src')
+}
 const audio = computed(() => {
   const playable = props.store.playable.value
   const deck = audioDecks.value[activeDeckIndex.value]
@@ -129,6 +161,13 @@ const playedPercent = computed(() => {
  */
 const currentTrackLabel = computed(() =>
   resolveDisplayTitle(props.store.currentTrack.value, locale.value, text('player.noTrack')))
+/** The store's playback notices as localised text (P96-04). Optional: test stubs may omit them. */
+const playbackNoticeItems = computed(() => (props.store.playbackNotices?.value ?? []).map((notice) => {
+  const track = notice.trackId ? props.store.queue.value.find(({ id }) => id === notice.trackId) : undefined
+  const title = track ? resolveDisplayTitle(track, locale.value, notice.title ?? '') : notice.title ?? text('player.noTrack')
+  return { id: notice.id, kind: notice.kind, message: text(`player.notice.${notice.kind}` as TranslationKey, { title }) }
+}))
+const dismissPlaybackNotice = (id: number): void => { props.store.dismissNotice?.(id) }
 const upcomingCount = computed(() => props.store.queue.value.slice(Math.max(0, props.store.currentIndex.value + 1)).length)
 const queueLabel = computed(() => text('player.queueLabel').replace('{count}', String(upcomingCount.value)))
 const connection = (): NetworkInformationLike | undefined =>
@@ -145,6 +184,95 @@ let unregisterMediaSession: (() => void) | undefined
 let resumeAfterSuspension = false
 let youtubeSuspensionApplied = false
 let playbackCommandRevision = 0
+/** Media promises are invalidated by pauses without revoking a timer pause lease. */
+let mediaOperationRevision = 0
+const INITIAL_PLAY_FALLBACK_MS = 7_000
+const PLAYBACK_STALL_FALLBACK_MS = 9_000
+let playbackStallTimer: number | undefined
+let resumeSeekTimer: number | undefined
+let lastObservedPosition = 0
+let nativeInterruptionGeneration: number | undefined
+/** A network failure can stop a previously playing decoder before its replacement is ready. */
+const networkErrorSources = new WeakMap<HTMLAudioElement, { generation: number; commandRevision: number; pauseObserved: boolean }>()
+/** P96-06: a handed-over element that has not advanced shows the starting state, never Pause. */
+const transportStarting = computed(() => props.store.playbackIntent.value === 'playing' &&
+  props.store.awaitingStart?.value?.generation === props.store.playbackGeneration.value &&
+  ['playing', 'buffering', 'resolving', 'ready'].includes(props.store.status.value))
+const transportPlaying = computed(() => !transportStarting.value && props.store.playbackIntent.value === 'playing' &&
+  ['playing', 'buffering', 'resolving', 'ready'].includes(props.store.status.value))
+/** The progress check armed on every handover, for every provider (P96-06). */
+const HANDOVER_PROGRESS_TIMEOUT_MS = 5_000
+/**
+ * Delay before the ladder step after a refused start (`NotAllowedError`, an unchanged-load
+ * `AbortError`): the step runs in a later task, outside the rejected `play()` chain.
+ */
+const HANDOVER_REFUSAL_STEP_DELAY_MS = 250
+/**
+ * Task 41: a watchdog check that finds the handover element still loading (accepted `play()`, no
+ * MediaError, network activity) re-arms instead of escalating, up to this total from the handover
+ * start. A phone-network refill from an empty buffer can take well over 5 s; past this bound the
+ * ladder runs as before, so a stuck load still reaches the notice in about 25 s at most.
+ */
+const HANDOVER_LOADING_LIMIT_MS = 20_000
+/**
+ * Task 41: automatic resume after a refused or missing start (tap-to-resume notice). Retries run
+ * on page events and, while the page is visible, at these delays after each refused attempt; then
+ * stop (4 timer retries per track, well inside 20 `play()` calls per minute).
+ */
+const AUTO_RESUME_BACKOFF_MS = [2_000, 4_000, 8_000, 16_000] as const
+/** Non-gesture page events closer together than this share one attempt. */
+const AUTO_RESUME_EVENT_SPACING_MS = 1_000
+/** An automatic `play()` still unsettled after this counts as not started (the next retry may run). */
+const AUTO_RESUME_SETTLE_MS = 5_000
+interface AutoResumeState {
+  generation: number
+  /** Timer retries used for this generation (index into AUTO_RESUME_BACKOFF_MS). */
+  backoffUsed: number
+  timer: number | undefined
+  inFlight: boolean
+  /** The last attempt's `play()` was accepted; page events wait for progress or a new refusal. */
+  accepted: boolean
+  lastAttemptAt: number
+}
+let autoResume: AutoResumeState | undefined
+/**
+ * Task 41: the last `play()` request per element, and the last network-activity event. A request
+ * is recorded before its promise is awaited, because the HTML spec keeps that promise pending
+ * until playback actually starts: a buffering element has a pending, not a resolved, `play()`.
+ * Pending and resolved both count as accepted; a rejection removes the request.
+ */
+interface PlayRequest { src: string; generation: number; state: 'pending' | 'resolved' }
+const playRequests = new WeakMap<HTMLMediaElement, PlayRequest>()
+interface ActiveMediaRecovery {
+  /** A cancelled starting handover cannot be adopted by a later Play command. */
+  startedDuringHandover: boolean
+  operationRevision: number
+  commandRevision: number
+  cancelled: boolean
+  /** Explicit Pause and seek retire this owner; only native interruptions can be reauthorised. */
+  retired: boolean
+  generation: number
+  providerId: string | undefined
+  stillNeeded?: () => boolean
+  promise: Promise<void>
+}
+let activeMediaRecovery: ActiveMediaRecovery | undefined
+const loadActivityAt = new WeakMap<HTMLMediaElement, number>()
+const loadObservedElements = new WeakSet<HTMLMediaElement>()
+const LOAD_ACTIVITY_EVENTS = ['loadstart', 'progress', 'waiting', 'stalled'] as const
+interface HandoverState {
+  generation: number
+  trackId: string
+  /** `Date.now()` at the handover start; bounds the loading extension. */
+  startedAt: number
+  startPosition: number
+  /** Deck index of the retained element that played the previous track; -1 when none is left. */
+  retainedIndex: number
+  step: 'promoted' | 'swapped' | 'reResolving' | 'reResolved'
+  advancing: boolean
+}
+let handover: HandoverState | undefined
+let handoverWatchdog: number | undefined
 interface TimerPauseLeaseState {
   generation: number
   owner: symbol
@@ -153,6 +281,441 @@ interface TimerPauseLeaseState {
   settled: boolean
 }
 let activeTimerPauseLease: TimerPauseLeaseState | undefined
+/**
+ * Origin of the last pause of the active element (D20, P95-03). `player` is a pause this component
+ * asked for (`pauseMedia`); any other `pause` event is `native` (OS, headset, another tab). A timer
+ * pause lease never takes ownership after a native pause, so its release cannot undo that pause.
+ */
+let lastPauseOrigin: { origin: 'native' | 'player'; generation: number } | undefined
+let playerPauseRequested = false
+
+/* Playback event log (task 41.1). Logging only: none of this changes what the player does. */
+/** Elements that reached playing at least once (Chrome ties media activation to the element). */
+const everPlayedElements = new WeakSet<HTMLMediaElement>()
+const instrumentedElements = new WeakSet<HTMLMediaElement>()
+const LOGGED_MEDIA_EVENTS = [
+  'play', 'playing', 'pause', 'waiting', 'stalled', 'suspend', 'canplay', 'loadstart', 'error', 'ended', 'emptied', 'abort',
+] as const
+const PROGRESS_SAMPLE_INTERVAL_MS = 5_000
+let lastProgressSampleAt = Number.NEGATIVE_INFINITY
+let uninstallPlaybackLogLifecycle: (() => void) | undefined
+function elementEverPlayed(element: HTMLMediaElement | null | undefined): boolean {
+  return Boolean(element && everPlayedElements.has(element))
+}
+function pageLogState(): Record<string, unknown> {
+  const activation = (navigator as Navigator & { userActivation?: { isActive: boolean; hasBeenActive: boolean } }).userActivation
+  return {
+    visibility: typeof document !== 'undefined' ? document.visibilityState : null,
+    focused: typeof document !== 'undefined' && typeof document.hasFocus === 'function' ? document.hasFocus() : null,
+    userActive: activation?.isActive ?? null,
+    userHasBeenActive: activation?.hasBeenActive ?? null,
+  }
+}
+function onLoggedMediaEvent(event: Event): void {
+  const element = event.currentTarget
+  if (!(element instanceof HTMLMediaElement)) return
+  if (event.type === 'playing') everPlayedElements.add(element)
+  recordPlayback(`media.${event.type}`, {
+    ...describeMediaElement(element), active: element.dataset.audioDeck === String(activeDeckIndex.value),
+    everPlayed: everPlayedElements.has(element), visibility: document.visibilityState,
+  })
+}
+function instrumentDeckElements(): void {
+  for (const element of audioDeckElements.value) {
+    if (instrumentedElements.has(element)) continue
+    instrumentedElements.add(element)
+    for (const type of LOGGED_MEDIA_EVENTS) element.addEventListener(type, onLoggedMediaEvent)
+  }
+}
+
+/* Task 41: network activity per deck element, read by the handover watchdog. */
+function onLoadActivity(event: Event): void {
+  if (event.currentTarget instanceof HTMLMediaElement) loadActivityAt.set(event.currentTarget, Date.now())
+}
+function observeDeckLoadActivity(): void {
+  for (const element of audioDeckElements.value) {
+    if (loadObservedElements.has(element)) continue
+    loadObservedElements.add(element)
+    for (const type of LOAD_ACTIVITY_EVENTS) element.addEventListener(type, onLoadActivity)
+  }
+}
+
+/**
+ * The handover element is still loading: its `play()` for the current `src` and generation was
+ * requested and not rejected (pending or resolved), it has no MediaError, it cannot play ahead yet,
+ * and the network is fetching (or fetched within one check). An idle, refused or errored element
+ * is not loading, so the ladder decides it as before.
+ */
+function handoverElementLoading(element: HTMLMediaElement | null | undefined, generation: number): boolean {
+  if (!element || element.error) return false
+  const src = element.getAttribute('src')
+  const request = playRequests.get(element)
+  if (!src || !request || request.src !== src || request.generation !== generation) return false
+  if (element.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return false
+  if (element.networkState === HTMLMediaElement.NETWORK_LOADING) return true
+  const lastActivity = loadActivityAt.get(element)
+  return lastActivity !== undefined && Date.now() - lastActivity <= HANDOVER_PROGRESS_TIMEOUT_MS
+}
+
+function clearPlaybackStall(): void {
+  if (playbackStallTimer !== undefined) {
+    clearTimeout(playbackStallTimer)
+    playbackStallTimer = undefined
+  }
+}
+
+function canAttemptStallRecovery(): boolean {
+  const providerId = props.store.activeProviderId.value
+  if (
+    activeMediaRecovery?.generation === props.store.playbackGeneration.value ||
+    handoverActive(handover, props.store.playbackGeneration.value) ||
+    props.store.awaitingStart?.value?.generation === props.store.playbackGeneration.value ||
+    autoResume?.generation === props.store.playbackGeneration.value ||
+    props.store.pendingResumePosition.value !== undefined ||
+    nativeInterruptionGeneration === props.store.playbackGeneration.value ||
+    props.store.playbackIntent.value !== 'playing' ||
+    ['ended', 'error', 'resolving'].includes(props.store.status.value) ||
+    props.store.playable.value?.kind !== 'audio' || !providerId
+  ) return false
+  return props.store.registrySnapshot?.().registry.selectable().some(({ provider }) => provider.id === providerId) === true
+}
+
+/** Only a `halted` outcome stops the element; every other outcome leaves it to `syncActiveDeck`. */
+function pauseIfHalted(outcome: FailureOutcome | 'recovered', generation: number): void {
+  if (outcome === 'halted' && generation === props.store.playbackGeneration.value) audio.value?.pause()
+}
+
+function clearHandoverWatchdog(): void {
+  if (handoverWatchdog !== undefined) {
+    clearTimeout(handoverWatchdog)
+    handoverWatchdog = undefined
+  }
+}
+
+/** End the handover check: clear the watchdog and unmount the retained previous element. */
+function endHandover(): void {
+  clearHandoverWatchdog()
+  const state = handover
+  handover = undefined
+  if (state) recordPlayback('handover.end', { gen: state.generation, trackId: state.trackId, step: state.step })
+  if (state) releaseRetainedDeck(state.retainedIndex)
+}
+
+function releaseRetainedDeck(index: number): void {
+  const deck = audioDecks.value[index]
+  if (deck?.retained && !deck.src && index !== activeDeckIndex.value) clearDeck(index)
+}
+
+function handoverActive(state: HandoverState | undefined, generation = props.store.playbackGeneration.value): state is HandoverState {
+  return Boolean(state && state === handover && state.generation === generation &&
+    state.trackId === props.store.currentTrack.value?.id)
+}
+
+/** Start the check after a promotion; only a real handover (the store's starting state) gets one. */
+function beginHandover(generation: number, trackId: string, retainedIndex: number): void {
+  clearHandoverWatchdog()
+  handover = undefined
+  const awaiting = props.store.awaitingStart?.value
+  if (awaiting?.generation !== generation) {
+    recordPlayback('handover.notStarting', { gen: generation, trackId, retainedIndex, awaitingGen: awaiting?.generation ?? null })
+    releaseRetainedDeck(retainedIndex)
+    return
+  }
+  recordPlayback('handover.begin', { gen: generation, trackId, retainedIndex, startPosition: awaiting.startPosition, deck: activeDeckIndex.value })
+  handover = {
+    generation, trackId, startedAt: Date.now(), startPosition: awaiting.startPosition, retainedIndex, step: 'promoted', advancing: false,
+  }
+  armHandoverWatchdog()
+}
+
+/**
+ * One check at HANDOVER_PROGRESS_TIMEOUT_MS after each ladder step, however late the timer fires.
+ * No progress past the start position starts the next ladder step, except while the element is
+ * still loading (task 41): then the check re-arms, until HANDOVER_LOADING_LIMIT_MS from the start.
+ */
+function armHandoverWatchdog(timeoutMs = HANDOVER_PROGRESS_TIMEOUT_MS): void {
+  clearHandoverWatchdog()
+  const state = handover
+  if (!state) return
+  recordPlayback('handover.watchdog.arm', { gen: state.generation, step: state.step, timeoutMs })
+  handoverWatchdog = window.setTimeout(() => {
+    handoverWatchdog = undefined
+    if (!handoverActive(state, state.generation)) return
+    const element = audio.value
+    const started = prerollRewindIndex.value !== activeDeckIndex.value &&
+      (props.store.awaitingStart?.value?.generation !== state.generation ||
+      Boolean(element && element.currentTime > state.startPosition))
+    const elapsedMs = Date.now() - state.startedAt
+    const remainingMs = HANDOVER_LOADING_LIMIT_MS - elapsedMs
+    const ended = started || props.store.playbackIntent.value !== 'playing'
+    const extend = !ended && remainingMs > 0 && handoverElementLoading(element, state.generation)
+    recordPlayback('handover.watchdog.fire', {
+      ...describeMediaElement(element), gen: state.generation, step: state.step, started,
+      startPosition: state.startPosition, intent: props.store.playbackIntent.value, everPlayed: elementEverPlayed(element),
+      decision: ended ? 'end' : extend ? 'extend' : 'ladder', elapsedMs, ...pageLogState(),
+    })
+    if (ended) {
+      endHandover()
+      // Hidden pages may advance native time without delivering timeupdate. Transfer that
+      // observed progress to the normal watchdog before releasing the handover's monitoring.
+      if (started && element && !element.paused && !element.seeking && props.store.playbackIntent.value === 'playing') {
+        props.store.reportProgress?.(element.currentTime, state.generation)
+        updateMediaPresentation(element)
+        schedulePlaybackStall(PLAYBACK_STALL_FALLBACK_MS)
+      }
+    } else if (extend) {
+      const nextMs = Math.min(HANDOVER_PROGRESS_TIMEOUT_MS, remainingMs)
+      recordPlayback('handover.watchdog.extend', {
+        gen: state.generation, step: state.step, elapsedMs, nextMs, limitMs: HANDOVER_LOADING_LIMIT_MS,
+        lastLoadActivityMs: element && loadActivityAt.has(element) ? Date.now() - (loadActivityAt.get(element) ?? 0) : null,
+      })
+      armHandoverWatchdog(nextMs)
+    } else void advanceHandoverLadder(state)
+  }, timeoutMs)
+}
+
+/** A refused start is decided at once: the next ladder step replaces the pending progress check. */
+function refuseHandoverStart(state: HandoverState, reason: string): void {
+  recordPlayback('handover.refused', { gen: state.generation, step: state.step, reason, advancing: state.advancing, active: handoverActive(state, state.generation) })
+  if (!handoverActive(state, state.generation) || state.advancing) return
+  clearHandoverWatchdog()
+  clearPlaybackStall()
+  handoverWatchdog = window.setTimeout(() => {
+    handoverWatchdog = undefined
+    void advanceHandoverLadder(state)
+  }, HANDOVER_REFUSAL_STEP_DELAY_MS)
+}
+
+/** The handover ladder (P96-06): (a) `src` swap, (b) same-position re-resolve, (c) tap-to-resume notice. */
+async function advanceHandoverLadder(state: HandoverState): Promise<void> {
+  if (!handoverActive(state, state.generation) || state.advancing) return
+  state.advancing = true
+  clearHandoverWatchdog()
+  clearPlaybackStall()
+  try {
+    if (state.step === 'promoted') {
+      state.step = 'swapped'
+      recordPlayback('handover.ladder', { gen: state.generation, step: 'srcSwap', retainedIndex: state.retainedIndex })
+      if (state.retainedIndex >= 0 && await props.store.recoverHandover('srcSwap', state.generation)) {
+        if (!handoverActive(state, state.generation)) return
+        if (swapToRetainedElement(state)) return
+      }
+    }
+    if (!handoverActive(state, state.generation)) return
+    if (state.step === 'swapped') {
+      state.step = 'reResolving'
+      recordPlayback('handover.ladder', { gen: state.generation, step: 'reResolve' })
+      const renewed = await props.store.recoverHandover('reResolve', state.generation)
+      if (state !== handover) return
+      if (renewed) {
+        state.generation = props.store.playbackGeneration.value
+        state.step = 'reResolved'
+        // The playable watcher plays the renewed URL; this is its one progress check.
+        armHandoverWatchdog()
+        return
+      }
+      state.step = 'reResolved'
+    }
+    if (!handoverActive(state, state.generation)) return
+    recordPlayback('handover.ladder', { gen: state.generation, step: 'notice', ...pageLogState() })
+    recordPlayback('notice.tapToResume.raise', { site: 'handoverLadder', gen: state.generation, trackId: state.trackId })
+    const noticed = await props.store.recoverHandover('notice', state.generation)
+    endHandover()
+    if (noticed) armAutoResume(state.generation, 'handoverLadder')
+  } finally {
+    state.advancing = false
+  }
+}
+
+/**
+ * Ladder step (a): play the handed-over URL on the element that played the previous track (it was
+ * unlocked by the listener's gesture), from the start position, and re-arm the watchdog once.
+ */
+function swapToRetainedElement(state: HandoverState): boolean {
+  const playable = props.store.playable.value
+  const retainedIndex = state.retainedIndex
+  state.retainedIndex = -1
+  const element = deckElement(retainedIndex)
+  if (playable?.kind !== 'audio' || retainedIndex === activeDeckIndex.value ||
+    !audioDecks.value[retainedIndex]?.retained || !element) {
+    recordPlayback('handover.srcSwap', { gen: state.generation, ok: false, retainedIndex, hasElement: Boolean(element) })
+    return false
+  }
+  const promotedIndex = activeDeckIndex.value
+  recordPlayback('handover.srcSwap', { gen: state.generation, ok: true, fromDeck: promotedIndex, toDeck: retainedIndex, targetEverPlayed: elementEverPlayed(element) })
+  const generation = props.store.playbackGeneration.value
+  activeDeckIndex.value = retainedIndex
+  assignDeck(retainedIndex, {
+    generation, mimeType: playable.mimeType, preload: 'auto', src: playable.url, trackId: state.trackId,
+  })
+  // The promoted element is released the same way a promotion releases the outgoing deck.
+  clearDeck(promotedIndex)
+  try { element.currentTime = state.startPosition } catch { /* Applied by the next readiness event. */ }
+  armHandoverWatchdog()
+  void nextTick(() => {
+    if (!handoverActive(state, generation) || audio.value !== element) return
+    syncVolume(props.store.volume.value)
+    void play(generation, props.store.activeProviderId.value, false)
+  })
+  return true
+}
+
+/*
+ * Automatic resume (task 41). After a refused or missing start ends in the tap-to-resume notice,
+ * while the listener still wants playback (intent `playing`), retry through `play()` on the active
+ * element (its current `src`) when the page becomes usable again or on any gesture, and with a
+ * bounded backoff while visible. A pause, a native interruption, a new generation or progress
+ * ends it. The Media Session `play` action keeps its own path (commands.play).
+ */
+function clearAutoResumeTimer(state: AutoResumeState | undefined = autoResume): void {
+  if (state?.timer !== undefined) {
+    clearTimeout(state.timer)
+    state.timer = undefined
+  }
+}
+
+function cancelAutoResume(reason: string): void {
+  const state = autoResume
+  if (!state) return
+  clearAutoResumeTimer(state)
+  autoResume = undefined
+  recordPlayback('autoResume.cancel', { gen: state.generation, reason, backoffUsed: state.backoffUsed })
+}
+
+function armAutoResume(generation: number, site: string): void {
+  if (generation !== props.store.playbackGeneration.value || props.store.playbackIntent.value !== 'playing') return
+  let state = autoResume
+  if (state?.generation !== generation) {
+    cancelAutoResume('newStart')
+    state = { generation, backoffUsed: 0, timer: undefined, inFlight: false, accepted: false, lastAttemptAt: Number.NEGATIVE_INFINITY }
+    autoResume = state
+  }
+  state.accepted = false
+  recordPlayback('autoResume.arm', { gen: generation, site, backoffUsed: state.backoffUsed, ...pageLogState() })
+  scheduleAutoResumeBackoff()
+}
+
+/** One timer retry at a time, only while visible; hidden pages wait for a page event. */
+function scheduleAutoResumeBackoff(): void {
+  const state = autoResume
+  if (!state || state.timer !== undefined || state.inFlight || state.accepted) return
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  const delayMs = AUTO_RESUME_BACKOFF_MS[state.backoffUsed]
+  if (delayMs === undefined) return
+  state.backoffUsed += 1
+  recordPlayback('autoResume.backoff', { gen: state.generation, delayMs, retry: state.backoffUsed })
+  state.timer = window.setTimeout(() => {
+    state.timer = undefined
+    void attemptAutoResume('backoff')
+  }, delayMs)
+}
+
+function autoResumeEligible(state: AutoResumeState): boolean {
+  return state === autoResume && state.generation === props.store.playbackGeneration.value &&
+    props.store.playbackIntent.value === 'playing' && props.store.status.value === 'paused' &&
+    nativeInterruptionGeneration !== state.generation && props.store.playable.value?.kind === 'audio'
+}
+
+async function attemptAutoResume(trigger: string): Promise<void> {
+  const state = autoResume
+  if (!state) return
+  recordPlayback('autoResume.trigger', { trigger, gen: state.generation, inFlight: state.inFlight, accepted: state.accepted, ...pageLogState() })
+  if (!autoResumeEligible(state)) {
+    if (state.generation !== props.store.playbackGeneration.value || props.store.playbackIntent.value !== 'playing' ||
+      nativeInterruptionGeneration === state.generation) cancelAutoResume(`ineligible:${trigger}`)
+    return
+  }
+  const gesture = trigger === 'pointerdown' || trigger === 'keydown'
+  if (state.inFlight || (state.accepted && !gesture)) return
+  if (!gesture && trigger !== 'backoff' && Date.now() - state.lastAttemptAt < AUTO_RESUME_EVENT_SPACING_MS) return
+  if (trigger !== 'backoff' && state.timer !== undefined) {
+    // An event attempt replaces the pending timer retry and gives its slot back.
+    clearAutoResumeTimer(state)
+    state.backoffUsed = Math.max(0, state.backoffUsed - 1)
+  }
+  state.inFlight = true
+  state.lastAttemptAt = Date.now()
+  const element = audio.value
+  recordPlayback('autoResume.attempt', {
+    ...describeMediaElement(element), trigger, gen: state.generation, backoffUsed: state.backoffUsed,
+    everPlayed: elementEverPlayed(element), ...pageLogState(),
+  })
+  let settleTimer: number | undefined
+  let settled: 'resolved' | 'refused' | 'pending' = 'pending'
+  try {
+    // A `play()` that never settles must not hold the retries forever. Only this attempt's own
+    // resolved `play()` is accepted; any rejection (NotAllowedError, AbortError, ...) is refused.
+    settled = await Promise.race([
+      play(state.generation, props.store.activeProviderId.value, false, true)
+        .then((resolved) => resolved ? 'resolved' as const : 'refused' as const),
+      new Promise<'pending'>((resolve) => { settleTimer = window.setTimeout(() => resolve('pending'), AUTO_RESUME_SETTLE_MS) }),
+    ])
+  } finally {
+    if (settleTimer !== undefined) clearTimeout(settleTimer)
+    state.inFlight = false
+  }
+  if (state !== autoResume) return
+  const outcome = settled === 'resolved' ? 'accepted' : settled
+  recordPlayback('autoResume.outcome', { trigger, gen: state.generation, outcome, status: props.store.status.value })
+  if (outcome === 'accepted') state.accepted = true
+  else scheduleAutoResumeBackoff()
+}
+
+function onAutoResumePageEvent(event: Event): void {
+  if (event.type === 'visibilitychange' && document.visibilityState !== 'visible') cancelPreroll()
+  if (!autoResume) return
+  if (event.type === 'visibilitychange' && document.visibilityState !== 'visible') {
+    // Hidden: stop the timer retries (a hidden retry is refused) and keep the slot for later.
+    if (autoResume.timer !== undefined) {
+      clearAutoResumeTimer(autoResume)
+      autoResume.backoffUsed = Math.max(0, autoResume.backoffUsed - 1)
+    }
+    return
+  }
+  if (event instanceof KeyboardEvent && event.repeat) return
+  void attemptAutoResume(event.type)
+}
+
+const AUTO_RESUME_DOCUMENT_EVENTS = ['visibilitychange', 'resume', 'pointerdown', 'keydown'] as const
+const AUTO_RESUME_WINDOW_EVENTS = ['pageshow', 'focus', 'online'] as const
+const AUTO_RESUME_LISTENER_OPTIONS: AddEventListenerOptions = { capture: true, passive: true }
+function installAutoResumeListeners(): void {
+  for (const type of AUTO_RESUME_DOCUMENT_EVENTS) document.addEventListener(type, onAutoResumePageEvent, AUTO_RESUME_LISTENER_OPTIONS)
+  for (const type of AUTO_RESUME_WINDOW_EVENTS) window.addEventListener(type, onAutoResumePageEvent, AUTO_RESUME_LISTENER_OPTIONS)
+}
+function uninstallAutoResumeListeners(): void {
+  for (const type of AUTO_RESUME_DOCUMENT_EVENTS) document.removeEventListener(type, onAutoResumePageEvent, AUTO_RESUME_LISTENER_OPTIONS)
+  for (const type of AUTO_RESUME_WINDOW_EVENTS) window.removeEventListener(type, onAutoResumePageEvent, AUTO_RESUME_LISTENER_OPTIONS)
+}
+
+function schedulePlaybackStall(timeoutMs: number): void {
+  if (playbackStallTimer !== undefined || !canAttemptStallRecovery()) return
+  const generation = props.store.playbackGeneration.value
+  lastObservedPosition = currentTime.value
+  playbackStallTimer = window.setTimeout(() => {
+    playbackStallTimer = undefined
+    if (generation !== props.store.playbackGeneration.value || audio.value?.seeking ||
+      props.store.playbackIntent.value !== 'playing' ||
+      ['ended', 'error'].includes(props.store.status.value)) return
+    const element = audio.value
+    if (element && Math.abs(element.currentTime - lastObservedPosition) >= 0.25) {
+      updateMediaPresentation(element)
+      schedulePlaybackStall(timeoutMs)
+      return
+    }
+    if (element?.paused && element.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return
+    // D21 (P95-04): the decision follows `currentTime` progress and the media events that armed this
+    // timer, never the timer's own delay; a late firing with no progress is a stall.
+    const providerId = props.store.activeProviderId.value
+    if (!element || !providerId || !canAttemptStallRecovery()) return
+    const position = element.currentTime
+    void recoverMediaFailure(providerId, generation, () =>
+      audio.value === element && !element.seeking &&
+      (!element.paused || element.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) &&
+      nativeInterruptionGeneration !== generation && props.store.playbackIntent.value === 'playing' &&
+      Math.abs(element.currentTime - position) < 0.25)
+  }, timeoutMs)
+}
 
 function formatProviderLabel(id: string): string {
   if (id === 'youtube') return 'YouTube'
@@ -160,6 +723,7 @@ function formatProviderLabel(id: string): string {
   if (id === 'jellyfin') return 'Jellyfin'
   if (id === 'chksz') return 'ChKSz'
   if (id === 'lx') return 'LX Music'
+  if (id === 'vkeys') return 'Vkeys'
   if (id === 'gd-studio') return 'GD Studio'
   if (id === 'lx-huanyin') return '幻音'
   return id
@@ -212,7 +776,25 @@ const playbackQualityText = computed(() => {
 })
 const releaseProviderText = playbackQualityText
 
-const primaryArtworkUrl = computed(() => props.store.playable.value?.metadata?.artworkUrl)
+const artworkIdentity = computed(() => JSON.stringify([props.store.currentTrack.value?.id, props.store.playbackGeneration.value]))
+const canonicalArtworkUrl = computed(() => {
+  const providerId = props.store.activeProviderId.value
+  const track = props.store.currentTrack.value
+  if ((providerId !== 'lx' && providerId !== 'gd-studio') || props.store.playable.value?.kind !== 'audio' ||
+      !props.store.enabledProviderIds.value.includes(providerId) || !track) return undefined
+  let id: string | undefined
+  if (providerId === 'gd-studio') {
+    // Use the exact binding GD Studio resolved, with the canonical NetEase binding as fallback.
+    const gdSource = track.sources.find(source => source.provider === 'gd-studio')
+    id = gdSource
+      ? /^netease:([0-9]{1,20})(?::(?:128|192|320|740|999))?$/.exec(gdSource.externalId)?.[1]
+      : track.sources.find(source => source.provider === 'chksz' && isChkszExternalId(source.externalId))?.externalId
+  } else {
+    id = deriveLxCandidates(track).find(candidate => candidate.source === 'wy' && isChkszExternalId(candidate.id))?.id
+  }
+  return id ? '/api/providers/' + providerId + '/artwork/' + encodeURIComponent(id) : undefined
+})
+const primaryArtworkUrl = computed(() => props.store.playable.value?.metadata?.artworkUrl ?? canonicalArtworkUrl.value)
 const artworkPhase = ref<'primary' | 'resolving' | 'jellyfin' | 'failed'>('primary')
 const jellyfinArtworkUrl = ref<string>()
 const artworkUrl = computed(() => artworkPhase.value === 'jellyfin' ? jellyfinArtworkUrl.value : primaryArtworkUrl.value)
@@ -279,7 +861,11 @@ watch(
   },
   { immediate: true },
 )
-function onArtworkError(): void {
+function onArtworkError(event: Event): void {
+  // An old image may finish after a track/generation change. It must not erase the new cover.
+  const image = event.target as HTMLImageElement | null
+  if (image?.dataset.artworkIdentity !== artworkIdentity.value) return
+  if (artworkUrl.value && image.src !== new URL(artworkUrl.value, window.location.origin).href) return
   if (artworkPhase.value === 'primary') void tryJellyfinArtwork()
   else if (artworkPhase.value === 'jellyfin') artworkPhase.value = 'failed'
 }
@@ -300,6 +886,7 @@ function failureText(code?: string): string {
     invalid_response: 'player.statusInvalid', not_mapped: 'player.statusNotMapped',
     rate_limited: 'player.statusRateLimited', timeout: 'player.statusTimeout', unavailable: 'player.statusUnavailable',
     credential_required: 'player.statusCredentialRequired', invalid_credential: 'player.statusInvalidCredential',
+    csp_blocked: 'player.statusCspBlocked',
   }
   return text(keys[code ?? 'unavailable'] ?? 'player.statusUnavailable')
 }
@@ -307,39 +894,139 @@ function failureText(code?: string): string {
 async function play(
   generation = props.store.playbackGeneration.value,
   providerId = props.store.activeProviderId.value,
-): Promise<void> {
-  if (generation !== props.store.playbackGeneration.value) return
+  userInitiated = true,
+  /**
+   * Task 41 automatic resume: the listener did not ask, so the store's Play (which answers the
+   * notice) and the stall fallback are left out; the notice stays until real progress clears it.
+   */
+  automatic = false,
+): Promise<boolean> {
+  // Resolves `true` only when the media element's own `play()` resolved (task 41.6: an automatic
+  // resume counts as accepted only then); every other path, rejections included, resolves `false`.
+  if (generation !== props.store.playbackGeneration.value) return false
+  if (userInitiated) {
+    nativeInterruptionGeneration = undefined
+    lastPauseOrigin = undefined
+    // A new listener command may adopt the still-pending same-source result. Cancellation
+    // belongs to the previous command; automatic play requests never restore its authority.
+    if (activeMediaRecovery?.generation === generation && activeMediaRecovery.providerId === providerId &&
+      !activeMediaRecovery.startedDuringHandover && !activeMediaRecovery.retired) {
+      activeMediaRecovery.cancelled = false
+      activeMediaRecovery.commandRevision = playbackCommandRevision
+      activeMediaRecovery.operationRevision = mediaOperationRevision
+      const element = audio.value
+      const source = element && networkErrorSources.get(element)
+      if (source?.generation === generation) source.commandRevision = playbackCommandRevision
+    }
+  }
+  else if (nativeInterruptionGeneration === generation) return false
+  playerPauseRequested = false
+  clearPlaybackStall()
   if (props.mediaSuspended && props.store.playable.value?.kind === 'youtube') {
     resumeAfterSuspension = true
     applyYouTubeSuspension(generation)
-    return
+    return false
   }
-  props.store.play()
+  if (props.store.status.value === 'error' && props.store.pendingResumePosition.value !== undefined) {
+    await props.store.play()
+    return false
+  }
+  if (!automatic) props.store.play()
+  if (userInitiated && prerollRewindIndex.value === activeDeckIndex.value && !completePrerollRewind(activeDeckIndex.value) && !handover) {
+    beginHandover(generation, props.store.currentTrack.value?.id ?? '', -1)
+  }
+  if (props.store.pendingResumePosition.value !== undefined) {
+    if (resumeSeekTimer === undefined) resumeSeekTimer = window.setTimeout(() => {
+      resumeSeekTimer = undefined
+      if (generation === props.store.playbackGeneration.value &&
+        props.store.playbackIntent.value === 'playing' && props.store.pendingResumePosition.value !== undefined) {
+        void reportFailure(providerId, generation)
+        audio.value?.pause()
+      }
+    }, 10_000)
+    if (audio.value) updateMediaPresentation(audio.value)
+    return false
+  }
   youtube.value?.play()
+  const element = audio.value
+  const loadedSrc = element?.getAttribute('src')
+  const operationRevision = mediaOperationRevision
+  recordPlayback('play.call', {
+    ...describeMediaElement(element), gen: generation, userInitiated, providerId: providerId ?? null,
+    handover: handoverActive(handover, generation), everPlayed: elementEverPlayed(element), automatic, ...pageLogState(),
+  })
+  // Recorded before the await: the promise stays pending while the element buffers (task 41.6).
+  const request: PlayRequest | undefined = element && loadedSrc ? { src: loadedSrc, generation, state: 'pending' } : undefined
+  if (element && request) playRequests.set(element, request)
   try {
-    await audio.value?.play()
+    if (!automatic) schedulePlaybackStall(INITIAL_PLAY_FALLBACK_MS)
+    await element?.play()
+    if (request) request.state = 'resolved'
+    recordPlayback('play.resolved', { gen: generation, deck: element?.dataset.audioDeck ?? null, paused: element?.paused ?? null })
+    return Boolean(element)
   } catch (error) {
+    // Only this request is withdrawn; a newer `play()` on the element keeps its own.
+    if (element && request && playRequests.get(element) === request) playRequests.delete(element)
+    recordPlayback('play.rejected', {
+      gen: generation, deck: element?.dataset.audioDeck ?? null, everPlayed: elementEverPlayed(element),
+      name: error instanceof DOMException || error instanceof Error ? error.name : typeof error,
+      message: error instanceof Error || error instanceof DOMException ? error.message : null, ...pageLogState(),
+    })
+    // A failed resource can both emit error and reject play(). Its existing recovery owns
+    // the generation until renewal/fallback settles; reporting it twice would abort renewal.
+    if (generation !== props.store.playbackGeneration.value || operationRevision !== mediaOperationRevision ||
+      props.store.playbackIntent.value !== 'playing' || playerUnmounted || audio.value !== element ||
+      element?.getAttribute('src') !== loadedSrc) return false
     if (error instanceof DOMException && error.name === 'NotAllowedError') {
       // Browser autoplay policy: the track is resolved and ready but the
       // browser requires a user gesture before playback can begin.  Do NOT
       // report this as a provider failure — keep the playable loaded and
       // show the play button so a subsequent user click succeeds.
       if (generation === props.store.playbackGeneration.value) {
-        props.store.pause()
-        props.store.reportMediaState('ready', generation)
+        clearPlaybackStall()
+        // After a handover the ladder runs at once (P96-06).
+        if (handoverActive(handover, generation)) {
+          refuseHandoverStart(handover, 'NotAllowedError')
+          return false
+        }
+        props.store.reportMediaState('paused', generation)
+        // A refused automatic resume keeps the notice it answers (or the listener's dismissal).
+        if (automatic) return false
+        // D29: say so, and let one tap start playback.
+        if (props.store.playbackIntent.value === 'playing') {
+          recordPlayback('notice.tapToResume.raise', { site: 'playRejected', gen: generation })
+          props.store.addPlaybackNotice('tapToResume')
+          armAutoResume(generation, 'playRejected')
+        }
       }
-      return
+      return false
     }
     if (error instanceof DOMException && error.name === 'AbortError') {
-      // Playback was interrupted (e.g. a new track was loaded while this
-      // one was still buffering).  Silently ignore.
-      return
+      // A load replaced by a newer one is ignored. After a handover, an abort of the unchanged load
+      // (same element, `src` and generation) is a missing start (P96-06). An automatic resume's
+      // abort outside a handover is a not-started attempt: its caller schedules the next retry.
+      if (handoverActive(handover, generation) && element && audio.value === element &&
+        element.getAttribute('src') === loadedSrc) refuseHandoverStart(handover, 'AbortError')
+      return false
     }
-    await reportFailure(providerId, generation)
+    // Resource refusal and a later error event share one bounded renewal, even while the
+    // promoted deck is awaiting its first progress. Gesture/unchanged-load refusals stay above.
+    if (element && audio.value === element && element.getAttribute('src') === loadedSrc) {
+      await recoverMediaFailure(providerId, generation)
+    }
+    return false
   }
 }
 
 function pauseMedia(): void {
+  finishOverlap('pause')
+  stopSampling()
+  releaseRecoverySource()
+  clearPlaybackStall()
+  endHandover()
+  cancelAutoResume('pause')
+  if (resumeSeekTimer !== undefined) { clearTimeout(resumeSeekTimer); resumeSeekTimer = undefined }
+  playerPauseRequested = true
   props.store.pause()
   youtube.value?.pause()
   audio.value?.pause()
@@ -349,8 +1036,11 @@ function toggleCollapsed(): void {
   collapsed.value = !collapsed.value
 }
 
-function invalidateInterruptionOwnership(clearDeferredResume = true): void {
+function invalidateInterruptionOwnership(clearDeferredResume = true, preservePreroll = false): void {
+  cancelManualSelection()
+  if (!preservePreroll) cancelPreroll()
   playbackCommandRevision += 1
+  mediaOperationRevision += 1
   cancelTimerPauseLease()
   if (clearDeferredResume) resumeAfterSuspension = false
 }
@@ -386,6 +1076,7 @@ function resumeTimerPauseLeaseWhenReady(lease = activeTimerPauseLease): boolean 
 
 function pause(): void {
   invalidateInterruptionOwnership()
+  clearPlaybackStall()
   pauseMedia()
 }
 
@@ -399,6 +1090,7 @@ function applyYouTubeSuspension(generation = props.store.playbackGeneration.valu
 
 function stop(): void {
   invalidateInterruptionOwnership()
+  clearPlaybackStall()
   pauseMedia()
   props.store.stop()
 }
@@ -406,21 +1098,81 @@ function stop(): void {
 defineExpose({ pause, stop })
 
 function toggle(): void {
-  if (props.store.playbackIntent.value === 'playing') pause()
-  else {
-    invalidateInterruptionOwnership(false)
-    void play()
-  }
+  if (transportPlaying.value || transportStarting.value) pause()
+  else resumeFromListener()
+}
+
+/** The user-initiated play, also behind the tap-to-resume notice (D29). */
+function resumeFromListener(): void {
+  invalidateInterruptionOwnership(false)
+  void play()
 }
 
 function next(): void {
+  const index = manualTargetIndex(1)
+  if (props.store.transitionMode.value !== 'off' && !props.store.queue.value[index]) return
+  recordPlayback('advance.user', { direction: 'next', index: props.store.currentIndex.value })
   invalidateInterruptionOwnership()
-  void props.store.next()
+  clearPlaybackStall()
+  if (props.store.transitionMode.value === 'off') void props.store.next()
+  else void transitionByUser(index)
 }
 
 function previous(): void {
+  const index = manualTargetIndex(-1)
+  if (props.store.transitionMode.value !== 'off' && !props.store.queue.value[index]) return
+  recordPlayback('advance.user', { direction: 'previous', index: props.store.currentIndex.value })
   invalidateInterruptionOwnership()
-  void props.store.previous()
+  clearPlaybackStall()
+  if (props.store.transitionMode.value === 'off') void props.store.previous()
+  else void transitionByUser(index)
+}
+
+let playerUnmounted = false
+let manualTransitionRevision = 0
+let manualPreparation: number | undefined
+let pendingManualTarget: { index: number; track: PlaybackStore['queue']['value'][number]; generation: number; revision: number } | undefined
+function cancelManualSelection(): void {
+  manualTransitionRevision += 1
+  pendingManualTarget = undefined
+  manualPreparation = undefined
+}
+function manualTargetIndex(direction: 1 | -1): number {
+  const pending = pendingManualTarget
+  const base = pending && pending.revision === manualTransitionRevision &&
+    pending.generation === props.store.playbackGeneration.value && props.store.queue.value[pending.index] === pending.track
+    ? pending.index : props.store.currentIndex.value
+  return base + direction
+}
+async function transitionByUser(index: number): Promise<void> {
+  const revision = ++manualTransitionRevision
+  finishOverlap('manual-switch')
+  const target = props.store.queue.value[index]
+  if (!target || index === props.store.currentIndex.value) return
+  const generation = props.store.playbackGeneration.value
+  const current = () => !playerUnmounted && revision === manualTransitionRevision && generation === props.store.playbackGeneration.value &&
+    target === props.store.queue.value[index]
+  manualPreparation = revision
+  pendingManualTarget = { index, track: target, generation, revision }
+  try {
+    if (props.store.sourceOverride.value === undefined && props.store.transitionMode.value !== 'off' &&
+        props.store.playbackIntent.value === 'playing') {
+      await props.store.prepareTransition(index)
+      await nextTick()
+      if (!current()) return
+      const prepared = props.store.preparedNext.value
+      const standby = deckElement(standbyDeckIndex())
+      if (prepared?.track === target && standby && !pageIsHidden()) {
+        await waitForBuffer(standby, 2, current)
+      }
+      if (!current()) return
+      if (await tryCrossfade(index, true)) return
+    }
+    if (current()) await props.store.playQueueIndex(index)
+  } finally {
+    if (manualPreparation === revision) manualPreparation = undefined
+    if (pendingManualTarget?.revision === revision) pendingManualTarget = undefined
+  }
 }
 
 function onKeydown(event: KeyboardEvent): void {
@@ -431,11 +1183,17 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function onSourceChange(event: Event): void {
+  finishOverlap('provider-change')
   invalidateInterruptionOwnership()
+  clearPlaybackStall()
   void props.store.setSourceOverride((event.target as HTMLSelectElement).value || undefined)
 }
 
 function pauseForInterruption(): PlaybackPauseLease | undefined {
+  // D20: after a native pause the intent still reads `playing`, but the playback is not ours to resume.
+  if (lastPauseOrigin?.origin === 'native' && lastPauseOrigin.generation === props.store.playbackGeneration.value) {
+    return undefined
+  }
   const ownsPlayingIntent = resumeAfterSuspension || props.store.playbackIntent.value === 'playing'
   if (!ownsPlayingIntent) return undefined
 
@@ -480,9 +1238,188 @@ function formatTime(value: number): string {
   return formatPlaybackTime(value)
 }
 
-function assignDeck(index: number, deck: AudioDeck): void {
+
+interface DeckOverlap {
+  from: number; to: number; outgoing: HTMLAudioElement; incoming: HTMLAudioElement
+  preparationId: number; generation: number; promoted: boolean; committing: boolean
+  seconds: number; progress: number; startedAt: number
+}
+const overlap = shallowRef<DeckOverlap | null>(null)
+let fadeTimer: ReturnType<typeof setInterval> | undefined
+let transitionAttempt: number | undefined
+let stopEnergySampling: (() => void) | undefined
+let samplingElement: HTMLAudioElement | undefined
+let energySamples: EnergySample[] = []
+const preparationObservations = new Map<number, string>()
+let startLatency: { generation: number; startedAt: number } | undefined
+
+const pageIsHidden = () => document.visibilityState === 'hidden'
+function overlapDeckAllowed(index: number): boolean {
+  const state = overlap.value
+  return Boolean(state && (index === state.from || index === state.to) &&
+    deckElement(state.from) === state.outgoing && deckElement(state.to) === state.incoming)
+}
+function applyOverlapVolume(): void {
+  const state = overlap.value
+  if (!state) return
+  const [outgoing, incoming] = fadeGains(state.progress, props.store.volume.value)
+  state.outgoing.volume = outgoing
+  state.incoming.volume = incoming
+}
+function finishOverlap(reason: string): void {
+  const state = overlap.value
+  if (!state) return
+  overlap.value = null
+  if (fadeTimer !== undefined) clearInterval(fadeTimer)
+  fadeTimer = undefined
+  const discarded = state.promoted ? state.from : state.to
+  // Withdraw authorisation before pausing so queued events cannot restart a discarded deck.
+  const element = state.promoted ? state.outgoing : state.incoming
+  element.pause()
+  element.muted = true
+  if (state.promoted) clearDeck(discarded)
+  else { try { element.currentTime = 0 } catch { /* An interrupted load may not be seekable. */ } }
+  const active = deckElement(activeDeckIndex.value)
+  if (active) { active.muted = false; active.volume = props.store.volume.value }
+  recordPlayback('transition.end', { reason, promoted: state.promoted, progress: state.progress })
+  if (!playerUnmounted) void nextTick(() => syncPreparedDeck())
+}
+function stopSampling(): void {
+  stopEnergySampling?.()
+  stopEnergySampling = undefined
+  samplingElement = undefined
+  energySamples = []
+}
+function observeEnergy(element: HTMLAudioElement): void {
+  const eligible = props.store.transitionMode.value === 'smart' && !element.paused &&
+    document.visibilityState !== 'hidden' && duration.value > 0 &&
+    duration.value - currentTime.value <= Math.max(24, props.store.crossfadeDuration.value * 2)
+  if (!eligible) { if (samplingElement) stopSampling(); return }
+  if (samplingElement === element) return
+  stopSampling()
+  samplingElement = element
+  stopEnergySampling = startPassiveEnergySampling(element, sample => {
+    if (samplingElement !== element) return
+    energySamples.push(sample)
+    if (energySamples.length > 12) energySamples.shift()
+  }, state => {
+    if (state === 'unavailable' || state === 'suspended') energySamples = []
+    recordPlayback('transition.analysis', {state, gen: props.store.playbackGeneration.value})
+  })
+}
+function plannedTransition(manual = false) {
+  if (manual) return { durationSeconds: transitionDuration(props.store.crossfadeDuration.value, true), reason: 'manual', analysed: false }
+  return props.store.transitionMode.value === 'smart'
+    ? planSmartMix(props.store.crossfadeDuration.value, duration.value, energySamples)
+    : { durationSeconds: transitionDuration(props.store.crossfadeDuration.value), reason: 'configured', analysed: false }
+}
+async function tryCrossfade(targetIndex: number, manual = false): Promise<boolean> {
+  // Apple mobile WebKit also rejects the zero-volume start used by an overlap.
+  if (playerUnmounted || overlap.value || preroll || recoveryRetainedIndex.value !== undefined || isAppleMobileWebKit() ||
+      props.store.transitionMode.value === 'off' || props.store.preloadPolicy.value !== 'auto' ||
+      props.store.playbackIntent.value !== 'playing' || props.mediaSuspended || document.visibilityState === 'hidden') return false
+  const prepared = props.store.preparedNext.value
+  const outgoing = audio.value
+  const to = standbyDeckIndex(), incoming = deckElement(to)
+  const plan = plannedTransition(manual)
+  const remaining = outgoing ? outgoing.duration - outgoing.currentTime : 0
+  if (!manual && (!Number.isFinite(remaining) || remaining < .25)) return false
+  if (!prepared || !outgoing || outgoing.paused || outgoing.ended || outgoing.seeking || !incoming ||
+      prepared.track !== props.store.queue.value[targetIndex] || audioDecks.value[to].preparationId !== prepared.id ||
+      !props.store.canHandoffPreparation(prepared.id) || transitionAttempt === prepared.id) return false
+  const incomingRemaining = incoming.duration - incoming.currentTime
+  // A short incoming track shortens the automatic lead as well as the envelope. Otherwise a
+  // one-second overlap could start twelve seconds early and discard the outgoing outro.
+  if (!manual && remaining > Math.min(plan.durationSeconds, incomingRemaining / 2) + .1) return false
+  const seconds = boundedOverlapDuration(plan.durationSeconds, remaining, incomingRemaining)
+  if (seconds === 0 || !inspectBuffer(incoming, Math.max(2, seconds + .5)).ready ||
+      !supportsNativeVolumeControl(incoming)) return false
+  transitionAttempt = prepared.id
+  const state: DeckOverlap = { from: activeDeckIndex.value, to, outgoing, incoming,
+    preparationId: prepared.id, generation: props.store.playbackGeneration.value, promoted: false,
+    committing: false, seconds, progress: 0, startedAt: performance.now() }
+  overlap.value = state
+  incoming.volume = 0
+  incoming.muted = false
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    // An accepted play is required before touching the outgoing track/store. A bounded timeout
+    // leaves the ordinary handoff available when mobile autoplay or the radio refuses overlap.
+    const started = incoming.play().then(() => {
+      // play() can settle after a timeout, cancellation, or removal of the native listeners.
+      // Stop only an abandoned deck; a newer transition may already own this same element.
+      const authorised = !playerUnmounted && (overlapDeckAllowed(to) ||
+        (audio.value === incoming && props.store.playbackIntent.value === 'playing' &&
+          nativeInterruptionGeneration !== props.store.playbackGeneration.value))
+      if (!authorised) { incoming.pause(); incoming.muted = true }
+    })
+    await Promise.race([started, new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error('transition-start-timeout')), 1500)
+    })])
+    if (overlap.value !== state || state.generation !== props.store.playbackGeneration.value ||
+        props.store.playbackIntent.value !== 'playing' || pageIsHidden() ||
+        !props.store.canHandoffPreparation(prepared.id) || prepared.track !== props.store.queue.value[targetIndex]) {
+      if (overlap.value === state) finishOverlap('cancelled-before-start')
+      return false
+    }
+    state.seconds = boundedOverlapDuration(state.seconds, outgoing.duration - outgoing.currentTime,
+      incoming.duration - incoming.currentTime)
+    if (state.seconds === 0) { finishOverlap('too-late'); return false }
+    state.committing = true
+    await props.store.playQueueIndex(targetIndex, () => overlap.value === state &&
+      state.generation === props.store.playbackGeneration.value &&
+      props.store.playbackIntent.value === 'playing' && !pageIsHidden() &&
+      props.store.transitionMode.value !== 'off' && props.store.preloadPolicy.value === 'auto')
+    if (overlap.value !== state || activeDeckIndex.value !== to || props.store.playable.value !== prepared.playable) {
+      if (overlap.value === state) finishOverlap('handoff-rejected')
+      return false
+    }
+    state.promoted = true
+    state.committing = false
+    state.generation = props.store.playbackGeneration.value
+    state.startedAt = performance.now()
+    recordPlayback('transition.start', { mode: props.store.transitionMode.value, seconds: state.seconds,
+      reason: plan.reason, analysed: plan.analysed, manual, preparationId: prepared.id })
+    fadeTimer = setInterval(() => {
+      if (overlap.value !== state) return
+      if (props.store.playbackIntent.value !== 'playing' || state.generation !== props.store.playbackGeneration.value) {
+        finishOverlap('interrupted'); return
+      }
+      state.progress = Math.min(1, (performance.now() - state.startedAt) / (state.seconds * 1000))
+      applyOverlapVolume()
+      if (state.progress >= 1) finishOverlap('complete')
+    }, 50)
+    return true
+  } catch {
+    if (overlap.value === state) finishOverlap('play-refused')
+    recordPlayback('transition.unavailable', { preparationId: prepared.id, manual })
+    return false
+  } finally { if (timeout !== undefined) clearTimeout(timeout) }
+}
+function observePreparation(index: number): void {
+  const deck = audioDecks.value[index]
+  if (deck.preparationId === undefined) return
+  const result = inspectBuffer(deckElement(index), Math.max(2, props.store.crossfadeDuration.value + .5))
+  const phase = result.ready ? 'ready' : result.totalBufferedSeconds > 0 ? 'buffering' : 'fetching'
+  const observation = phase + ':' + Math.floor(result.bufferedSeconds)
+  if (preparationObservations.get(deck.preparationId) === observation) return
+  preparationObservations.set(deck.preparationId, observation)
+  if (preparationObservations.size > 4) preparationObservations.delete(preparationObservations.keys().next().value!)
+  recordPlayback('preparation.buffer', { preparationId: deck.preparationId, phase,
+    bufferedSeconds: result.bufferedSeconds, totalBufferedSeconds: result.totalBufferedSeconds, ready: result.ready })
+}
+function onTransitionVisibility(): void {
+  if (document.visibilityState !== 'hidden') return
+  cancelManualSelection()
+  finishOverlap('background')
+  stopSampling()
+}
+
+function assignDeck(index: number, deck: AudioDeck, preserveElement = false): void {
+  if (preroll?.index === index && (deck.preparationId !== preroll.preparationId || deck.src !== audioDecks.value[index].src)) cancelPreroll()
+  if (prerollRewindIndex.value === index && (deck.src !== audioDecks.value[index].src || deck.generation !== audioDecks.value[index].generation)) prerollRewindIndex.value = undefined
   const outgoing = audioDecks.value[index]
-  if (outgoing.src && (outgoing.src !== deck.src || outgoing.trackId !== deck.trackId)) {
+  if (!preserveElement && outgoing.src && (outgoing.src !== deck.src || outgoing.trackId !== deck.trackId)) {
     const element = deckElement(index)
     if (element) {
       element.pause()
@@ -501,6 +1438,8 @@ function assignDeck(index: number, deck: AudioDeck): void {
 }
 
 function clearDeck(index: number): void {
+  const element = deckElement(index)
+  if (element) { networkErrorSources.delete(element); expectedPrerollPauses.delete(element) }
   assignDeck(index, emptyDeck())
 }
 
@@ -508,11 +1447,132 @@ function standbyDeckIndex(): number {
   return activeDeckIndex.value === 0 ? 1 : 0
 }
 
+/** Unmount the deck's source but keep its element for ladder step (a) (P96-06). */
+function retainDeck(index: number): void {
+  assignDeck(index, { ...emptyDeck(), retained: true })
+}
+
+function releaseRecoverySource(restorePreparation = false): void {
+  const index = recoveryRetainedIndex.value
+  recoveryRetainedIndex.value = undefined
+  if (recoveryRetainTimer !== undefined) clearTimeout(recoveryRetainTimer)
+  recoveryRetainTimer = undefined
+  if (index !== undefined) clearDeck(index)
+  // The outgoing element may have ended before the incoming one started. Its slot is still
+  // available for an armed preparation even when the retained index was already released.
+  if (restorePreparation) syncPreparedDeck()
+}
+
+function isNetworkErrorSource(index: number, element: HTMLAudioElement): boolean {
+  const source = networkErrorSources.get(element)
+  return source !== undefined && source.generation === audioDecks.value[index].generation &&
+    source.commandRevision === playbackCommandRevision && element.error?.code === 2 &&
+    !playerPauseRequested && props.store.playbackIntent.value === 'playing'
+}
+
+function retainRecoverySource(index: number): boolean {
+  if (recoveryRetainedIndex.value !== undefined) return recoveryRetainedIndex.value === index
+  const deck = audioDecks.value[index]
+  const element = deckElement(index)
+  if (!deck.src || deck.trackId !== props.store.currentTrack.value?.id || !element ||
+    (element.paused && !isNetworkErrorSource(index, element)) || element.ended || nativeInterruptionGeneration === props.store.playbackGeneration.value ||
+    props.store.pendingResumePosition.value === undefined || props.store.playbackIntent.value !== 'playing') return false
+  recoveryRetainedIndex.value = index
+  // Share the existing bounded loading window; a stalled replacement cannot retain a source forever.
+  recoveryRetainTimer = setTimeout(() => releaseRecoverySource(true), HANDOVER_LOADING_LIMIT_MS)
+  return true
+}
+
+function cancelPreroll(): void {
+  const previous = preroll
+  preroll = undefined
+  prerollDeckIndex.value = undefined
+  if (prerollTimer !== undefined) clearTimeout(prerollTimer)
+  prerollTimer = undefined
+  if (previous) {
+    const src = previous.element.getAttribute('src')
+    if (!previous.element.paused && src) expectedPrerollPauses.set(previous.element, { generation: previous.generation, src })
+    previous.element.pause()
+    try { previous.element.currentTime = 0 } catch { /* A failed source is released by its owner. */ }
+  }
+}
+
+/** Native completion may arrive without seeked after a page lifecycle pause. */
+function completePrerollRewind(index: number, seeked = false): boolean {
+  if (prerollRewindIndex.value !== index) return true
+  const element = deckElement(index)
+  if (!element || element.seeking || element.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || (!seeked && element.currentTime > 0.25)) return false
+  prerollRewindIndex.value = undefined
+  syncVolume(props.store.volume.value)
+  return true
+}
+
+function isAppleMobileWebKit(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const userAgent = navigator.userAgent
+  if (!/AppleWebKit\//u.test(userAgent)) return false
+  return /iPad|iPhone|iPod/u.test(userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+}
+
+function maybePreroll(): void {
+  // iPadOS/iOS WebKit can report a completed, buffered standby element as ended
+  // immediately after a volume-zero play request. Keep the URL preloaded, but leave
+  // the standby element paused and let the native ended handoff promote it.
+  if (isAppleMobileWebKit()) return
+  if (document.visibilityState !== 'visible') return
+  // Crossfade and preroll cannot own or rewind the same standby element.
+  if (playerUnmounted || overlap.value || preroll || recoveryRetainedIndex.value !== undefined || handover || props.store.repeatMode.value === 'one' ||
+    props.store.playbackIntent.value !== 'playing' || props.store.status.value !== 'playing' ||
+    nativeInterruptionGeneration === props.store.playbackGeneration.value) return
+  const current = audio.value
+  const prepared = props.store.preparedNext.value
+  if (!current || current.paused || current.ended || current.seeking || !Number.isFinite(current.duration) ||
+    current.duration - current.currentTime <= 0 || current.duration - current.currentTime > PREROLL_LEAD_SECONDS ||
+    !prepared?.armed || !isPreparationFresh(prepared) || rejectedPrerollId === prepared.id) return
+  const index = standbyDeckIndex()
+  const deck = audioDecks.value[index]
+  const element = deckElement(index)
+  if (!element || deck.preparationId !== prepared.id || deck.src !== prepared.playable.url ||
+    element.error || element.seeking || element.readyState < HTMLMediaElement.HAVE_FUTURE_DATA ||
+    !Number.isFinite(element.duration) || element.duration <= PREROLL_LEAD_SECONDS ||
+    element.buffered.length === 0 || element.buffered.start(0) > 0.05 ||
+    element.buffered.end(0) < Math.min(element.duration, 3)) return
+  const candidate = { index, element, preparationId: prepared.id, generation: props.store.playbackGeneration.value }
+  preroll = candidate
+  prerollDeckIndex.value = index
+  prerollTimer = setTimeout(() => {
+    if (preroll !== candidate) return
+    rejectedPrerollId = candidate.preparationId
+    cancelPreroll()
+  }, 3_000)
+  // Chromium may suspend a never-unmuted element in a hidden page. Keep this finite
+  // pre-roll inaudible through its volume, then restore volume only after rewind.
+  element.volume = 0
+  element.muted = false
+  try {
+    if (element.currentTime > 0) element.currentTime = 0
+    recordPlayback('handover.preroll', { gen: candidate.generation, preparationId: prepared.id, deck: index })
+    void element.play().then(() => {
+      // A late fulfilled play must not restart a cancelled or replaced standby.
+      if (preroll !== candidate && audio.value !== element) element.pause()
+    }).catch(() => {
+      if (preroll !== candidate) return
+      rejectedPrerollId = candidate.preparationId
+      cancelPreroll()
+    })
+  } catch {
+    rejectedPrerollId = candidate.preparationId
+    cancelPreroll()
+  }
+}
+
 function syncPreparedDeck(): void {
+  if (playerUnmounted || overlap.value || recoveryRetainedIndex.value !== undefined) return
   const prepared = props.store.preparedNext.value
   const standbyIndex = standbyDeckIndex()
-  // An early speculative resolve does not start a media fetch. The standby URL is assigned only
-  // after the lead-window arm, while the preparation's transient ticket is still fresh.
+  // Only a lead-window arm or an explicit transition resolves the standby URL.
+  // Assign it while the preparation's transient ticket is still fresh.
   if (prepared?.armed && isPreparationFresh(prepared)) {
     assignDeck(standbyIndex, {
       generation: prepared.generation,
@@ -524,30 +1584,78 @@ function syncPreparedDeck(): void {
     })
     return
   }
+  // A retained previous element belongs to the handover check, which releases it.
+  if (audioDecks.value[standbyIndex].retained) return
   if (props.store.preloadPolicy.value === 'none') {
     clearDeck(standbyIndex)
     return
   }
   void nextTick(() => {
+    if (playerUnmounted || overlap.value || recoveryRetainedIndex.value !== undefined) return
     const latest = props.store.preparedNext.value
     // A *stale* preparation must not hold the standby deck open: its URL is no longer usable, so
     // treat it the same as no preparation at all.
     if ((latest?.armed && isPreparationFresh(latest)) || props.store.preloadHandoff.value) return
     const standby = audioDecks.value[standbyDeckIndex()]
+    if (standby.retained) return
     if (props.store.currentTrack.value?.id === standby.trackId && props.store.status.value === 'resolving') return
     clearDeck(standbyDeckIndex())
   })
 }
 
 function syncActiveDeck(): void {
+  clearPlaybackStall()
+  if (resumeSeekTimer !== undefined) { clearTimeout(resumeSeekTimer); resumeSeekTimer = undefined }
   const playable = props.store.playable.value
-  if (playable?.kind !== 'audio') {
-    clearDeck(activeDeckIndex.value)
-    return
-  }
   const generation = props.store.playbackGeneration.value
   const trackId = props.store.currentTrack.value?.id ?? ''
   const handoff = props.store.preloadHandoff.value
+  const mixing = overlap.value
+  if (mixing && !mixing.committing && mixing.generation !== generation) finishOverlap('generation-changed')
+  if (mixing?.committing && playable?.kind !== 'audio' && handoff?.id === mixing.preparationId) return
+  const held = recoveryRetainedIndex.value
+  if (held !== undefined && (audioDecks.value[held].trackId !== trackId ||
+    props.store.playbackIntent.value !== 'playing' || playable?.kind === 'youtube')) releaseRecoverySource()
+  // A track change or any other new generation ends the handover check; a ladder re-resolve
+  // (step b) carries it to the renewed generation.
+  if (handover) {
+    if (handover.trackId !== trackId) endHandover()
+    else if (handover.generation !== generation) {
+      if (handover.step !== 'reResolving') endHandover()
+      else if (playable?.kind === 'audio') handover.generation = generation
+    }
+  }
+  if (playable?.kind !== 'audio') {
+    // A synchronous background adoption briefly clears store.playable. Keep the
+    // existing node/source until the verified next source is published below.
+    if (backgroundHandoff) return
+    const index = activeDeckIndex.value
+    const deck = audioDecks.value[index]
+    if (!handoff && retainRecoverySource(index)) return
+    // An automatic advance to a preparation keeps the element that played the previous track.
+    if (handoff && deck.src && deck.trackId !== handoff.track.id) retainDeck(index)
+    else if (!(handoff && deck.retained)) clearDeck(index)
+    return
+  }
+  const immediate = backgroundHandoff
+  if (immediate && handoff?.id === immediate.preparationId && generation === immediate.generation &&
+    trackId === immediate.trackId && playable.url === handoff.playable.url &&
+    deckElement(immediate.index) === immediate.element) {
+    activeDeckIndex.value = immediate.index
+    prerollRewindIndex.value = undefined
+    assignDeck(immediate.index, { generation, mimeType: playable.mimeType, preload: 'auto', src: playable.url, trackId }, true)
+    // Native events can fire before Vue's next render. Stamp this same element now.
+    immediate.element.dataset.playbackGeneration = String(generation)
+    immediate.element.dataset.trackId = trackId
+    immediate.element.dataset.audioRole = 'active'
+    immediate.element.muted = false
+    syncVolume(props.store.volume.value)
+    props.store.releasePreloadHandoff(generation)
+    clearDeck(1 - immediate.index)
+    recordPlayback('handover.sameElement', { gen: generation, trackId, deck: immediate.index })
+    beginHandover(generation, trackId, -1)
+    return
+  }
   const promotedIndex = handoff && handoff.generation === generation && handoff.track.id === trackId &&
     handoff.playable.url === playable.url
     ? audioDecks.value.findIndex((deck) =>
@@ -555,12 +1663,32 @@ function syncActiveDeck(): void {
     : -1
   if (promotedIndex >= 0) {
     const previousActive = activeDeckIndex.value
+    const warmed = preroll?.index === promotedIndex && preroll.preparationId === handoff?.id ? preroll : undefined
+    preroll = undefined
+    prerollDeckIndex.value = undefined
+    if (prerollTimer !== undefined) clearTimeout(prerollTimer)
+    prerollTimer = undefined
     activeDeckIndex.value = promotedIndex
     assignDeck(promotedIndex, {
       ...audioDecks.value[promotedIndex], generation, preload: 'metadata', preparationId: undefined,
     })
-    if (previousActive !== promotedIndex) clearDeck(previousActive)
+    if (warmed && warmed.element.currentTime > 0) {
+      prerollRewindIndex.value = promotedIndex
+      warmed.element.volume = 0
+      try { warmed.element.currentTime = 0 } catch { prerollRewindIndex.value = undefined }
+    }
+    const retained = previousActive !== promotedIndex && Boolean(audioDecks.value[previousActive].retained)
+    if (previousActive !== promotedIndex && !retained && !overlapDeckAllowed(previousActive)) clearDeck(previousActive)
+    if (overlap.value?.committing && overlap.value.to === promotedIndex) overlap.value.promoted = true
     props.store.releasePreloadHandoff(generation)
+    const promotedElement = deckElement(promotedIndex)
+    startLatency = { generation, startedAt: performance.now() }
+    recordPlayback('preparation.handoff', { preparationId: handoff?.id ?? null, reusedElement: true, ...inspectBuffer(promotedElement) })
+    recordPlayback('handover.promote', {
+      ...describeMediaElement(promotedElement), gen: generation, trackId, fromDeck: previousActive, toDeck: promotedIndex,
+      retained, targetEverPlayed: elementEverPlayed(promotedElement), ...pageLogState(),
+    })
+    beginHandover(generation, trackId, retained ? previousActive : -1)
     return
   }
   const activeIndex = activeDeckIndex.value
@@ -569,12 +1697,15 @@ function syncActiveDeck(): void {
     currentDeck.src === playable.url && currentDeck.trackId === trackId &&
     currentDeck.generation === generation
   ) return
-  const coldIndex = standbyDeckIndex()
+  const coldIndex = recoveryRetainedIndex.value === undefined ? standbyDeckIndex() : 1 - recoveryRetainedIndex.value
   activeDeckIndex.value = coldIndex
   assignDeck(coldIndex, {
-    generation, mimeType: playable.mimeType, preload: 'metadata', src: playable.url, trackId,
+    generation, mimeType: playable.mimeType,
+    preload: props.store.pendingResumePosition.value === undefined ? 'metadata' : 'auto', src: playable.url, trackId,
   })
-  clearDeck(activeIndex)
+  if (activeIndex !== coldIndex && activeIndex !== recoveryRetainedIndex.value) clearDeck(activeIndex)
+  startLatency = { generation, startedAt: performance.now() }
+  recordPlayback('deck.coldLoad', { gen: generation, trackId, fromDeck: activeIndex, toDeck: coldIndex, hadHandoff: Boolean(handoff) })
 }
 
 function activeDeckEvent(index: number, event: Event): boolean {
@@ -587,25 +1718,264 @@ function activeDeckEvent(index: number, event: Event): boolean {
 }
 
 function onDeckPresentation(index: number, event: Event): void {
-  if (activeDeckEvent(index, event)) mediaPresentationHandlers.value.update(event, index)
+  observePreparation(index)
+  if (!activeDeckEvent(index, event)) {
+    if (event.currentTarget === deckElement(index) && ['canplay', 'progress', 'loadedmetadata'].includes(event.type)) maybePreroll()
+    return
+  }
+  if (prerollRewindIndex.value === index && !completePrerollRewind(index, event.type === 'seeked')) return
+  if (event.type === 'seeking') { cancelManualSelection(); finishOverlap('seek'); stopSampling(); cancelPreroll(); clearPlaybackStall() }
+  if ((event.type === 'seeking' || event.type === 'seeked') && event.currentTarget instanceof HTMLAudioElement) {
+    retireMediaRecovery()
+    props.store.reportProgress?.(event.currentTarget.currentTime, props.store.playbackGeneration.value, true)
+  }
+  if (event.type === 'timeupdate' && event.currentTarget instanceof HTMLAudioElement) {
+    const generation = props.store.playbackGeneration.value
+    const elapsed = event.currentTarget.currentTime
+    if (startLatency?.generation === generation && elapsed > 0 && !event.currentTarget.paused) {
+      recordPlayback('preparation.playback-start', { gen: generation, latencyMs: performance.now() - startLatency.startedAt })
+      startLatency = undefined
+    }
+    if (!event.currentTarget.seeking) props.store.reportProgress?.(elapsed, generation)
+    const sampleAt = performance.now()
+    if (sampleAt - lastProgressSampleAt >= PROGRESS_SAMPLE_INTERVAL_MS) {
+      lastProgressSampleAt = sampleAt
+      recordPlayback('media.progress', { ...describeMediaElement(event.currentTarget), gen: generation })
+    }
+    // Progress past the start position ends the handover check (P96-06).
+    if (handoverActive(handover, generation) && elapsed > handover.startPosition) endHandover()
+    // Playing again after an automatic resume (task 41): nothing left to retry.
+    if (autoResume?.generation === generation && props.store.status.value === 'playing' && !event.currentTarget.seeking) {
+      cancelAutoResume('progress')
+    }
+  }
+  mediaPresentationHandlers.value.update(event, index)
+  if (event.type === 'seeked' && ['playing', 'buffering'].includes(props.store.status.value)) schedulePlaybackStall(PLAYBACK_STALL_FALLBACK_MS)
+  maybePreroll()
 }
 
 function onDeckState(index: number, event: Event, state: PlaybackMediaState): void {
+  const element = event.currentTarget
+  // A queued pause from the ended source may arrive after this same element has
+  // started its replacement. A real native/user pause still has paused=true.
+  if (state === 'paused' && backgroundStartedGeneration === props.store.playbackGeneration.value &&
+    activeDeckEvent(index, event) && element instanceof HTMLAudioElement && !element.paused) return
+  if (state === 'paused' && element instanceof HTMLAudioElement) {
+    const expected = expectedPrerollPauses.get(element)
+    expectedPrerollPauses.delete(element)
+    if (expected && element === deckElement(index) && element.getAttribute('src') === expected.src &&
+      audioDecks.value[index].generation >= expected.generation && audioDecks.value[index].generation <= expected.generation + 1) return
+  }
+  if (preroll?.index === index && preroll.element === element) return
+  if (activeDeckEvent(index, event) && state === 'paused' && element instanceof HTMLAudioElement && !element.ended) cancelPreroll()
+  if (state === 'paused' && element instanceof HTMLAudioElement && element === deckElement(index) &&
+    isNetworkErrorSource(index, element)) {
+    const source = networkErrorSources.get(element)!
+    if (!source.pauseObserved) {
+      source.pauseObserved = true
+      // Keep the existing native session until replacement playing. A second pause is an
+      // interruption, and explicit player commands invalidate this lease independently.
+      props.store.reportMediaState('buffering', props.store.playbackGeneration.value)
+      return
+    }
+  }
+  if (state === 'paused' && element instanceof HTMLAudioElement && !element.ended &&
+    (activeDeckEvent(index, event) || (index === recoveryRetainedIndex.value && element === deckElement(index)))) {
+    // An initial load failure also emits pause before metadata, with no playing source to
+    // retain. Keep its existing provider fallback; only a distinct interruption cancels it.
+    if (activeMediaRecovery && (!element.error || networkErrorSources.get(element)?.pauseObserved)) {
+      activeMediaRecovery.cancelled = true
+    }
+  }
   if (!activeDeckEvent(index, event)) {
+    if (overlapDeckAllowed(index)) {
+      if (state === 'paused' && !(event.currentTarget as HTMLAudioElement).ended) pauseMedia()
+      else if (state === 'ended' || state === 'buffering') finishOverlap('outgoing-' + state)
+      return
+    }
+    if (index === recoveryRetainedIndex.value && event.currentTarget === deckElement(index)) {
+      if (state === 'paused' && event.currentTarget instanceof HTMLAudioElement && !event.currentTarget.ended) {
+        const generation = props.store.playbackGeneration.value
+        nativeInterruptionGeneration = generation
+        lastPauseOrigin = { origin: 'native', generation }
+        clearPlaybackStall()
+        if (resumeSeekTimer !== undefined) clearTimeout(resumeSeekTimer)
+        resumeSeekTimer = undefined
+        releaseRecoverySource()
+        audio.value?.pause()
+        props.store.reportMediaState('paused', generation)
+      } else if (state === 'ended') releaseRecoverySource()
+      return
+    }
     if (state === 'playing' && event.currentTarget instanceof HTMLAudioElement) event.currentTarget.pause()
     return
   }
-  if (state === 'ended') mediaStateHandlers.value.ended()
-  else mediaStateHandlers.value[state]()
+  if (state === 'playing' && props.store.playbackIntent.value !== 'playing') {
+    audio.value?.pause()
+    return
+  }
+  if (state === 'playing') { releaseRecoverySource(true); nativeInterruptionGeneration = undefined; lastPauseOrigin = undefined; playerPauseRequested = false }
+  if (state === 'ended') { clearPlaybackStall(); mediaStateHandlers.value.ended() }
+  else {
+    mediaStateHandlers.value[state]()
+    if (state === 'buffering' && props.store.playbackIntent.value === 'playing') {
+      schedulePlaybackStall(PLAYBACK_STALL_FALLBACK_MS)
+    }
+    else if (state === 'playing') { clearPlaybackStall(); schedulePlaybackStall(PLAYBACK_STALL_FALLBACK_MS) }
+    else if (state === 'paused') {
+      cancelManualSelection()
+      finishOverlap('native-pause')
+      stopSampling()
+      clearPlaybackStall()
+      // A native or OS pause is honoured: no ladder step and no notice.
+      endHandover()
+      if (resumeSeekTimer !== undefined) { clearTimeout(resumeSeekTimer); resumeSeekTimer = undefined }
+      if (!audio.value?.ended) {
+        nativeInterruptionGeneration = props.store.playbackGeneration.value
+        lastPauseOrigin = { origin: playerPauseRequested ? 'player' : 'native', generation: props.store.playbackGeneration.value }
+      }
+      playerPauseRequested = false
+    }
+  }
 }
 
 function onDeckPlay(index: number, event: Event): void {
+  if (preroll?.index === index && preroll.element === event.currentTarget) return
+  if (index === recoveryRetainedIndex.value && event.currentTarget === deckElement(index)) return
   if (activeDeckEvent(index, event)) nativePlayCommandHandler.value()
-  else if (event.currentTarget instanceof HTMLAudioElement) event.currentTarget.pause()
+  else if (!overlapDeckAllowed(index) && event.currentTarget instanceof HTMLAudioElement) event.currentTarget.pause()
 }
 
 function onDeckError(index: number, event: Event): void {
-  if (activeDeckEvent(index, event)) void playbackFailureHandler.value()
+  if (activeDeckEvent(index, event)) cancelPreroll()
+  if (preroll?.index === index && preroll.element === event.currentTarget) cancelPreroll()
+  const mediaError = event.currentTarget instanceof HTMLMediaElement ? event.currentTarget.error : null
+  const preparationId = audioDecks.value[index].preparationId
+  if (overlapDeckAllowed(index)) {
+    const wasActive = activeDeckEvent(index, event)
+    if (mediaError) finishOverlap('media-error')
+    if (!wasActive || !mediaError) return
+  }
+  if (!activeDeckEvent(index, event)) {
+    if (mediaError && preparationId !== undefined && event.currentTarget === deckElement(index)) {
+      props.store.rejectNextPreparation(preparationId)
+      recordPlayback('preparation.media-failed', { preparationId })
+    }
+    return
+  }
+  // After a native pause only an event whose element carries a MediaError is a failure;
+  // an error-less event in that state stays ignored.
+  if (nativeInterruptionGeneration === props.store.playbackGeneration.value && !mediaError) return
+  const element = event.currentTarget
+  const knownFailure = element instanceof HTMLAudioElement ? networkErrorSources.get(element) : undefined
+  // An interrupted, already-observed network failure stays cancelled when a duplicate error
+  // arrives after its resolver settled. A new listener Play clears the interruption explicitly.
+  if (knownFailure?.generation === props.store.playbackGeneration.value && knownFailure.pauseObserved &&
+    nativeInterruptionGeneration === props.store.playbackGeneration.value) return
+  if (mediaError?.code === 2 && element instanceof HTMLAudioElement &&
+    element.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+    nativeInterruptionGeneration !== props.store.playbackGeneration.value && !playerPauseRequested &&
+    props.store.playbackIntent.value === 'playing' && ['playing', 'buffering'].includes(props.store.status.value) &&
+    !networkErrorSources.has(element)) {
+    networkErrorSources.set(element, {
+      generation: props.store.playbackGeneration.value, commandRevision: playbackCommandRevision, pauseObserved: false,
+    })
+  }
+  void recoverMediaFailure(props.store.activeProviderId.value, props.store.playbackGeneration.value)
+}
+
+/** Keep store cancellation from becoming a failed renewal in the awaiting view callback. */
+function retireMediaRecovery(): void {
+  mediaOperationRevision += 1
+  if (activeMediaRecovery) {
+    activeMediaRecovery.retired = true
+    activeMediaRecovery.cancelled = true
+  }
+}
+
+/** One load failure may produce several events before its same-track renewal has settled. */
+function recoverMediaFailure(
+  providerId: string | undefined,
+  generation: number,
+  stillNeeded?: () => boolean,
+): Promise<void> {
+  if (playerUnmounted || generation !== props.store.playbackGeneration.value || providerId !== props.store.activeProviderId.value) {
+    return Promise.resolve()
+  }
+  // A retired command cannot own a new load failure; its late result remains cancelled.
+  if (activeMediaRecovery?.generation === generation && activeMediaRecovery.providerId === providerId &&
+    !activeMediaRecovery.retired) {
+    recordPlayback('media.recovery.join', { gen: generation, providerId: providerId ?? null })
+    const pending = activeMediaRecovery
+    // A real load failure must outlive the progress guard of an earlier stall. If the stall
+    // renews successfully its new generation makes this follow-up stale; otherwise retry the
+    // error path once, sharing it with any overlapping error or play rejection.
+    return !stillNeeded && pending.stillNeeded
+      ? pending.promise.then(() => {
+          const stillAllowed = () => !playerUnmounted && !pending.cancelled && pending.commandRevision === playbackCommandRevision &&
+            pending.operationRevision === mediaOperationRevision &&
+            nativeInterruptionGeneration !== generation && props.store.playbackIntent.value === 'playing'
+          if (stillAllowed()) return recoverMediaFailure(providerId, generation, stillAllowed)
+        })
+      : pending.promise
+  }
+  const recovery: ActiveMediaRecovery = {
+    startedDuringHandover: handoverActive(handover, generation) || props.store.awaitingStart?.value?.generation === generation,
+    commandRevision: playbackCommandRevision, operationRevision: mediaOperationRevision, cancelled: false, retired: false, generation, providerId, stillNeeded,
+    promise: Promise.resolve().then(() => handleDeckError(providerId, generation,
+      () => !playerUnmounted && !recovery.cancelled && recovery.commandRevision === playbackCommandRevision &&
+        recovery.operationRevision === mediaOperationRevision &&
+        props.store.playbackIntent.value === 'playing' && (stillNeeded?.() ?? true), Boolean(stillNeeded))).finally(() => {
+      if (activeMediaRecovery !== recovery) return
+      activeMediaRecovery = undefined
+      // Progress and waiting events while the resolve was pending could not arm the watchdog.
+      if (stillNeeded && generation === props.store.playbackGeneration.value &&
+        !stillNeeded() && !audio.value?.paused && !audio.value?.seeking) {
+        schedulePlaybackStall(PLAYBACK_STALL_FALLBACK_MS)
+      }
+    }),
+  }
+  activeMediaRecovery = recovery
+  recordPlayback('media.recovery.begin', { gen: generation, providerId: providerId ?? null })
+  return recovery.promise
+}
+
+/**
+ * A media error is first treated as an expired or interrupted URL: the same provider is asked for
+ * a fresh one at the same position (see `renewMedia`). A stalled stream uses the same bounded
+ * path, with a guard that discards a late result once playback resumes or is interrupted.
+ * Failed renewal tries the remaining automatic providers before any skip.
+ */
+async function handleDeckError(
+  providerId: string | undefined,
+  generation: number,
+  stillNeeded: () => boolean = () => true,
+  stalled = false,
+): Promise<void> {
+  if (generation !== props.store.playbackGeneration.value || providerId !== props.store.activeProviderId.value || !stillNeeded()) return
+  clearPlaybackStall()
+  if (stalled && providerId && props.store.requestSourceRecovery) {
+    const element = audio.value
+    if (!element) return
+    pauseIfHalted(await props.store.requestSourceRecovery(providerId, generation, element.currentTime, stillNeeded), generation)
+    return
+  }
+  const starting = handoverActive(handover, generation) ? handover : undefined
+  if (starting) { clearHandoverWatchdog(); starting.step = 'reResolving' }
+  const renewed = providerId && await props.store.renewMedia(providerId, generation, stillNeeded)
+  if (!stillNeeded()) return
+  if (starting && starting === handover) {
+    if (renewed) {
+      starting.generation = props.store.playbackGeneration.value
+      starting.step = 'reResolved'
+      armHandoverWatchdog()
+      return
+    }
+    endHandover()
+  }
+  if (renewed) return
+  if (generation !== props.store.playbackGeneration.value || !stillNeeded()) return
+  pauseIfHalted(await reportFailure(providerId, generation), generation)
 }
 
 function updateBufferState(element: HTMLAudioElement): void {
@@ -626,23 +1996,58 @@ function resetBufferState(): void {
   bufferedRawRanges.value = []
 }
 
-function updateMediaPresentation(element: HTMLAudioElement): void {
+function updateMediaPresentation(element: HTMLAudioElement, allowTransition = true): void {
+  if (prerollRewindIndex.value === activeDeckIndex.value && element === deckElement(activeDeckIndex.value) && !completePrerollRewind(activeDeckIndex.value)) return
   duration.value = Number.isFinite(element.duration) && element.duration > 0 ? element.duration : 0
   seekable.value = element.seekable.length > 0
   const elapsed = Number.isFinite(element.currentTime) ? Math.max(0, element.currentTime) : 0
   currentTime.value = duration.value > 0 ? Math.min(elapsed, duration.value) : elapsed
+  const pendingResume = props.store.pendingResumePosition.value
+  if (
+    pendingResume !== undefined &&
+    element.dataset.playbackGeneration === String(props.store.playbackGeneration.value)
+  ) {
+    const target = duration.value > 0 ? Math.min(pendingResume, duration.value) : pendingResume
+    if (element.seeking) return
+    if (Math.abs(element.currentTime - target) <= 1) {
+      if (resumeSeekTimer !== undefined) { clearTimeout(resumeSeekTimer); resumeSeekTimer = undefined }
+      props.store.consumePendingResumePosition()
+      if (props.store.playbackIntent.value === 'playing') void play(props.store.playbackGeneration.value, props.store.activeProviderId.value, false)
+    } else {
+      const ranges = element.seekable
+      for (let i = 0; i < ranges.length; i++) {
+        if (target >= ranges.start(i) && target <= ranges.end(i)) {
+          try { element.currentTime = target } catch { /* Retry on the next readiness event. */ }
+          break
+        }
+      }
+      return
+    }
+  }
+  if (Math.abs(currentTime.value - lastObservedPosition) >= 0.25) {
+    lastObservedPosition = currentTime.value
+    clearPlaybackStall()
+    if (props.store.status.value === 'playing' || props.store.status.value === 'buffering') schedulePlaybackStall(PLAYBACK_STALL_FALLBACK_MS)
+  }
+  if (!allowTransition) return
+  observeEnergy(element)
   armNextTrackIfDue()
+  if (manualPreparation === undefined && !element.seeking && props.store.transitionMode.value !== 'off' && props.store.repeatMode.value !== 'one' && duration.value > 0 &&
+      duration.value - currentTime.value <= plannedTransition().durationSeconds) {
+    void tryCrossfade(props.store.nextPreparationIndex.value)
+  }
 }
 
 /**
  * Ask the store to prepare the next track once the active track is inside the preload lead window.
  *
  * Driven from media progress rather than from the track change, because the resolved media URL
- * carries a ticket with a 30 second lifetime: resolving at the start of a multi-minute track would
+ * carries a ticket with a 120 second lifetime: resolving at the start of a multi-minute track would
  * produce a URL that has already expired by the time the track is promoted. `armNextPreparation` is
  * a no-op while a fresh preparation exists, so calling it on every progress tick is cheap.
  */
 function armNextTrackIfDue(): void {
+  if (manualPreparation !== undefined || overlap.value) return
   if (duration.value <= 0) return
   if (duration.value - currentTime.value > NEXT_TRACK_PRELOAD_LEAD_SECONDS) return
   void props.store.armNextPreparation()
@@ -672,7 +2077,10 @@ const mediaPresentationHandlers = computed(() => {
     const element = currentMedia()
     if (!element || !canSeek.value) return
     if (!Number.isFinite(value)) return
-    updateMediaPresentation(element)
+    cancelManualSelection()
+    finishOverlap('seek')
+    stopSampling()
+    updateMediaPresentation(element, false)
     if (!canSeek.value) return
     updateBufferState(element)
     try {
@@ -686,7 +2094,9 @@ const mediaPresentationHandlers = computed(() => {
         if (Math.abs(candidate - target) < distance) { nearest = candidate; distance = Math.abs(candidate - target) }
       }
       element.currentTime = nearest
-      updateMediaPresentation(element)
+      retireMediaRecovery()
+      props.store.reportProgress?.(nearest, generation, true)
+      updateMediaPresentation(element, false)
     } catch {
       // A source may lose seekability between metadata and this user command.
       // Do not fabricate elapsed time or treat an unavailable seek as provider failure.
@@ -720,12 +2130,19 @@ watch(
   () => { currentTime.value = 0; duration.value = 0; seekable.value = false; resetBufferState() },
 )
 
-async function reportFailure(providerId?: string, generation = props.store.playbackGeneration.value): Promise<void> {
-  if (providerId) await props.store.reportPlaybackFailure(providerId, generation)
+async function reportFailure(providerId?: string, generation = props.store.playbackGeneration.value): Promise<FailureOutcome> {
+  return providerId ? await props.store.reportPlaybackFailure(providerId, generation) : 'stale'
 }
 
 function syncVolume(volume: number): void {
-  if (audio.value) audio.value.volume = volume
+  if (overlap.value) { applyOverlapVolume(); return }
+  for (let index = 0; index < audioDecks.value.length; index++) {
+    const element = deckElement(index)
+    if (!element) continue
+    const audible = (index === activeDeckIndex.value || index === recoveryRetainedIndex.value) &&
+      index !== prerollRewindIndex.value
+    element.volume = audible ? volume : 0
+  }
   youtube.value?.setVolume(volume)
 }
 
@@ -738,11 +2155,40 @@ function reportMediaState(state: PlaybackMediaState, generation: number): void {
   props.store.reportMediaState(state, generation)
 }
 
+function tryBackgroundHandoff(generation: number): boolean {
+  if (document.visibilityState !== 'hidden' || props.store.repeatMode.value === 'one' ||
+    nativeInterruptionGeneration === generation || recoveryRetainedIndex.value !== undefined) return false
+  const element = audio.value
+  const prepared = props.store.preparedNext.value
+  if (!element?.ended || !prepared?.armed || props.store.playbackIntent.value !== 'playing') return false
+  const pending = { index: activeDeckIndex.value, element, preparationId: prepared.id,
+    generation: generation + 1, trackId: prepared.track.id }
+  backgroundHandoff = pending
+  let advanced = false
+  try { advanced = props.store.tryAdvancePreparedAfterEnded(generation) }
+  finally { backgroundHandoff = undefined }
+  if (!advanced) return false
+  invalidateInterruptionOwnership(true, true)
+  backgroundStartedGeneration = props.store.playbackGeneration.value
+  // No timer or nextTick before the actual native play request.
+  void play(backgroundStartedGeneration, props.store.activeProviderId.value, false)
+  return true
+}
+
 function handleMediaEnded(generation: number): void {
+  finishOverlap('ended')
   if (generation !== props.store.playbackGeneration.value) return
+  recordPlayback('advance.auto', {
+    gen: generation, trackId: props.store.currentTrack.value?.id ?? null, repeatMode: props.store.repeatMode.value,
+    index: props.store.currentIndex.value, length: props.store.queue.value.length, ...pageLogState(),
+  })
+  if (tryBackgroundHandoff(generation)) return
   if (props.store.repeatMode.value === 'off') {
-    if (props.store.currentIndex.value + 1 >= props.store.queue.value.length) reportMediaState('ended', generation)
-    else { invalidateInterruptionOwnership(); void props.store.next() }
+    if (props.store.currentIndex.value + 1 >= props.store.queue.value.length) {
+      reportMediaState('ended', generation)
+      props.store.pause()
+    }
+    else { invalidateInterruptionOwnership(true, true); void props.store.next() }
     return
   }
   if (props.store.repeatMode.value === 'one') {
@@ -750,12 +2196,18 @@ function handleMediaEnded(generation: number): void {
     // A fully buffered deck can replay without minting a new transient media ticket.
     if (element && Number.isFinite(element.duration) && element.duration > 0 &&
       element.buffered.length === 1 && element.buffered.start(0) <= 0.05 && element.buffered.end(0) >= element.duration - 0.25) {
+      reportMediaState('ended', generation)
+      if (props.store.playbackIntent.value !== 'playing' || nativeInterruptionGeneration === generation) return
+      void props.store.play()
       element.currentTime = 0
-      void element.play().catch(() => { void props.store.advanceAfterEnded() })
+      void element.play().catch((error: unknown) => {
+        recordPlayback('play.rejected', { gen: generation, site: 'repeatOne', name: error instanceof Error ? error.name : typeof error })
+        void props.store.advanceAfterEnded()
+      })
       return
     }
   }
-  invalidateInterruptionOwnership()
+  invalidateInterruptionOwnership(true, true)
   void props.store.advanceAfterEnded()
 }
 
@@ -766,8 +2218,16 @@ function reportNativePlayCommand(generation: number): void {
   ) invalidateInterruptionOwnership()
 }
 
+watch(() => props.store.transitionMode.value, () => { cancelManualSelection(); finishOverlap('setting'); stopSampling() })
+watch(() => props.store.playbackIntent.value, intent => {
+  if (intent === 'paused') {
+    // Also covers store.pause() callers outside this view, including a synchronous Pause/Play.
+    retireMediaRecovery()
+    cancelManualSelection(); finishOverlap('intent-pause'); stopSampling()
+  }
+}, { flush: 'sync' })
 watch(
-  () => props.store.preparedNext.value,
+  () => [props.store.preparedNext.value, props.store.preloadPolicy.value] as const,
   syncPreparedDeck,
   { flush: 'sync', immediate: true },
 )
@@ -783,6 +2243,17 @@ watch(
 )
 
 watch(
+  () => [props.store.playbackIntent.value, props.store.status.value] as const,
+  ([intent, status]) => {
+    if (intent !== 'playing' || ['error', 'idle'].includes(status) || (status === 'paused' && !audio.value?.ended)) cancelPreroll()
+    if (recoveryRetainedIndex.value !== undefined && (intent !== 'playing' || ['paused', 'error', 'ended', 'idle'].includes(status))) {
+      releaseRecoverySource()
+      audio.value?.pause()
+    }
+  },
+  { flush: 'sync' },
+)
+watch(
   () => props.store.volume.value,
   (volume) => {
     if (volume > 0) lastAudibleVolume.value = volume
@@ -792,6 +2263,7 @@ watch(
 )
 // The volume watcher runs before template refs exist on an initial mount.
 watch(audio, (element) => {
+  if (samplingElement && samplingElement !== element) stopSampling()
   if (element) {
     syncVolume(props.store.volume.value)
     // A promoted deck already delivered metadata while it was standby. Observe
@@ -813,9 +2285,10 @@ watch(
       observedPlayable !== props.store.playable.value ||
       generation !== props.store.playbackGeneration.value
     ) return
+    if (generation === backgroundStartedGeneration) return
     if (audio.value) {
       syncVolume(props.store.volume.value)
-      if (props.store.playbackIntent.value === 'playing') await play(generation, providerId)
+      if (props.store.playbackIntent.value === 'playing' && !overlap.value?.promoted) await play(generation, providerId, false)
     }
   },
 )
@@ -899,11 +2372,21 @@ const youtubeStateHandler = computed(() => {
       return
     }
     if (mediaState === 'ended') handleMediaEnded(generation)
-    else if (mediaState) reportMediaState(mediaState, generation)
+    else if (mediaState) {
+      if (generation === props.store.playbackGeneration.value) {
+        if (mediaState === 'playing' && props.store.playbackIntent.value !== 'playing') void props.store.play()
+        if (mediaState === 'paused' && props.store.playbackIntent.value !== 'paused') props.store.pause()
+      }
+      reportMediaState(mediaState, generation)
+    }
   }
 })
 
 onMounted(() => {
+  uninstallPlaybackLogLifecycle = installPlaybackLogLifecycle()
+  instrumentDeckElements()
+  observeDeckLoadActivity()
+  installAutoResumeListeners()
   const commands: PlayerCommands = {
     isPlaying: () => props.store.playbackIntent.value === 'playing' || resumeAfterSuspension,
     pause,
@@ -920,12 +2403,33 @@ onMounted(() => {
   unregisterPlayerCommands = registerPlayerCommands(commands)
   unregisterMediaSession = registerPlaybackMediaSession(props.store, commands, () => currentTrackLabel.value)
   updateConnectivity()
+  document.addEventListener('visibilitychange', onTransitionVisibility)
   window.addEventListener('online', updateConnectivity)
   window.addEventListener('offline', updateConnectivity)
   connection()?.addEventListener?.('change', updateConnectivity)
 })
 
+onUpdated(() => {
+  instrumentDeckElements()
+  observeDeckLoadActivity()
+})
+
 onBeforeUnmount(() => {
+  playerUnmounted = true
+  finishOverlap('unmount')
+  stopSampling()
+  cancelManualSelection()
+  document.removeEventListener('visibilitychange', onTransitionVisibility)
+  cancelPreroll()
+  uninstallPlaybackLogLifecycle?.()
+  uninstallPlaybackLogLifecycle = undefined
+  uninstallAutoResumeListeners()
+  cancelAutoResume('unmount')
+  clearPlaybackStall()
+  clearHandoverWatchdog()
+  handover = undefined
+  if (resumeSeekTimer !== undefined) clearTimeout(resumeSeekTimer)
+  releaseRecoverySource()
   for (const element of audioDeckElements.value) {
     element.pause()
     element.removeAttribute('src')
@@ -943,9 +2447,12 @@ onBeforeUnmount(() => {
 
 <template>
   <section
+    ref="glassHeroRoot"
     class="player-bar liquid-shell"
+    data-glass-hero="player"
     :class="{ 'player-bar--compact': compact, 'player-bar--collapsed': collapsed }"
     :data-player-compact="compact ? '' : undefined"
+    :data-transition-active="overlap ? 'true' : 'false'"
     :data-media-suspended="mediaSuspended ? 'true' : 'false'"
     :inert="mediaSuspended || undefined"
     :aria-hidden="mediaSuspended ? 'true' : undefined"
@@ -959,6 +2466,8 @@ onBeforeUnmount(() => {
           <img
             v-if="hasArtwork && artworkUrl"
             data-player-artwork-image
+            :key="artworkIdentity"
+            :data-artwork-identity="artworkIdentity"
             class="player-bar__artwork-image"
             :src="artworkUrl"
             :alt="artworkAlt"
@@ -1009,6 +2518,18 @@ onBeforeUnmount(() => {
 
     <div class="player-bar__body">
       <p class="player-bar__status" role="status" :aria-label="text('player.statusName')" aria-live="polite">{{ statusText }}</p>
+      <ul class="player-bar__notices" data-player-notices aria-live="polite" :aria-label="text('player.notice.region')">
+        <li v-for="notice in playbackNoticeItems" :key="notice.id" :data-player-notice="notice.kind">
+          <span>{{ notice.message }}</span>
+          <button
+            v-if="notice.kind === 'tapToResume'"
+            type="button"
+            data-player-notice-resume
+            @click="resumeFromListener"
+          >{{ text('player.notice.resume') }}</button>
+          <button type="button" :aria-label="text('player.notice.dismiss')" @click="dismissPlaybackNotice(notice.id)">×</button>
+        </li>
+      </ul>
 
       <div v-show="!collapsed" class="player-bar__video-container">
         <YouTubePlayer
@@ -1024,16 +2545,16 @@ onBeforeUnmount(() => {
       </div>
       <template v-for="(deck, deckIndex) in audioDecks" :key="deckIndex">
         <audio
-          v-if="deck.src"
+          v-if="deck.src || deck.retained"
           v-show="false"
           ref="audioDeckElements"
           :data-audio-deck="deckIndex"
-          :data-audio-role="deckIndex === activeDeckIndex ? 'active' : 'standby'"
-          :muted="deckIndex !== activeDeckIndex"
+          :data-audio-role="deckIndex === activeDeckIndex ? 'active' : deck.retained || deckIndex === recoveryRetainedIndex ? 'retained' : 'standby'"
+          :muted="deckIndex !== activeDeckIndex && deckIndex !== recoveryRetainedIndex && deckIndex !== prerollDeckIndex && !overlapDeckAllowed(deckIndex)"
           :data-playback-generation="deck.generation"
           :data-track-id="deck.trackId"
           :preload="deck.preload"
-          :src="deck.src"
+          v-audio-source="deck.src || undefined"
           :type="deck.mimeType"
           @loadedmetadata="onDeckPresentation(deckIndex, $event)"
           @durationchange="onDeckPresentation(deckIndex, $event)"
@@ -1047,6 +2568,7 @@ onBeforeUnmount(() => {
           @playing="onDeckState(deckIndex, $event, 'playing')"
           @pause="onDeckState(deckIndex, $event, 'paused')"
           @waiting="onDeckState(deckIndex, $event, 'buffering')"
+          @stalled="onDeckState(deckIndex, $event, 'buffering')"
           @ended="onDeckState(deckIndex, $event, 'ended')"
           @error="onDeckError(deckIndex, $event)"
         ></audio>
@@ -1109,10 +2631,13 @@ onBeforeUnmount(() => {
             type="button"
             class="player-bar__play"
             data-player-play
-            :aria-label="text(store.playbackIntent.value === 'playing' ? 'player.pause' : 'player.play')"
+            :aria-label="text(transportStarting ? 'player.transport.starting' : transportPlaying ? 'player.pause' : 'player.play')"
+            :aria-busy="transportStarting ? 'true' : undefined"
+            :data-player-starting="transportStarting ? '' : undefined"
             @click="toggle"
           >
-            <Pause v-if="store.playbackIntent.value === 'playing'" :size="24" aria-hidden="true" />
+            <LoaderCircle v-if="transportStarting" class="player-bar__starting" :size="24" aria-hidden="true" />
+            <Pause v-else-if="transportPlaying" :size="24" aria-hidden="true" />
             <Play v-else :size="24" aria-hidden="true" />
           </button>
           <button
@@ -1208,6 +2733,13 @@ onBeforeUnmount(() => {
 .player-bar__heading .player-bar__release { margin-top: 0.25rem; color: var(--colour-text-muted); font-size: 0.75rem; }
 .player-bar__heading label { display: grid; gap: 0.25rem; }
 .player-bar__status { color: var(--colour-accent-strong); font-size: 0.875rem; line-height: 1.5; }
+.player-bar__notices { margin: 0; padding: 0; list-style: none; font-size: 0.8125rem; line-height: 1.4; }
+.player-bar__notices:empty { display: none; }
+.player-bar__notices li { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.player-bar__notices button { min-width: 2rem; min-height: 2rem; border: 0; background: none; color: inherit; cursor: pointer; }
+.player-bar__starting { animation: player-bar-starting 1s linear infinite; }
+@keyframes player-bar-starting { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .player-bar__starting { animation: none; } }
 select { min-height: 2.5rem; padding: 0.4375rem 0.625rem; color: var(--colour-text-primary); background: var(--colour-surface-opaque); border: var(--glass-border); border-radius: 0.5rem; cursor: pointer; transition: filter var(--motion-duration) ease; }
 select:hover { filter: var(--control-hover-filter); }
 select:active { filter: var(--control-active-filter); }

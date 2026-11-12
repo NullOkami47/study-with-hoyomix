@@ -25,8 +25,24 @@ import { resetAccountSession } from '../account/session'
 import type { SettingsSectionId } from './sections'
 import { PREFERENCES_STORAGE_KEY, usePreferences } from '../../stores/preferences'
 import SettingsSheet from './SettingsSheet.vue'
+import { computed, nextTick } from 'vue'
+import { glassEnvironment, REFRACTION_ENABLED, resolveGlassEnvironment, type GlassProbe } from '../glass/glassEnvironment'
+import { reloadRefractionPreference } from '../glass/refractionPreference'
 
 const cleanups: Array<() => void> = []
+// The refraction switch exists only while the build gate is on. The gate is a compile-time
+// constant, so these tests open it explicitly; one test checks the shipped value.
+const refractionGate = vi.hoisted(() => ({ open: false }))
+vi.mock('../glass/glassEnvironment', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../glass/glassEnvironment')>()
+  return {
+    ...actual,
+    useGlassRefractionSetting: () => {
+      const setting = actual.useGlassRefractionSetting()
+      return refractionGate.open ? { ...setting, visible: computed(() => actual.glassEnvironment.value !== null) } : setting
+    },
+  }
+})
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -64,12 +80,13 @@ function mountSettings(
   // The Control Center renders one category at a time, so a section list is how a test
   // reproduces what a user actually sees. Omitted means every section, as before.
   sections?: SettingsSectionId[],
+  visualStyle: 'cinematic' | 'studio' = 'cinematic',
 ) {
   const preferences = usePreferences()
   preferences.setLocale('en')
   preferences.setLowPower(false)
   preferences.setBackgroundMode('ambient')
-  preferences.setVisualStyle('cinematic')
+  preferences.setVisualStyle(visualStyle)
   preferences.setStudioBlur(16)
   preferences.setStudyTipsEnabled(true)
   let currentTime = 0
@@ -151,6 +168,7 @@ const allProvidersEnabled = (): PublicProviderState[] => ([
   { id: 'chksz', available: true, enabled: true, automaticEligible: true, priority: 10 },
   { id: 'lx', available: true, enabled: true, automaticEligible: true, priority: 20 },
   { id: 'jellyfin', available: true, enabled: true, automaticEligible: true, priority: 30 },
+  { id: 'gd-studio', available: true, enabled: true, automaticEligible: true, priority: 40 },
 ])
 
 /** The same state with LX turned off by the administrator, as `enabled: false`. */
@@ -338,7 +356,7 @@ describe('SettingsSheet', () => {
     const about = wrapper.get('[data-settings-section="about"]')
     expect(about.get('h3').text()).toBe('About this project')
     expect(about.findAll('h4').map((heading) => heading.text()))
-      .toEqual(['Licence', 'Source and attribution', 'Music and artwork'])
+      .toEqual(['Debug log', 'Licence', 'Source and attribution', 'Music and artwork'])
     expect(about.get('[data-about-licence]').text()).toContain('GPL-3.0')
     expect(about.get('[data-about-lineage]').text()).toContain('StudyWithMiku')
     expect(about.get('[data-about-liquid-glass]').text()).toContain('MIT License')
@@ -360,7 +378,10 @@ describe('SettingsSheet', () => {
     const privacy = wrapper.get('[data-settings-section="privacy"]')
     expect(privacy.get('h3').text()).toBe('Privacy')
     expect(privacy.findAll('h4').map((heading) => heading.text()))
-      .toEqual(['On this device', 'Signing in', 'Automatic synchronisation', 'Music providers', 'Your data', 'Analytics and service logs'])
+      .toEqual(['On this device', 'Signing in', 'Automatic synchronisation', 'Music providers', 'Community Chat', 'Your data', 'Analytics and service logs'])
+    expect(privacy.get('[data-privacy-chat]').text()).toContain('10,000')
+    expect(privacy.get('[data-privacy-chat-location]').text()).toContain('raw IP')
+    expect(privacy.get('[data-privacy-chat-moderation]').text()).toContain('versions')
     expect(privacy.get('[data-privacy-account]').text()).toContain('public email')
     expect(privacy.get('[data-privacy-session]').text()).toContain('90 days')
     expect(privacy.get('[data-privacy-provider-key]').text()).toContain('never synced to your account')
@@ -496,11 +517,11 @@ describe('SettingsSheet', () => {
     const allAvailable = allProvidersEnabled
 
     const RETIRED_PROVIDER_IDS = [
-      'r2', 'meting', 'piped', 'invidious', 'gd-studio', 'qijie', 'huanyin',
+      'r2', 'meting', 'piped', 'invidious', 'qijie', 'huanyin',
       'lx-huibq', 'lx-ikun', 'lx-juhe', 'lx-qdy', 'lx-flower', 'lx-lx', 'lx-grass', 'lx-sixyin',
     ]
 
-    it('lists exactly the three top-level providers in canonical automatic order', async () => {
+    it('lists independent providers with Vkeys after the existing providers', async () => {
       const { wrapper } = mountSettings(undefined, undefined, {
         providerStates: allAvailable(),
       })
@@ -508,9 +529,9 @@ describe('SettingsSheet', () => {
 
       const rows = wrapper.findAll('[data-settings-source]')
       expect(rows.map((row) => row.attributes('data-settings-source')))
-        .toEqual(['chksz', 'lx', 'jellyfin'])
+        .toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
       expect(rows.map((row) => row.get('span').text()))
-        .toEqual(['ChKSz BYOK', 'LX Music', 'Jellyfin'])
+        .toEqual(['ChKSz BYOK', 'LX Music', 'Jellyfin', 'GD Studio', 'Vkeys (QQ Music)'])
     })
 
     it('no longer offers a retired legacy provider or an individual LX endpoint', async () => {
@@ -575,6 +596,22 @@ describe('SettingsSheet', () => {
         .toBe(false)
     })
 
+    it('changes the GD Studio exclusion independently of LX and credits its official API', async () => {
+      const providerPreferences = createProviderPreferencesStore({
+        storage: { getItem: () => null, setItem: () => undefined, removeItem: () => undefined },
+      })
+      const { wrapper } = mountSettings(undefined, undefined, {
+        providerPreferences, providerStates: allAvailable(),
+      })
+      await flushPromises()
+      await wrapper.get('[data-settings-source="gd-studio"] input').setValue(false)
+      expect(providerPreferences.isDisabled('gd-studio')).toBe(true)
+      expect(providerPreferences.isDisabled('lx')).toBe(false)
+      const attribution = wrapper.get('[data-settings-gd-studio-attribution] a')
+      expect(attribution.attributes('href')).toBe('https://music.gdstudio.xyz')
+      expect(attribution.text()).toContain('GD')
+    })
+
     it('re-enables a provider the user previously disabled', async () => {
       const providerPreferences = createProviderPreferencesStore({
         storage: { getItem: () => null, setItem: () => undefined, removeItem: () => undefined },
@@ -632,9 +669,9 @@ describe('SettingsSheet', () => {
       // LX is gated on the authoritative state and fails closed, so an unreadable
       // configuration removes it. ChKSz and Jellyfin keep their truthful, disabled rows.
       expect(wrapper.findAll('[data-settings-source]').map((row) => row.attributes('data-settings-source')))
-        .toEqual(['chksz', 'jellyfin'])
+        .toEqual(['chksz', 'jellyfin', 'gd-studio', 'vkeys'])
       const rows = wrapper.findAll('[data-settings-source] input')
-      expect(rows).toHaveLength(2)
+      expect(rows).toHaveLength(4)
       expect(rows.every((row) => (row.element as HTMLInputElement).disabled)).toBe(true)
     })
 
@@ -796,6 +833,7 @@ describe('SettingsSheet', () => {
         indexedDB: new IDBFactory(),
         databaseName: `settings-lx-${crypto.randomUUID()}`,
       })
+      expect(await lxSourceRepository.list()).toEqual([])
       const { wrapper } = mountSettings(undefined, undefined, {
         lxSourceRepository,
         providerStates: allProvidersEnabled(),
@@ -1022,4 +1060,196 @@ it('cancels a deliberate Key activation without retaining the Key', async () => 
   expect(credentials.key()).toBeNull()
   expect(localStorage.getItem('study-with-hoyomix:third-party-agreement:v1')).toBeNull()
   wrapper.element.remove()
+})
+
+describe('SettingsSheet debug log group (task 41.8)', () => {
+  it('offers export and clear in About, independent of the player panel', async () => {
+    const { wrapper, preferences } = mountSettings(undefined, undefined, {}, ['about'])
+    const group = wrapper.get('[data-settings-section="about"] [data-settings-debug-log]')
+    expect(group.get('h4').text()).toBe('Debug log')
+    expect(group.get('[data-debug-log-export]').text()).toBe('Export debug log')
+    expect(group.get('[data-debug-log-clear]').text()).toBe('Clear debug log')
+
+    const created: Blob[] = []
+    const downloads: string[] = []
+    const originalCreate = URL.createObjectURL
+    const originalRevoke = URL.revokeObjectURL
+    URL.createObjectURL = (blob: Blob) => { created.push(blob); return 'blob:settings/1' }
+    URL.revokeObjectURL = () => {}
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) { downloads.push(this.download) })
+    try {
+      await group.get('[data-debug-log-export]').trigger('click')
+    } finally {
+      URL.createObjectURL = originalCreate
+      URL.revokeObjectURL = originalRevoke
+    }
+    expect(downloads).toHaveLength(1)
+    expect(downloads[0]).toMatch(/^hoyomix-debug-log-.+Z\.json$/u)
+    const json = await new Promise<string>((resolve) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.readAsText(created[0])
+    })
+    expect(JSON.parse(json)).toMatchObject({ format: 'hoyomix-debug-log', locale: 'en', player: expect.objectContaining({ intent: 'paused' }) })
+
+    preferences.setLocale('zh-Hant')
+    await flushPromises()
+    expect(group.get('h4').text()).toBe('除錯紀錄')
+    expect(group.get('[data-debug-log-export]').text()).toBe('匯出除錯紀錄')
+    expect(group.get('[data-debug-log-clear]').text()).toBe('清除除錯紀錄')
+    preferences.setLocale('zh-Hans')
+    await flushPromises()
+    expect(group.get('h4').text()).toBe('调试日志')
+    expect(group.get('[data-debug-log-export]').text()).toBe('导出调试日志')
+    expect(group.get('[data-debug-log-clear]').text()).toBe('清除调试日志')
+  })
+})
+
+describe('SettingsSheet glass refraction switch', () => {
+  const probe: GlassProbe = {
+    backdrop: true, chromium: true, urlBackdrop: true, mobile: false, reducedMotion: false, reducedTransparency: false,
+    contrastMore: false, forcedColors: false, cores: 8, memory: 8, saveData: false, slowUpdate: false, resizeObserver: true,
+  }
+  const environment = (overrides: Partial<GlassProbe> = {}, stored: 'on' | 'off' | null = null) =>
+    resolveGlassEnvironment({ ...probe, ...overrides }, { enabled: true, defaultOn: { desktop: true, mobile: true }, stored })
+
+  it.each([{}, { chromium: false }, { reducedTransparency: true }])('labels Edge as a saved preset when refraction is unavailable: %j', overrides => {
+    glassEnvironment.value = environment(overrides, 'off')
+    const { wrapper } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+    expect(wrapper.get('#settings-studio-edge-help').text()).toContain('only takes effect while glass refraction is on')
+    expect(wrapper.get('#settings-studio-edge-help').text()).not.toContain('Splits the colours')
+    expect(wrapper.get('[data-settings-studio-edge]').attributes('aria-describedby')).toBe('settings-studio-edge-help')
+  })
+
+  beforeEach(() => {
+    refractionGate.open = true
+  })
+
+  afterEach(() => {
+    refractionGate.open = false
+    glassEnvironment.value = null
+    reloadRefractionPreference()
+  })
+
+  it('follows the shipped build gate', () => {
+    refractionGate.open = false
+    glassEnvironment.value = environment()
+    const { wrapper } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+    expect(wrapper.find('[data-settings-glass-refraction]').exists()).toBe(REFRACTION_ENABLED)
+  })
+
+  it('renders an on switch only in Studio, never in Cinematic', async () => {
+    glassEnvironment.value = environment()
+    const { wrapper } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+    const input = wrapper.get('[data-settings-glass-refraction]')
+    expect(input.attributes('type')).toBe('checkbox')
+    expect(input.attributes('role')).toBe('switch')
+    expect((input.element as HTMLInputElement).checked).toBe(true)
+    expect(input.attributes('disabled')).toBeUndefined()
+    expect(input.attributes('aria-describedby')).toBe('settings-glass-refraction-help')
+    expect(input.element.closest('label')?.classList.contains('settings-sheet__toggle')).toBe(true)
+    expect(input.element.closest('label')?.textContent).toContain('Glass refraction')
+    expect(wrapper.get('#settings-glass-refraction-help').text()).toBe('Bends the live scene at the edges of Studio controls and panels. May use more graphics power.')
+    expect(wrapper.find('[data-settings-glass-refraction-hint]').exists()).toBe(false)
+    await wrapper.get('[data-settings-visual-style]').setValue('cinematic')
+    expect(wrapper.find('[data-settings-glass-refraction]').exists()).toBe(false)
+  })
+
+  it('is hidden while the glass environment is not mounted', () => {
+    const { wrapper } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+    expect(wrapper.find('[data-settings-glass-refraction]').exists()).toBe(false)
+  })
+
+  it('is disabled with the matching hint for each reason', async () => {
+    const cases: Array<[Partial<GlassProbe>, boolean, string]> = [
+      [{ chromium: false }, true, 'Not supported in this browser.'],
+      [{ contrastMore: true }, true, 'Unavailable while increased contrast is on.'],
+      [{ forcedColors: true }, true, 'Unavailable while increased contrast is on.'],
+      [{ reducedTransparency: true }, true, 'Unavailable while reduced transparency is on.'],
+      [{ saveData: true }, false, 'Off by default on this device to save power or reduce transparency. You can turn it on.'],
+    ]
+    for (const [overrides, disabled, hint] of cases) {
+      glassEnvironment.value = environment(overrides)
+      const { wrapper } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+      const input = wrapper.get('[data-settings-glass-refraction]')
+      expect((input.element as HTMLInputElement).checked, JSON.stringify(overrides)).toBe(false)
+      expect(input.attributes('disabled') !== undefined, JSON.stringify(overrides)).toBe(disabled)
+      expect(input.attributes('aria-describedby')).toBe('settings-glass-refraction-help settings-glass-refraction-hint')
+      expect(wrapper.get('#settings-glass-refraction-hint').text()).toBe(hint)
+      wrapper.unmount()
+    }
+  })
+
+  it('labels the switch in every locale', async () => {
+    glassEnvironment.value = environment()
+    const { wrapper, preferences } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+    const label = () => wrapper.get('[data-settings-glass-refraction]').element.closest('label')?.textContent?.trim()
+    expect(label()).toBe('Glass refraction')
+    preferences.setLocale('zh-Hans')
+    await nextTick()
+    expect(label()).toBe('玻璃折射')
+    expect(wrapper.get('#settings-glass-refraction-help').text()).toContain('实时背景')
+    preferences.setLocale('zh-Hant')
+    await nextTick()
+    expect(label()).toBe('玻璃折射')
+    expect(wrapper.get('#settings-glass-refraction-help').text()).toContain('即時背景')
+  })
+
+  it('stores the choice when toggled', async () => {
+    glassEnvironment.value = environment()
+    const { wrapper } = mountSettings(undefined, undefined, {}, ['appearance'], 'studio')
+    await wrapper.get('[data-settings-glass-refraction]').setValue(false)
+    expect(window.localStorage.getItem('study-with-hoyomix.glass-refraction')).toBe('off')
+    await wrapper.get('[data-settings-glass-refraction]').setValue(true)
+    expect(window.localStorage.getItem('study-with-hoyomix.glass-refraction')).toBe('on')
+  })
+})
+
+it('keeps debug export controls exclusively in About', async () => {
+  for (const section of ['playback', 'application'] as const) {
+    const { wrapper } = mountSettings(undefined, undefined, {}, [section])
+    await flushPromises()
+    expect(wrapper.find('[data-debug-log-export]').exists()).toBe(false)
+  }
+  const { wrapper } = mountSettings(undefined, undefined, {}, ['about'])
+  await flushPromises()
+  expect(wrapper.findAll('[data-debug-log-export]')).toHaveLength(1)
+  expect(wrapper.findAll('[data-debug-log-clear]')).toHaveLength(1)
+})
+
+
+it('lets the listener choose and restore an independent GD Studio quality', async () => {
+  const qualityPreferences = createPlaybackQualityPreferencesStore({ storage: window.localStorage })
+  const { wrapper } = mountSettings(undefined, undefined, { qualityPreferences, providerStates: allProvidersEnabled() })
+  await flushPromises()
+  const selector = wrapper.get('[data-settings-gd-studio-quality]')
+  expect(selector.findAll('option').map(option => option.element.value)).toEqual(['auto', '128', '192', '320', '740', '999'])
+  await selector.setValue('999')
+  expect(createPlaybackQualityPreferencesStore({ storage: window.localStorage }).gdStudioQuality()).toBe('999')
+  expect(qualityPreferences.chkszQuality()).toBe('standard')
+  expect(qualityPreferences.lxQuality()).toBe('standard')
+  qualityPreferences.setGdStudioQuality('740')
+  await nextTick()
+  expect((selector.element as HTMLSelectElement).value).toBe('740')
+})
+
+
+describe('track transition preferences', () => {
+  it('defaults off and shows a labelled bounded duration control for Crossfade and Smart Mix', async () => {
+    const {wrapper, player} = mountSettings()
+    const selector = wrapper.get('[data-settings-transition-mode]')
+    expect((selector.element as HTMLSelectElement).value).toBe('off')
+    expect(wrapper.find('[data-settings-crossfade-duration]').exists()).toBe(false)
+    await selector.setValue('crossfade')
+    const slider = wrapper.get('[data-settings-crossfade-duration]')
+    expect(player.transitionMode.value).toBe('crossfade')
+    expect(slider.attributes()).toMatchObject({min:'2',max:'12',step:'1'})
+    expect((slider.element as HTMLInputElement).value).toBe('5')
+    await slider.setValue('8')
+    expect(player.crossfadeDuration.value).toBe(8)
+    await selector.setValue('smart')
+    expect(player.transitionMode.value).toBe('smart')
+    await selector.setValue('off')
+    expect(wrapper.find('[data-settings-crossfade-duration]').exists()).toBe(false)
+  })
 })

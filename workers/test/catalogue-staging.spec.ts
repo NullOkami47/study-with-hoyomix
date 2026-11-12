@@ -18,7 +18,7 @@ const edit = (tab: 'Tracks' | 'Sources' | 'Aliases', field: string, value: strin
   return book
 }
 describe('bounded untrusted Sheet staging', () => {
-  it('roundtrips three synthetic trusted-source fixtures without inventing classification', () => {
+  it('roundtrips the three authorised tracks without inventing classification', () => {
     const parsed = parseStaging(exportWorkbook(snapshot), snapshot)
     expect(parsed.errors).toEqual([])
     expect(parsed.tracks).toHaveLength(3)
@@ -26,7 +26,7 @@ describe('bounded untrusted Sheet staging', () => {
   })
   it('accepts a focus track whose vocal status is vocal', () => {
     // Regression guard: `focus` and `vocal_status` are independent dimensions, so an admin may
-    // save a focus track with a vocal vocal_status.
+    // save a focus track with a vocal vocal_status (389 published rows already look like this).
     const book = exportWorkbook(snapshot)
     const headers = book.Tracks[0]
     book.Tracks[1][headers.indexOf('focus')] = 'TRUE'

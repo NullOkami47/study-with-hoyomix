@@ -14,11 +14,13 @@
     "test:workers": "vitest run --config vitest.workers.config.ts",
     "dev:worker": "wrangler dev --local --port 8787",
     "d1:migrate:local": "wrangler d1 migrations apply DB --local --config wrangler.toml",
-    "verify": "npm run typecheck && npm test && npm run test:workers && npm run build"
+    "verify": "npm run typecheck && npm test && npm run test:workers && npm run build",
+    "test:lx-policy-native": "node --experimental-vm-modules --test --test-concurrency=1 src/features/player/lx/globalSourceRepository.native-tests.mjs"
   },
   "dependencies": {
     "@jitl/quickjs-wasmfile-release-asyncify": "0.32.0",
     "@vueuse/core": "^10.1.2",
+    "acorn": "8.15.0",
     "lucide-vue-next": "^0.577.0",
     "mediabunny": "1.61.1",
     "opencc-js": "1.4.2",
@@ -30,23 +32,31 @@
     "postcss": "8.5.26"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.55.1",
     "@types/node": "22.15.3",
     "@vitejs/plugin-vue": "6.0.10",
     "@vue/test-utils": "2.4.6",
+    "copyfiles": "^2.4.1",
+    "dotenv": "16.3.1",
+    "dotenv-expand": "12.0.2",
     "esbuild": "0.28.2",
     "fake-indexeddb": "^6.2.4",
+    "fast-check": "4.10.2",
     "jsdom": "22.1.0",
     "miniflare": "5.20261012.0-beta",
+    "music-metadata": "^11.12.1",
     "typescript": "5.6.3",
     "vite": "8.3.4",
-    "vite-plugin-pwa": "^1.2.0",
+    "vite-plugin-pwa": "1.3.0",
     "vitest": "5.0.5",
     "vue-tsc": "2.1.10",
-    "wrangler": "4.151.0"
+    "wrangler": "4.151.0",
+    "yaml": "^2.3.4"
   },
-  "private": true,
   "license": "GPL-3.0",
   "engines": {
     "node": ">=22.18.0"
-  }
+  },
+  "private": true
 }

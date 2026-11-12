@@ -2,10 +2,22 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { mount } from '@vue/test-utils'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ProviderControls from './ProviderControls.vue'
 import type { AdminProvider } from './client'
+
+const pointerMethodDescriptors = ['setPointerCapture', 'releasePointerCapture'].map(name => ({
+  name, descriptor: Object.getOwnPropertyDescriptor(Element.prototype, name),
+}))
+afterEach(() => {
+  // defineProperty stubs are not restored by vi.restoreAllMocks(). Restore their
+  // descriptors so later suites can install their own writable media/UI stubs.
+  for (const { name, descriptor } of pointerMethodDescriptors) {
+    if (descriptor) Object.defineProperty(Element.prototype, name, descriptor)
+    else Reflect.deleteProperty(Element.prototype, name)
+  }
+})
 
 const makeProvider = (overrides: Partial<AdminProvider> = {}): AdminProvider => ({
   key: 'chksz',
@@ -77,7 +89,7 @@ describe('ProviderControls', () => {
     expect(disabledWrapper.get('[data-chksz-owner-fallback] input').attributes('disabled')).toBeDefined()
   })
 
-  it.each(['chksz', 'lx', 'jellyfin'] as const)(
+  it.each(['chksz', 'lx', 'jellyfin', 'gd-studio'] as const)(
     'disables non-last provider %s immediately without a global confirmation',
     async (key) => {
       const otherKey = key === 'chksz' ? 'lx' : 'chksz'
@@ -222,7 +234,7 @@ describe('ProviderControls', () => {
   })
 
   describe('canonical provider projection and ordering controls', () => {
-    it('renders only the 3 canonical top-level providers in priority order', () => {
+    it('renders all four independent canonical top-level providers in priority order', () => {
       const wrapper = mountControls([
         makeProvider({ key: 'youtube', priority: 1 }),
         makeProvider({ key: 'lx-ikun', priority: 2 }),
@@ -230,15 +242,17 @@ describe('ProviderControls', () => {
         makeProvider({ key: 'meting', priority: 5 }),
         makeProvider({ key: 'jellyfin', priority: 30 }),
         makeProvider({ key: 'r2', priority: 8 }),
+        makeProvider({ key: 'gd-studio', priority: 40 }),
         makeProvider({ key: 'chksz', priority: 10 }),
       ])
 
       const items = wrapper.findAll('[data-provider-key]')
-      expect(items).toHaveLength(3)
-      expect(items.map((i) => i.attributes('data-provider-key'))).toEqual(['chksz', 'lx', 'jellyfin'])
+      expect(items).toHaveLength(4)
+      expect(items.map((i) => i.attributes('data-provider-key'))).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio'])
       expect(items[0].text()).toContain('ChKSz BYOK')
       expect(items[1].text()).toContain('LX Music')
       expect(items[2].text()).toContain('Jellyfin')
+      expect(items[3].text()).toContain('GD Studio')
 
       expect(wrapper.find('[data-provider-key="youtube"]').exists()).toBe(false)
       expect(wrapper.find('[data-provider-key="lx-ikun"]').exists()).toBe(false)
@@ -339,7 +353,7 @@ describe('ProviderControls', () => {
       expect(resetBtn.text()).toContain('Reset default order')
       await resetBtn.trigger('click')
 
-      expect(wrapper.emitted('order')).toEqual([[['chksz', 'lx', 'jellyfin']]])
+      expect(wrapper.emitted('order')).toEqual([[['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys']]])
     })
 
     it('disables Move Up, Move Down, and Reset buttons when mutating is active', () => {
@@ -601,4 +615,18 @@ describe('ProviderControls', () => {
       expect(source).not.toContain('input[type="range"]')
     })
   })
+
+  it('keeps GD Studio independently toggleable and truthfully unavailable when deployment policy is missing', async () => {
+    const wrapper = mountControls([
+      makeProvider({ key: 'lx', priority: 20 }),
+      makeProvider({ key: 'gd-studio', priority: 40, adminEnabled: false, effectiveEnabled: false }),
+    ])
+    expect(wrapper.get('[data-provider-key="gd-studio"]').text()).toContain('GD Studio')
+    await wrapper.get('[data-provider-toggle="gd-studio"]').setValue(true)
+    expect(wrapper.emitted('toggle')).toEqual([['gd-studio', true]])
+    expect(wrapper.get('[data-provider-toggle="lx"]').element).toHaveProperty('checked', true)
+    await wrapper.setProps({ providers: [makeProvider({ key: 'gd-studio', adminEnabled: false, deploymentAvailable: false, effectiveEnabled: false })] })
+    expect(wrapper.get('[data-provider-toggle="gd-studio"]').element).toHaveProperty('disabled', true)
+  })
+
 })

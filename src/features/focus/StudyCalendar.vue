@@ -9,6 +9,7 @@ import {
   focusWeekdayLabels,
   formatLongFocusDuration,
 } from './presentation'
+import { useFocusNow } from './useFocusNow'
 import { deriveFocusStatistics } from './statistics'
 import type { FocusSessionRecord } from './types'
 
@@ -23,8 +24,9 @@ function completedText(count: number): string {
   return text('focus.calendar.completed').replace('{count}', String(count))
 }
 
+const focusNow = useFocusNow(() => props.timeZone)
 const statistics = computed(() => deriveFocusStatistics(props.sessions, {
-  now: new Date().toISOString(),
+  now: focusNow(),
   timeZone: props.timeZone,
 }))
 
@@ -34,6 +36,7 @@ const weekdayLabels = computed(() => focusWeekdayLabels(locale.value))
 
 <template>
   <section class="focus-calendar" data-focus-calendar>
+    <p class="focus-calendar__empty" data-focus-history-guide>{{ text('focus.history.howTo') }}</p>
     <p
       v-if="statistics.calendarDays.length === 0"
       class="focus-calendar__empty"

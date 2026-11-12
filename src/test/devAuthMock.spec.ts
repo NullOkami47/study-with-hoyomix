@@ -143,6 +143,10 @@ describe('explicit development auth preview through the real Vite chain', () => 
 
   it.each(['production', 'staging'])('excludes the interceptor from %s build config even with opt-in', async (mode) => {
     flag('1')
+    // Release builds fail closed without explicit response-policy inputs (M-13), so supply them.
+    vi.stubEnv('RESPONSE_POLICY_PUBLIC_ORIGIN', 'https://study.example')
+    vi.stubEnv('RESPONSE_POLICY_R2_BASE_URL', 'https://media.example.com/')
+    cleanups.push(async () => vi.unstubAllEnvs())
     const config = await resolveConfig({ root, configFile, mode, logLevel: 'silent' }, 'build')
     expect(config.plugins.some((plugin) => plugin.name === 'dev-auth-mock')).toBe(false)
   })

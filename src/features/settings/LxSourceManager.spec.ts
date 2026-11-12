@@ -2,15 +2,15 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { computeSha256, createLxSourceRepository } from '../player/lx/sourceRepository'
+import { computeSha256, createLxSourceRepository, LX_STORE_SOURCES } from '../player/lx/sourceRepository'
 import {
+  LX_BUILTIN_ID,
   LX_MAX_SCRIPT_BYTES,
   type LxSourceRecord,
   type LxSourceRepository,
 } from '../player/lx/types'
 import LxSourceManager from './LxSourceManager.vue'
-
-const LX_BUILTIN_ID = 'synthetic-pinned-source'
+import type {LxGlobalSourceRepository} from '../player/lx/globalSourceRepository'
 
 const ALPHA_SCRIPT = `/**
  * @name Alpha Source
@@ -47,43 +47,63 @@ async function settle(): Promise<void> {
   }
 }
 
-function createRepository(overrides: { fetch?: typeof fetch } = {}): LxSourceRepository {
-  // The production repository starts empty. Pinning is exercised with an explicit
-  // synthetic IndexedDB fixture rather than shipping any third-party script.
+// Test-only stored snapshot: no bundled runtime inventory or third-party script is needed.
+const PINNED_FIXTURE_ID = 'fixture-pinned-source'
+const PINNED_FIXTURE_NAME = 'Synthetic Pinned Source'
+const PINNED_FIXTURE_SCRIPT = '/** @name Synthetic Pinned Source */\nconst fixture = 1;'
+
+async function createRepository(
+  overrides: { fetch?: typeof fetch; pinnedId?: string } = {},
+): Promise<LxSourceRepository> {
   const indexedDB = new IDBFactory()
   const databaseName = `lx-manager-${crypto.randomUUID()}`
-  const ready = new Promise<void>((resolve, reject) => {
+  const snapshot: LxSourceRecord = {
+    id: overrides.pinnedId ?? PINNED_FIXTURE_ID,
+    name: PINNED_FIXTURE_NAME,
+    script: PINNED_FIXTURE_SCRIPT,
+    sha256: await computeSha256(PINNED_FIXTURE_SCRIPT),
+    originUrl: 'https://example.invalid/pinned-fixture.js',
+    enabled: true,
+    priority: 0,
+    builtIn: true,
+    importedAt: 1,
+    updatedAt: 1,
+  }
+  // importScript intentionally creates personal sources only. Seed the documented store
+  // before opening the real repository so pinned-policy tests exercise its real mutations.
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(databaseName, 1)
-    request.onupgradeneeded = () => request.result.createObjectStore('lx_sources', { keyPath: 'id' })
-    request.onerror = () => reject(request.error)
-    request.onsuccess = () => {
-      const database = request.result
-      const transaction = database.transaction('lx_sources', 'readwrite')
-      transaction.objectStore('lx_sources').put({
-        id: LX_BUILTIN_ID, name: 'Synthetic Pinned Source', sha256: 'b'.repeat(64),
-        enabled: true, priority: 10, script: '// Synthetic pinned test fixture',
-        originUrl: 'https://sources.example.invalid/synthetic.js',
-        builtIn: true, importedAt: 1, updatedAt: 1,
-      })
-      transaction.oncomplete = () => { database.close(); resolve() }
-      transaction.onerror = () => reject(transaction.error)
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(LX_STORE_SOURCES, { keyPath: 'id' })
     }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
   })
-  const repository = createLxSourceRepository({ indexedDB, databaseName, fetch: overrides.fetch })
-  return Object.fromEntries(Object.entries(repository).map(([name, method]) => [
-    name, async (...args: unknown[]) => { await ready; return (method as (...values: unknown[]) => unknown)(...args) },
-  ])) as unknown as LxSourceRepository
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(LX_STORE_SOURCES, 'readwrite')
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = () => reject(transaction.error)
+      transaction.onabort = () => reject(transaction.error)
+      transaction.objectStore(LX_STORE_SOURCES).put(snapshot)
+    })
+  } finally {
+    db.close()
+  }
+  return createLxSourceRepository({ indexedDB, databaseName, fetch: overrides.fetch })
 }
 
 function mountManager(options: {
   repository: LxSourceRepository
   testRunner?: (source: LxSourceRecord) => Promise<void>
+  globalRepository?: LxGlobalSourceRepository
 }) {
   const wrapper = mount(LxSourceManager, {
     props: {
       locale: 'en',
       repository: options.repository,
       testRunner: options.testRunner,
+      globalRepository: options.globalRepository ?? {list:async()=>[],revision:()=>1,pendingApproval:()=>[],invalidate:()=>{}},
     },
   })
   cleanups.push(() => wrapper.unmount())
@@ -104,37 +124,43 @@ async function importPasted(wrapper: ReturnType<typeof mountManager>, script: st
 
 describe('LxSourceManager', () => {
   describe('source list', () => {
-    it('shows no source rows before the user imports a source', async () => {
-      const repository = createLxSourceRepository({ indexedDB: new IDBFactory() })
+    it('keeps the public repository empty until a source is explicitly imported', async () => {
+      const repository = createLxSourceRepository({
+        indexedDB: new IDBFactory(),
+        databaseName: `lx-manager-empty-${crypto.randomUUID()}`,
+      })
+      expect(await repository.list()).toEqual([])
       const wrapper = mountManager({ repository })
       await settle()
+
       expect(rowIds(wrapper)).toEqual([])
-      expect(await repository.list()).toEqual([])
+      expect(wrapper.find('[data-lx-import-paste-submit]').exists()).toBe(true)
+      expect(wrapper.find('[data-lx-import-url-submit]').exists()).toBe(true)
     })
 
-    it('shows the synthetic pinned source pinned first with its snapshot hash', async () => {
-      const wrapper = mountManager({ repository: createRepository() })
+    it('shows an explicitly seeded synthetic built-in source pinned first with its snapshot hash', async () => {
+      const wrapper = mountManager({ repository: await createRepository() })
       await settle()
 
-      expect(rowIds(wrapper)).toEqual([LX_BUILTIN_ID])
-      const row = wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"]`)
+      expect(rowIds(wrapper)).toEqual([PINNED_FIXTURE_ID])
+      const row = wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"]`)
       expect(row.attributes('data-lx-source-builtin')).toBe('true')
-      expect(row.text()).toContain('Synthetic Pinned Source')
+      expect(row.text()).toContain(PINNED_FIXTURE_NAME)
       expect(row.get('[data-lx-source-sha]').text())
-        .toBe('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+        .toBe(await computeSha256(PINNED_FIXTURE_SCRIPT))
       expect(row.get('[data-lx-source-pinned-note]').text()).toMatch(/pinned/iu)
     })
 
     it('refuses to move or delete the built-in source while explaining why', async () => {
-      const wrapper = mountManager({ repository: createRepository() })
+      const wrapper = mountManager({ repository: await createRepository() })
       await settle()
 
-      const row = wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"]`)
+      const row = wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"]`)
       expect((row.get('[data-lx-source-move-up]').element as HTMLButtonElement).disabled).toBe(true)
       expect((row.get('[data-lx-source-move-down]').element as HTMLButtonElement).disabled).toBe(true)
       expect((row.get('[data-lx-source-delete]').element as HTMLButtonElement).disabled).toBe(true)
       expect(row.get('[data-lx-source-move-up]').attributes('aria-describedby'))
-        .toBe(`lx-source-${LX_BUILTIN_ID}-pinned`)
+        .toBe(`lx-source-${PINNED_FIXTURE_ID}-pinned`)
     })
 
     it('pins the built-in source ahead of a custom source with a lower stored priority', async () => {
@@ -144,7 +170,7 @@ describe('LxSourceManager', () => {
           priority: 5, script: 'const low = 1;', builtIn: false, importedAt: 1, updatedAt: 1,
         },
         {
-          id: LX_BUILTIN_ID, name: 'Synthetic Pinned Source', sha256: 'b'.repeat(64), enabled: true,
+          id: PINNED_FIXTURE_ID, name: PINNED_FIXTURE_NAME, sha256: 'b'.repeat(64), enabled: true,
           priority: 10, script: 'const builtin = 1;', builtIn: true, importedAt: 1, updatedAt: 1,
         },
       ]
@@ -162,11 +188,11 @@ describe('LxSourceManager', () => {
       const wrapper = mountManager({ repository })
       await settle()
 
-      expect(rowIds(wrapper)).toEqual([LX_BUILTIN_ID, 'custom-low'])
+      expect(rowIds(wrapper)).toEqual([PINNED_FIXTURE_ID, 'custom-low'])
     })
 
     it('never renders a stored script body into the page', async () => {
-      const wrapper = mountManager({ repository: createRepository() })
+      const wrapper = mountManager({ repository: await createRepository() })
       await settle()
       await importPasted(wrapper, ALPHA_SCRIPT)
 
@@ -187,24 +213,24 @@ describe('LxSourceManager', () => {
 
   describe('enable, disable, order and delete', () => {
     it('disables and re-enables a source through the repository', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const wrapper = mountManager({ repository })
       await settle()
 
-      const toggle = wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] input[type="checkbox"]`)
+      const toggle = wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] input[type="checkbox"]`)
       expect((toggle.element as HTMLInputElement).checked).toBe(true)
 
       await toggle.setValue(false)
       await settle()
 
-      expect((await repository.get(LX_BUILTIN_ID))?.enabled).toBe(false)
+      expect((await repository.get(PINNED_FIXTURE_ID))?.enabled).toBe(false)
       expect(
-        (wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] input[type="checkbox"]`).element as HTMLInputElement).checked,
+        (wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] input[type="checkbox"]`).element as HTMLInputElement).checked,
       ).toBe(false)
     })
 
     it('restores the toggle when the repository rejects the change', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const failing: LxSourceRepository = {
         ...repository,
         setEnabled: async () => {
@@ -214,19 +240,19 @@ describe('LxSourceManager', () => {
       const wrapper = mountManager({ repository: failing })
       await settle()
 
-      const toggle = wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] input[type="checkbox"]`)
+      const toggle = wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] input[type="checkbox"]`)
       await toggle.setValue(false)
       await settle()
 
       expect((toggle.element as HTMLInputElement).checked).toBe(true)
-      expect((await repository.get(LX_BUILTIN_ID))?.enabled).toBe(true)
+      expect((await repository.get(PINNED_FIXTURE_ID))?.enabled).toBe(true)
       const status = wrapper.get('[data-lx-status]')
       expect(status.attributes('data-lx-status-tone')).toBe('error')
       expect(status.text()).not.toContain('storage_failure')
     })
 
     it('reorders custom sources with Move Up and Move Down, leaving the built-in pinned', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const wrapper = mountManager({ repository })
       await settle()
       await importPasted(wrapper, ALPHA_SCRIPT)
@@ -234,23 +260,23 @@ describe('LxSourceManager', () => {
 
       const alpha = (await repository.list()).find((record) => record.name === 'Alpha Source')!
       const beta = (await repository.list()).find((record) => record.name === 'Beta Source')!
-      expect(rowIds(wrapper)).toEqual([LX_BUILTIN_ID, alpha.id, beta.id])
+      expect(rowIds(wrapper)).toEqual([PINNED_FIXTURE_ID, alpha.id, beta.id])
 
       await wrapper.get(`[data-lx-source="${beta.id}"] [data-lx-source-move-up]`).trigger('click')
       await settle()
-      expect(rowIds(wrapper)).toEqual([LX_BUILTIN_ID, beta.id, alpha.id])
+      expect(rowIds(wrapper)).toEqual([PINNED_FIXTURE_ID, beta.id, alpha.id])
 
       await wrapper.get(`[data-lx-source="${beta.id}"] [data-lx-source-move-down]`).trigger('click')
       await settle()
-      expect(rowIds(wrapper)).toEqual([LX_BUILTIN_ID, alpha.id, beta.id])
+      expect(rowIds(wrapper)).toEqual([PINNED_FIXTURE_ID, alpha.id, beta.id])
 
       expect(
-        (wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] [data-lx-source-move-down]`).element as HTMLButtonElement).disabled,
+        (wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] [data-lx-source-move-down]`).element as HTMLButtonElement).disabled,
       ).toBe(true)
     })
 
     it('deletes a custom source and reports it', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const wrapper = mountManager({ repository })
       await settle()
       await importPasted(wrapper, ALPHA_SCRIPT)
@@ -259,15 +285,15 @@ describe('LxSourceManager', () => {
       await wrapper.get(`[data-lx-source="${alpha.id}"] [data-lx-source-delete]`).trigger('click')
       await settle()
 
-      expect((await repository.list()).map((record) => record.id)).toEqual([LX_BUILTIN_ID])
-      expect(rowIds(wrapper)).toEqual([LX_BUILTIN_ID])
+      expect((await repository.list()).map((record) => record.id)).toEqual([PINNED_FIXTURE_ID])
+      expect(rowIds(wrapper)).toEqual([PINNED_FIXTURE_ID])
       expect(statusText(wrapper)).toBe('Source deleted.')
     })
   })
 
   describe('imports', () => {
     it('imports a pasted script and shows its byte size before saving', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const wrapper = mountManager({ repository })
       await settle()
 
@@ -280,7 +306,7 @@ describe('LxSourceManager', () => {
       await settle()
 
       const records = await repository.list()
-      expect(records.map((record) => record.name)).toEqual(['Synthetic Pinned Source', 'Alpha Source'])
+      expect(records.map((record) => record.name)).toEqual([PINNED_FIXTURE_NAME, 'Alpha Source'])
       expect(records[1].builtIn).toBe(false)
       expect(records[1].sha256).toBe(await computeSha256(ALPHA_SCRIPT))
       expect(statusText(wrapper)).toBe('Source imported.')
@@ -288,7 +314,7 @@ describe('LxSourceManager', () => {
     })
 
     it('rejects an oversized pasted script before it reaches the repository', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const importSpy = vi.spyOn(repository, 'importScript')
       const wrapper = mountManager({ repository })
       await settle()
@@ -296,14 +322,14 @@ describe('LxSourceManager', () => {
       await importPasted(wrapper, 'a'.repeat(LX_MAX_SCRIPT_BYTES + 1))
 
       expect(importSpy).not.toHaveBeenCalled()
-      expect((await repository.list()).map((record) => record.id)).toEqual([LX_BUILTIN_ID])
+      expect((await repository.list()).map((record) => record.id)).toEqual([PINNED_FIXTURE_ID])
       const status = wrapper.get('[data-lx-status]')
       expect(status.attributes('data-lx-status-tone')).toBe('error')
       expect(status.text()).toContain(String(LX_MAX_SCRIPT_BYTES))
     })
 
     it('imports a .js file chosen from the device', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const wrapper = mountManager({ repository })
       await settle()
 
@@ -314,7 +340,7 @@ describe('LxSourceManager', () => {
       await settle()
 
       const records = await repository.list()
-      expect(records.map((record) => record.name)).toEqual(['Synthetic Pinned Source', 'device-source'])
+      expect(records.map((record) => record.name)).toEqual([PINNED_FIXTURE_NAME, 'device-source'])
       expect(records[1].sha256).toBe(await computeSha256(GAMMA_SCRIPT))
     })
 
@@ -323,7 +349,7 @@ describe('LxSourceManager', () => {
         status: 200,
         headers: { 'content-type': 'text/javascript' },
       }))
-      const repository = createRepository({ fetch: fetchImpl as unknown as typeof fetch })
+      const repository = await createRepository({ fetch: fetchImpl as unknown as typeof fetch })
       const wrapper = mountManager({ repository })
       await settle()
 
@@ -332,14 +358,14 @@ describe('LxSourceManager', () => {
       await settle()
 
       const records = await repository.list()
-      expect(records.map((record) => record.name)).toEqual(['Synthetic Pinned Source', 'Alpha Source'])
+      expect(records.map((record) => record.name)).toEqual([PINNED_FIXTURE_NAME, 'Alpha Source'])
       expect(records[1].originUrl).toBe('https://example.invalid/alpha.js')
 
       await wrapper.get('[data-lx-import-url]').setValue('http://example.invalid/beta.js')
       await wrapper.get('[data-lx-import-url-submit]').trigger('click')
       await settle()
 
-      expect((await repository.list()).map((record) => record.name)).toEqual(['Synthetic Pinned Source', 'Alpha Source'])
+      expect((await repository.list()).map((record) => record.name)).toEqual([PINNED_FIXTURE_NAME, 'Alpha Source'])
       const status = wrapper.get('[data-lx-status]')
       expect(status.attributes('data-lx-status-tone')).toBe('error')
       expect(status.text()).toMatch(/https/iu)
@@ -351,7 +377,7 @@ describe('LxSourceManager', () => {
         status: 200,
         headers: { 'content-type': 'text/javascript' },
       }))
-      const repository = createRepository({ fetch: fetchImpl as unknown as typeof fetch })
+      const repository = await createRepository({ fetch: fetchImpl as unknown as typeof fetch })
       const wrapper = mountManager({ repository })
       await settle()
 
@@ -362,12 +388,12 @@ describe('LxSourceManager', () => {
       const status = wrapper.get('[data-lx-status]')
       expect(status.attributes('data-lx-status-tone')).toBe('error')
       expect(status.text()).toContain(String(LX_MAX_SCRIPT_BYTES))
-      expect((await repository.list()).map((record) => record.id)).toEqual([LX_BUILTIN_ID])
+      expect((await repository.list()).map((record) => record.id)).toEqual([PINNED_FIXTURE_ID])
     })
 
     it('reports a remote import failure without echoing the raw error', async () => {
       const fetchImpl = vi.fn(async () => { throw new Error('SECRET_TRANSPORT_DETAIL') })
-      const repository = createRepository({ fetch: fetchImpl as unknown as typeof fetch })
+      const repository = await createRepository({ fetch: fetchImpl as unknown as typeof fetch })
       const wrapper = mountManager({ repository })
       await settle()
 
@@ -385,23 +411,23 @@ describe('LxSourceManager', () => {
   describe('sandbox test action', () => {
     it('reports a successful sandbox test through status text', async () => {
       const testRunner = vi.fn(async (_source: LxSourceRecord) => undefined)
-      const wrapper = mountManager({ repository: createRepository(), testRunner })
+      const wrapper = mountManager({ repository: await createRepository(), testRunner })
       await settle()
 
-      await wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] [data-lx-source-test]`).trigger('click')
+      await wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] [data-lx-source-test]`).trigger('click')
       await settle()
 
       expect(testRunner).toHaveBeenCalledTimes(1)
-      expect(testRunner.mock.calls[0][0].id).toBe(LX_BUILTIN_ID)
+      expect(testRunner.mock.calls[0][0].id).toBe(PINNED_FIXTURE_ID)
       expect(statusText(wrapper)).toBe('Source loaded in the sandbox.')
     })
 
     it('reports a failed sandbox test without echoing the runner message', async () => {
       const testRunner = vi.fn(async () => { throw new Error('SANDBOX_INTERNAL_DETAIL') })
-      const wrapper = mountManager({ repository: createRepository(), testRunner })
+      const wrapper = mountManager({ repository: await createRepository(), testRunner })
       await settle()
 
-      await wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] [data-lx-source-test]`).trigger('click')
+      await wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] [data-lx-source-test]`).trigger('click')
       await settle()
 
       const status = wrapper.get('[data-lx-status]')
@@ -418,7 +444,7 @@ describe('LxSourceManager', () => {
         status: 200,
         headers: { 'content-type': 'text/javascript' },
       }))
-      const repository = createRepository({ fetch: fetchImpl as unknown as typeof fetch })
+      const repository = await createRepository({ fetch: fetchImpl as unknown as typeof fetch })
       const wrapper = mountManager({ repository })
       await settle()
 
@@ -455,7 +481,7 @@ describe('LxSourceManager', () => {
         status: 200,
         headers: { 'content-type': 'text/javascript' },
       }))
-      const repository = createRepository({ fetch: fetchImpl as unknown as typeof fetch })
+      const repository = await createRepository({ fetch: fetchImpl as unknown as typeof fetch })
       // Storage may commit before the component's asynchronous reload renders.
       const list = repository.list
       let listCalls = 0
@@ -498,7 +524,7 @@ describe('LxSourceManager', () => {
     })
 
     it('offers no refresh action for a source that has no origin URL', async () => {
-      const repository = createRepository()
+      const repository = await createRepository()
       const importScript = repository.importScript
       let releaseImport!: () => void
       const importGate = new Promise<void>((resolve) => { releaseImport = resolve })
@@ -537,8 +563,8 @@ describe('LxSourceManager', () => {
         await vi.waitFor(() => expect(wrapper.find(selector).exists()).toBe(true))
         const pasted = wrapper.get(selector)
         expect(pasted.findAll('[data-lx-source-refresh]')).toHaveLength(0)
-        // The synthetic pinned fixture has an origin and may be refreshed explicitly.
-        expect(wrapper.find(`[data-lx-source="${LX_BUILTIN_ID}"] [data-lx-source-refresh]`).exists())
+        // The synthetic pinned snapshot has an explicit HTTPS origin and may be refreshed.
+        expect(wrapper.find(`[data-lx-source="${PINNED_FIXTURE_ID}"] [data-lx-source-refresh]`).exists())
           .toBe(true)
       } finally {
         releaseImport()
@@ -548,7 +574,7 @@ describe('LxSourceManager', () => {
   })
 
   it('disables every action while a mutation is in flight', async () => {
-    const repository = createRepository()
+    const repository = await createRepository()
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     const gated: LxSourceRepository = {
@@ -561,10 +587,10 @@ describe('LxSourceManager', () => {
     const wrapper = mountManager({ repository: gated })
     await settle()
 
-    await wrapper.get(`[data-lx-source="${LX_BUILTIN_ID}"] input[type="checkbox"]`).setValue(false)
+    await wrapper.get(`[data-lx-source="${PINNED_FIXTURE_ID}"] input[type="checkbox"]`).setValue(false)
     await flushPromises()
 
-    const builtin = `[data-lx-source="${LX_BUILTIN_ID}"]`
+    const builtin = `[data-lx-source="${PINNED_FIXTURE_ID}"]`
     expect((wrapper.get(`${builtin} input[type="checkbox"]`).element as HTMLInputElement).disabled).toBe(true)
     expect((wrapper.get(`${builtin} [data-lx-source-test]`).element as HTMLButtonElement).disabled).toBe(true)
     expect((wrapper.get('[data-lx-import-file]').element as HTMLInputElement).disabled).toBe(true)
@@ -575,6 +601,58 @@ describe('LxSourceManager', () => {
 
     expect((wrapper.get(`${builtin} input[type="checkbox"]`).element as HTMLInputElement).disabled).toBe(false)
     expect((wrapper.get(`${builtin} [data-lx-source-test]`).element as HTMLButtonElement).disabled).toBe(false)
-    expect((await repository.get(LX_BUILTIN_ID))?.enabled).toBe(false)
+    expect((await repository.get(PINNED_FIXTURE_ID))?.enabled).toBe(false)
   })
+  it('shows the actual administrator-published sources separately from personal imports, without leaking publication controls',async()=>{
+    const repository=await createRepository()
+    await repository.importScript(ALPHA_SCRIPT)
+    const published:LxSourceRecord={id:'global:global-a',name:'Published Hei',version:'2.2.1',sha256:'a'.repeat(64),script:'// published',enabled:true,priority:20,builtIn:false,importedAt:0,updatedAt:0}
+    const globalRepository:LxGlobalSourceRepository={managesBundledSource:true,list:async()=>[published],revision:()=>2,pendingApproval:()=>[],invalidate:()=>{}}
+    const wrapper=mountManager({repository,globalRepository})
+    await settle()
+    expect(wrapper.get('[data-lx-source-group=published]').text()).toContain('Published Hei')
+    expect(wrapper.get('[data-lx-source-group=personal]').text()).toContain('Alpha Source')
+    expect(rowIds(wrapper)).toEqual(['global:global-a',expect.any(String)])
+    const row=wrapper.get('[data-lx-source="global:global-a"]')
+    expect(row.text()).toContain('Admin-published')
+    expect(row.find('[data-lx-source-delete]').exists()).toBe(false)
+    expect((row.get('input[type=checkbox]').element as HTMLInputElement).disabled).toBe(true)
+    expect(await repository.get(PINNED_FIXTURE_ID)).not.toBeNull()
+  })
+
+})
+
+
+it('keeps the administrator disabled policy visible without exposing a stale local test or personal mutation', async () => {
+  // The managed-policy protocol reserves this ID; its stored script is synthetic.
+  const repository=await createRepository({ pinnedId: LX_BUILTIN_ID })
+  const runner=vi.fn()
+  const globalRepository:LxGlobalSourceRepository={
+    managesBundledSource:true,list:async()=>[],revision:()=>4,pendingApproval:()=>[],invalidate:()=>{},
+    managedSource:()=>({id:LX_BUILTIN_ID,name:'Owner disabled synthetic source',version:'1',sha256:'a'.repeat(64),priority:10,requiredOrigins:[],enabled:false,status:'disabled'}),
+  }
+  const wrapper=mountManager({repository,globalRepository,testRunner:runner})
+  await settle()
+  expect(rowIds(wrapper)).toEqual([`global:${LX_BUILTIN_ID}`])
+  const row=wrapper.get('[data-lx-source]')
+  expect(row.text()).toContain('Owner disabled synthetic source')
+  expect((row.get('input[type=checkbox]').element as HTMLInputElement).checked).toBe(false)
+  expect((row.get('[data-lx-source-test]').element as HTMLButtonElement).disabled).toBe(true)
+  await row.get('[data-lx-source-test]').trigger('click')
+  expect(runner).not.toHaveBeenCalled()
+  expect((await repository.list()).find(source=>source.id===LX_BUILTIN_ID)?.enabled).toBe(true)
+})
+
+it('hides a deleted managed source and never restores its local bundled copy', async () => {
+  // The managed-policy protocol reserves this ID; its stored script is synthetic.
+  const repository=await createRepository({ pinnedId: LX_BUILTIN_ID })
+  const globalRepository:LxGlobalSourceRepository={
+    managesBundledSource:true,list:async()=>[],revision:()=>5,pendingApproval:()=>[],invalidate:()=>{},
+    managedSource:()=>({id:LX_BUILTIN_ID,name:'Deleted synthetic source',version:'1',sha256:'a'.repeat(64),priority:10,requiredOrigins:[],enabled:false,status:'disabled',deleted:true}),
+  }
+  const wrapper=mountManager({repository,globalRepository})
+  await settle()
+  expect(rowIds(wrapper)).toEqual([])
+  expect(wrapper.text()).not.toContain('Deleted synthetic source')
+  expect((await repository.list()).find(source=>source.id===LX_BUILTIN_ID)?.enabled).toBe(true)
 })

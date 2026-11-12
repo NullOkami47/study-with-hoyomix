@@ -106,7 +106,8 @@ describe('Privacy copy', () => {
 
   it('describes export and deletion in terms of what they actually do', () => {
     // exportAccountData returns favourites, playlists, preferences, focus sessions, provider
-    // preferences and catalogue reports. deleteAccount deletes the user row and D1 cascades.
+    // preferences, catalogue reports and the user's own chat messages (L-21). deleteAccount deletes
+    // the user row and D1 cascades; retained chat rows lose their author and text.
     for (const [locale, catalogue] of Object.entries(catalogues)) {
       expect(catalogue['settings.privacy.export'], locale).toBeTruthy()
       expect(catalogue['settings.privacy.deletion'], locale).toBeTruthy()
@@ -127,14 +128,16 @@ describe('Privacy copy', () => {
     expect(en['settings.privacy.analytics']).not.toMatch(/no third-party tracking/iu)
   })
 
-  it('does not present Community Chat data collection as active', () => {
+  it('discloses public chat, the enforced retention limits and optional coarse location', () => {
     for (const [locale, catalogue] of Object.entries(catalogues)) {
-      const copy = privacyCopy(catalogue)
-      const mentionsChat = /chat|聊天/iu.test(copy)
-      if (!mentionsChat) continue
-      expect(copy, `${locale} mentions chat without marking it unavailable`)
-        .toMatch(/not (?:yet )?(?:available|implemented)|尚未|未提供/iu)
+      expect(catalogue['settings.privacy.chat'], locale).toMatch(/30/u)
+      expect(catalogue['settings.privacy.chat'], locale).toMatch(/10,000/u)
+      expect(catalogue['settings.privacy.chatLocation'], locale).toMatch(/IP/u)
+      expect(catalogue['settings.privacy.chatModeration'], locale).toBeTruthy()
     }
+    expect(en['settings.privacy.chat']).toMatch(/public/iu)
+    expect(en['settings.privacy.chatLocation']).toMatch(/optional/iu)
+    expect(en['settings.privacy.chatModeration']).toMatch(/versions/iu)
   })
 
   it('invents no retention period, encryption guarantee, legal basis or sharing promise', () => {
@@ -154,6 +157,8 @@ describe('Privacy copy', () => {
         // The session lifetime is the one duration source establishes, so it is allowed there and
         // nowhere else.
         const withoutSession = copy.replace(catalogue['settings.privacy.session'], ' ')
+          .replace(catalogue['settings.privacy.chat'], ' ')
+          .replace(catalogue['settings.privacy.chatModeration'], ' ')
         expect(pattern.test(withoutSession), `${locale} invents ${pattern}`).toBe(false)
       }
     }

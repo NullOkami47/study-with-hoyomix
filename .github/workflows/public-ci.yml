@@ -64,6 +64,7 @@ jobs:
             'vite.config.ts', 'vitest.config.ts', 'vitest.workers.config.ts',
             'tsconfig.json', 'tsconfig.node.json', 'wrangler.toml',
             '.github/workflows/public-ci.yml', 'scripts/public-ci.test.mjs',
+            'src/features/player/lx/globalSourceRepository.native-tests.mjs',
           ];
           const lines = [
             '## Public source inputs',
@@ -93,6 +94,9 @@ jobs:
       - name: Install the public lockfile
         run: npm ci --no-audit --no-fund
 
+      - name: Check source-policy revocation
+        run: npm run test:lx-policy-native
+
       - name: Check types
         run: npm run typecheck
 
@@ -103,6 +107,11 @@ jobs:
         run: npm run test:workers -- --maxWorkers=2
 
       - name: Build the public app
+        # Compile-only fixture origins; no deployment, live media or credentials.
+        env:
+          RESPONSE_POLICY_PUBLIC_ORIGIN: 'https://public-ci.example.invalid'
+          RESPONSE_POLICY_R2_BASE_URL: 'https://media.public-ci.example.invalid/'
+          LX_ALLOWED_ORIGINS: ''
         run: npm run build
 
       - name: Apply migrations to a local D1 database

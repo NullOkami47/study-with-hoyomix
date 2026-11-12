@@ -14,7 +14,7 @@
  * and returns without touching the GPU. `StudioGlassCanvas.vue` still budgets the
  * offset into its off-canvas cull margin so that honouring it later cannot
  * under-reach. All three facts are pinned by `studio-pass-graph.spec.ts`; the
- * reasoning is in `the original development notes`.
+ * reasoning is in `the regression specification`.
  */
 import { sdfLib } from './sdf.glsl'
 

@@ -2,6 +2,7 @@ import { watchEffect } from 'vue'
 import type { PlaybackStore } from './store'
 import type { PlayerCommands } from './commands'
 import { playbackPresentationFor } from './presentation'
+import { recordPlayback } from './playbackLog'
 
 /** Optional browser integration. Unsupported actions never prevent normal playback. */
 export function registerPlaybackMediaSession(
@@ -22,8 +23,17 @@ export function registerPlaybackMediaSession(
   const installed: MediaSessionAction[] = []
   if (typeof session.setActionHandler === 'function') {
     for (const [action, handler] of Object.entries(handlers)) {
+      // Task 41.1: every invocation is logged before the command runs.
+      const logged: MediaSessionActionHandler = (details) => {
+        recordPlayback('mediaSession.action', {
+          action, seekTime: details?.seekTime ?? null, status: store.status?.value ?? null,
+          intent: store.playbackIntent?.value ?? null,
+          visibility: typeof document !== 'undefined' ? document.visibilityState : null,
+        })
+        handler(details)
+      }
       try {
-        session.setActionHandler(action as MediaSessionAction, handler)
+        session.setActionHandler(action as MediaSessionAction, logged)
         installed.push(action as MediaSessionAction)
       } catch { /* A browser may implement only some actions. */ }
     }

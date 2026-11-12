@@ -85,9 +85,9 @@ const cachedTicket = (overrides: Record<string, unknown> = {}) => Response.json(
   nonce: NONCE,
   validatedUrl: MEDIA_URL,
   mimeType: 'audio/mpeg',
-  expiresAt: 31_000,
+  expiresAt: 121_000,
   ...overrides,
-}, { headers: { 'cache-control': 'max-age=30' } })
+}, { headers: { 'cache-control': 'max-age=120' } })
 
 const putTicket = (
   cache: MemoryCache,
@@ -122,7 +122,7 @@ describe('security: transient media ticket boundaries', () => {
       nonce: NONCE,
       validatedUrl: MEDIA_URL,
       mimeType: 'audio/mpeg',
-      expiresAt: 31_000,
+      expiresAt: 121_000,
     })
     expect(fetchImpl).not.toHaveBeenCalled()
   })
@@ -154,8 +154,8 @@ describe('security: transient media ticket boundaries', () => {
     ['nonce substitution', { nonce: 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' }, 502],
     ['an extra ticket field', { attacker: true }, 502],
     ['an expired timestamp', { expiresAt: 1_000 }, 410],
-    ['a timestamp beyond the 30-second lifetime', { expiresAt: 31_001 }, 502],
-    ['a fractional timestamp', { expiresAt: 30_999.5 }, 502],
+    ['a timestamp beyond the 120-second lifetime', { expiresAt: 121_001 }, 502],
+    ['a fractional timestamp', { expiresAt: 120_999.5 }, 502],
     ['an unsafe cached URL', { validatedUrl: 'https://attacker.example/audio' }, 502],
     ['a non-audio cached MIME', { mimeType: 'text/html' }, 502],
   ])('rejects %s before contacting upstream media', async (_label, overrides, status) => {
@@ -230,3 +230,4 @@ describe('security: transient media ticket boundaries', () => {
     expect(response.headers.get('authorization')).toBeNull()
   })
 })
+

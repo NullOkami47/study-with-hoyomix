@@ -3,12 +3,12 @@ import { describe, expect, it } from 'vitest'
 import { automaticProviderEligible, cloudflareCountry } from '../providers/routing'
 import type { ProviderState } from '../providers/config'
 
-const chksz = (overrides: Partial<ProviderState> = {}): ProviderState => ({
-  id: 'chksz',
+const providerState = (id: 'chksz' | 'vkeys', overrides: Partial<ProviderState> = {}): ProviderState => ({
+  id,
   adminEnabled: true,
   deploymentAvailable: true,
   effectiveEnabled: true,
-  priority: 20,
+  priority: id === 'vkeys' ? 50 : 10,
   status: 'unknown',
   failureClass: null,
   latencyMs: null,
@@ -19,26 +19,32 @@ const chksz = (overrides: Partial<ProviderState> = {}): ProviderState => ({
 })
 
 describe('ephemeral provider automatic eligibility', () => {
-  it('allows effective ChKSz automatically globally', () => {
-    const state = chksz()
+  describe.each(['chksz', 'vkeys'] as const)('%s', (id) => {
+    it('allows an effective provider automatically globally', () => {
+      const state = providerState(id)
+      for (const country of ['CN', 'HK', 'US', undefined]) {
+        expect(automaticProviderEligible(state, country)).toBe(true)
+      }
+    })
 
-    expect(automaticProviderEligible(state, 'CN')).toBe(true)
-    expect(automaticProviderEligible(state, 'HK')).toBe(true)
-    expect(automaticProviderEligible(state, 'US')).toBe(true)
-    expect(automaticProviderEligible(state, undefined)).toBe(true)
-  })
+    it.each([
+      ['Admin-disabled', { adminEnabled: false, effectiveEnabled: false }],
+      ['deployment-unavailable', { deploymentAvailable: false, effectiveEnabled: false }],
+    ])('does not re-enable or reprioritise an %s provider', (_case, overrides) => {
+      const state = providerState(id, overrides)
+      const before = { ...state }
+      for (const country of ['CN', 'HK', 'US', undefined]) {
+        expect(automaticProviderEligible(state, country)).toBe(false)
+      }
+      expect(state).toEqual(before)
+    })
 
-  it.each([
-    ['Admin-disabled', { adminEnabled: false, effectiveEnabled: false }],
-    ['deployment-unavailable', { deploymentAvailable: false, effectiveEnabled: false }],
-  ])('does not re-enable or reprioritise %s ChKSz', (_case, overrides) => {
-    expect(automaticProviderEligible(chksz(overrides), 'CN')).toBe(false)
-    expect(automaticProviderEligible(chksz(overrides), 'HK')).toBe(false)
-  })
-
-  it('never makes a manual-only provider automatic', () => {
-    expect(automaticProviderEligible({ ...chksz(), automaticPolicy: 'never' }, 'CN')).toBe(false)
-    expect(automaticProviderEligible({ ...chksz(), automaticPolicy: 'never' }, undefined)).toBe(false)
+    it('never makes a manual-only provider automatic', () => {
+      for (const country of ['CN', 'HK', 'US', undefined]) {
+        expect(automaticProviderEligible(providerState(id, { automaticPolicy: 'never' }), country))
+          .toBe(false)
+      }
+    })
   })
 
   it('reads only the Worker request cf.country property', () => {

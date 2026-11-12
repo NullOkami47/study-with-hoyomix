@@ -29,6 +29,74 @@ export interface AdminProvider {
   ownerFallbackUsable?: boolean
 }
 
+export type LxGlobalSourceStatus = 'active' | 'disabled' | 'pending_network_approval' | 'failed'
+
+export interface AdminLxSourceSnapshot {
+  credentialKeys?: string[]
+  sha256: string
+  version: string | null
+  createdAt: number
+  note: string | null
+  active: boolean
+}
+
+export interface AdminLxSource {
+  plaintextOrigins?: string[]
+  /** Release-provided source whose policy is retained even when disabled. */
+  managed?: boolean
+  id: string
+  name: string
+  version: string | null
+  originUrl: string
+  originKind: 'url' | 'upload'
+  sha256: string
+  enabled: boolean
+  priority: number
+  status: LxGlobalSourceStatus
+  requiredOrigins: string[]
+  pendingOrigins: string[]
+  createdAt: number
+  updatedAt: number
+  lastCheckedAt: number | null
+  lastCheckNote: string | null
+  snapshots: AdminLxSourceSnapshot[]
+}
+
+/** A candidate script, fetched and screened but not stored. */
+export interface AdminLxSourcePreview {
+  credentialKeys?: string[]
+  plaintextOrigins?: string[]
+  sha256: string
+  name: string | null
+  version: string | null
+  /** Origins the script uses as request destinations. These gate publication. */
+  requiredOrigins: string[]
+  /**
+   * Origins that appear only as a header value (`Referer`, `Origin`, …). Shown so the Owner can see
+   * what the script sends without mistaking it for a destination the deployment must allow.
+   */
+  headerOrigins: string[]
+  byteLength: number
+  script: string
+}
+
+export interface AdminLxSourceList {
+  revision: number
+  sources: AdminLxSource[]
+}
+
+/** What an update check found. Nothing is changed by a check. */
+export interface AdminLxUpdateCandidate {
+  credentialKeys?: string[]
+  activeSha256: string
+  candidateSha256: string
+  hasUpdate: boolean
+  candidateVersion: string | null
+  requiredOrigins: string[]
+  /** Present only when there is an update: the body the Owner may adopt. */
+  candidateScript?: string
+}
+
 export interface AdminOverview {
   providers: AdminProvider[]
   activeNoticeCount: number
@@ -230,6 +298,11 @@ export interface AdminCatalogueTrackEditResult {
   track: AdminCatalogueTrackDetail
 }
 
+
+export interface AdminDiscoverySource { provider:string; externalId:string; status:'valid'|'invalid'|'unavailable'|'unverified'|'permission_required'|'rate_limited'; checkedAt:number; confidence:number; reason:string }
+export interface AdminDiscoveryCandidate { id:string; trackId:string; discovery:{videoId:string;title:string;album:string;games:CatalogueGame[];releaseDate?:string;durationSeconds?:number;evidence:string[]}; suggestion:{games:CatalogueGame[];album:string;aliases:Record<string,string[]>;relation_ids:string[];work_group_id:string;vocal_status:CatalogueVocalStatus;tabs:CatalogueTab[];evidence:string[];reasons:string[];confidence:number;uncertainties:string[];adapter:string}; classificationReviewed:boolean; sources:AdminDiscoverySource[]; conflicts:string[]; revision:number; stageState:'pending'|'staged'|'uncertain'; createdAt:number; updatedAt:number }
+export interface AdminDiscoveryStatus { nextCursor?:string|null; candidates:AdminDiscoveryCandidate[]; runs:Array<{runId:string;createdAt:number;discovered:number;added:number;repeated:number;outcome:string}>; configured:boolean; sheetsConfigured:boolean; ingestionConfigured:boolean; channelIds:string[]; adapters:Array<{id:string;available:boolean;mode:string}>; catalogueRevision:number }
+
 interface AdminRepositoryOptions {
   fetch?: typeof fetch
 }
@@ -246,6 +319,15 @@ export interface AdminRepository {
   publishCatalogueBatch(batchId:string,reviewRevision:number):Promise<ImportBatch>
   listCatalogueTracks():Promise<AdminCatalogueIndex>
   getCatalogueTrack(trackId:string):Promise<AdminCatalogueTrackDetail>
+  getDiscoveryStatus(cursor?:string):Promise<AdminDiscoveryStatus>
+  scanDiscovery():Promise<unknown>
+  reconcileDiscoveryCandidate(id:string,revision:number,expectedCatalogueRevision:number):Promise<AdminDiscoveryCandidate>
+  resolveDiscoveryCandidate(id:string,revision:number,trackId:string,reason:string):Promise<AdminDiscoveryCandidate>
+  importDiscoveryManifest(payload:unknown):Promise<unknown>
+  importDiscoverySuggestions(payload:unknown):Promise<unknown>
+  updateDiscoveryCandidate(id:string,payload:Record<string,unknown>,revision:number):Promise<AdminDiscoveryCandidate>
+  checkDiscoveryCandidate(id:string,revision:number):Promise<AdminDiscoveryCandidate>
+  stageDiscoveryCandidate(id:string,revision:number,expectedCatalogueRevision:number):Promise<AdminDiscoveryCandidate>
   updateCatalogueTrack(
     trackId:string,
     changes:AdminCatalogueTrackEdit,
@@ -276,10 +358,27 @@ export interface AdminRepository {
   restoreBackground(id: string): Promise<AdminBackground>
   purgeBackground(id: string): Promise<void>
   checkSession(): Promise<AdminSessionResult>
+  listLxSources(): Promise<AdminLxSourceList>
+  previewLxSource(input: { url?: string; script?: string }): Promise<AdminLxSourcePreview>
+  createLxSource(input: { url?: string; script?: string; name?: string; version?: string; originUrl?: string; credentialDisclosureSha256?: string }): Promise<AdminLxSource>
+  updateLxSource(id: string, patch: { enabled?: boolean; priority?: number; name?: string }): Promise<AdminLxSource>
+  reorderLxSources(ids: string[]): Promise<number>
+  deleteLxSource(id: string): Promise<number>
+  checkLxSourceUpdate(id: string): Promise<AdminLxUpdateCandidate>
+  adoptLxSource(id: string, sha256: string, script?: string, credentialDisclosureSha256?: string): Promise<AdminLxSource>
+  verifyLxSource(id: string, ok: boolean, note: string): Promise<AdminLxSource>
 }
 
-const jsonBody = async <T>(response: Response): Promise<T> => {
-  if (!response.ok) throw new Error(`admin_${response.status}`)
+const jsonBody = async <T>(response: Response, includeReason = false): Promise<T> => {
+  if (!response.ok) {
+    if (!includeReason) throw new Error(`admin_${response.status}`)
+    let detail: { error?: unknown; message?: unknown } | null = null
+    try { detail = await response.json() } catch { /* Upstream errors need not be JSON. */ }
+    const code = typeof detail?.error === 'string' && /^[a-z0-9_]{1,80}$/u.test(detail.error)
+      ? detail.error : `admin_${response.status}`
+    const message = typeof detail?.message === 'string' ? detail.message.slice(0, 1000) : ''
+    throw new Error(message ? `${code}: ${message}` : code)
+  }
   return response.json() as Promise<T>
 }
 
@@ -305,14 +404,14 @@ export function createAdminRepository(options: AdminRepositoryOptions = {}): Adm
   const get = <T>(path: string) => fetcher(path, {
     credentials: 'same-origin',
     headers: { accept: 'application/json' },
-  }).then((r) => jsonBody<T>(r))
+  }).then((r) => jsonBody<T>(r, (path.startsWith('/api/admin/lx/sources')||path.startsWith('/api/admin/catalogue/discovery'))))
 
   const mutate = <T>(path: string, method: string, body?: unknown) => fetcher(path, {
     method,
     credentials: 'same-origin',
     headers: body !== undefined ? mutationHeaders(origin) : { accept: 'application/json', ...mutationHeaders(origin) },
     body: body !== undefined ? JSON.stringify(body) : undefined,
-  }).then((r) => jsonBody<T>(r))
+  }).then((r) => jsonBody<T>(r, path.startsWith('/api/admin/lx/sources')))
 
   const mutateMedia = async <T>(path: string, file: File, options?: BackgroundUploadOptions): Promise<T> => {
     if (file.type.startsWith('video/')) {
@@ -347,6 +446,15 @@ export function createAdminRepository(options: AdminRepositoryOptions = {}): Adm
     approveCatalogueR2AsOwner:(id,changeId,reviewRevision)=>mutate<ImportBatch>(catalogueBatchPath(id)+'/changes/'+encodeURIComponent(changeId)+'/approve-r2-owner','POST',{reviewRevision}),
     approveCatalogueHighConfidence:(id,reviewRevision)=>mutate<ImportBatch>(catalogueBatchPath(id)+'/approve-high-confidence','POST',{reviewRevision}),
     publishCatalogueBatch:(id,reviewRevision)=>mutate<ImportBatch>(catalogueBatchPath(id)+'/publish','POST',{reviewRevision}),
+    getDiscoveryStatus:(cursor)=>get<AdminDiscoveryStatus>('/api/admin/catalogue/discovery'+(cursor?'?cursor='+encodeURIComponent(cursor):'')),
+    reconcileDiscoveryCandidate:(id,revision,expectedCatalogueRevision)=>mutate<AdminDiscoveryCandidate>('/api/admin/catalogue/discovery/'+encodeURIComponent(id)+'/reconcile','POST',{revision,expectedCatalogueRevision}),
+    resolveDiscoveryCandidate:(id,revision,trackId,reason)=>mutate<AdminDiscoveryCandidate>('/api/admin/catalogue/discovery/'+encodeURIComponent(id)+'/resolve','POST',{revision,trackId,reason}),
+    scanDiscovery:()=>mutate<unknown>('/api/admin/catalogue/discovery/scan','POST',{}),
+    importDiscoveryManifest:(payload)=>mutate<unknown>('/api/admin/catalogue/discovery/import','POST',payload),
+    importDiscoverySuggestions:(payload)=>mutate<unknown>('/api/admin/catalogue/discovery/suggestions','POST',payload),
+    updateDiscoveryCandidate:(id,payload,revision)=>mutate<AdminDiscoveryCandidate>('/api/admin/catalogue/discovery/'+encodeURIComponent(id),'PATCH',{...payload,revision,reviewed:true}),
+    checkDiscoveryCandidate:(id,revision)=>mutate<AdminDiscoveryCandidate>('/api/admin/catalogue/discovery/'+encodeURIComponent(id)+'/check','POST',{revision}),
+    stageDiscoveryCandidate:(id,revision,expectedCatalogueRevision)=>mutate<AdminDiscoveryCandidate>('/api/admin/catalogue/discovery/'+encodeURIComponent(id)+'/stage','POST',{revision,expectedCatalogueRevision}),
     listCatalogueTracks:()=>get<AdminCatalogueIndex>('/api/admin/catalogue/tracks'),
     getCatalogueTrack:(trackId)=>get<AdminCatalogueTrackDetail>(
       '/api/admin/catalogue/tracks/'+encodeURIComponent(trackId),
@@ -381,6 +489,52 @@ export function createAdminRepository(options: AdminRepositoryOptions = {}): Adm
         'PUT',
         { enabled },
       )
+    },
+    async listLxSources() {
+      return get<AdminLxSourceList>('/api/admin/lx/sources')
+    },
+    async previewLxSource(input) {
+      return mutate<AdminLxSourcePreview>('/api/admin/lx/sources/preview', 'POST', input)
+    },
+    async createLxSource(input) {
+      return mutate<{ source: AdminLxSource }>('/api/admin/lx/sources', 'POST', input).then((r) => r.source)
+    },
+    async updateLxSource(id, patch) {
+      return mutate<{ source: AdminLxSource }>(
+        `/api/admin/lx/sources/${encodeURIComponent(id)}`,
+        'PATCH',
+        patch,
+      ).then((r) => r.source)
+    },
+    async reorderLxSources(ids) {
+      return mutate<{ revision: number }>('/api/admin/lx/sources/order', 'POST', { ids }).then((r) => r.revision)
+    },
+    async deleteLxSource(id) {
+      return mutate<{ revision: number }>(
+        `/api/admin/lx/sources/${encodeURIComponent(id)}`,
+        'DELETE',
+      ).then((r) => r.revision)
+    },
+    async checkLxSourceUpdate(id) {
+      return mutate<AdminLxUpdateCandidate>(
+        `/api/admin/lx/sources/${encodeURIComponent(id)}/check-update`,
+        'POST',
+        {},
+      )
+    },
+    async adoptLxSource(id, sha256, script, credentialDisclosureSha256) {
+      return mutate<{ source: AdminLxSource }>(
+        `/api/admin/lx/sources/${encodeURIComponent(id)}/adopt`,
+        'POST',
+        { sha256, ...(script === undefined ? {} : { script }), ...(credentialDisclosureSha256 === undefined ? {} : { credentialDisclosureSha256 }) },
+      ).then((r) => r.source)
+    },
+    async verifyLxSource(id, ok, note) {
+      return mutate<{ source: AdminLxSource }>(
+        `/api/admin/lx/sources/${encodeURIComponent(id)}/verify`,
+        'POST',
+        { ok, note },
+      ).then((r) => r.source)
     },
     async listNotices() {
       return get<{ notices: AdminNotice[] }>('/api/admin/notices').then((r) => r.notices)

@@ -7,13 +7,22 @@ import { createAdminHandler, type AdminEnv } from '../admin/routes'
 import { createAuthHandler } from '../auth/routes'
 import { BACKGROUND_IMAGE_MAX_BYTES } from '../backgrounds/mediaValidation'
 import type { BackgroundBucket, BackgroundStoredObject } from '../backgrounds/storage'
-import { STATIC_BACKGROUND_IDS } from '../../src/features/backgrounds/staticDefinitions'
+import { PUBLIC_BACKGROUND_IDS } from './fixtures/publicBackgrounds'
 import { applyApiSecurityHeaders } from '../index'
 
-vi.mock('../../src/features/backgrounds/staticDefinitions', async (importOriginal) => ({
-  ...await importOriginal<typeof import('../../src/features/backgrounds/staticDefinitions')>(),
-  ...await import('./static-backgrounds-fixture'),
-}))
+// Inject only test data; keep the real routes, security constants and playback URL policy.
+vi.mock('../../src/features/backgrounds/staticDefinitions', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/features/backgrounds/staticDefinitions')>()
+  const fixture = await import('./fixtures/publicBackgrounds')
+  return {
+    ...actual,
+    STATIC_BACKGROUND_DEFINITIONS: fixture.PUBLIC_BACKGROUND_DEFINITIONS,
+    STATIC_BACKGROUND_IDS: fixture.PUBLIC_BACKGROUND_IDS,
+    isStaticBackgroundId: fixture.isPublicBackgroundId,
+    staticBackgroundDefinition: fixture.publicBackgroundDefinition,
+  }
+})
+
 const ORIGIN = 'https://study.example'
 const NOW = 1_787_030_400_000
 
@@ -411,7 +420,7 @@ describe('Admin background operations', () => {
   it('rejects stale background selection revisions after deletion and an absent condition against an existing row', async () => {
     const handler = createAdminHandler(env, { now: () => NOW + 3 })
     const cookie = await authenticatedCookie('user')
-    const selection = { selectedIds: [STATIC_BACKGROUND_IDS[0]], autoRotate: true, intervalSeconds: 1200 }
+    const selection = { selectedIds: [PUBLIC_BACKGROUND_IDS[0]], autoRotate: true, intervalSeconds: 1200 }
     const put = (value: typeof selection, expected: string) => handler.fetch(request('/api/account/background-selection', cookie, {
       method: 'PUT', headers: { 'content-type': 'application/json', origin: ORIGIN, 'if-match': expected }, body: JSON.stringify(value),
     }))
@@ -729,7 +738,7 @@ describe('Admin background operations', () => {
     // The bug: undefined?.purgeStartedAt !== null evaluates to true
     const testUndefined: any = undefined
     expect(testUndefined?.purgeStartedAt !== null).toBe(true) // Demonstrates the bug
-
+    
     // This test documents the vulnerability even though outer readBackground() mitigates it
     // The purge() function itself needs fixing for defense-in-depth
     const cookie = await authenticatedCookie('admin')
@@ -746,14 +755,14 @@ describe('Admin background operations', () => {
       headers: { origin: ORIGIN },
     }))
     expect(purgeResponse.status).toBe(204)
-
+    
     // Second purge attempt correctly returns 404 (protected by outer readBackground check)
     const stalePurge = await handler.fetch(request(`/api/admin/backgrounds/${id}/purge`, cookie, {
       method: 'DELETE',
       headers: { origin: ORIGIN },
     }))
     expect(stalePurge.status).toBe(404)
-
+    
     // Verify exactly one audit
     const auditCount = await database.prepare(`
       SELECT COUNT(*) AS count FROM admin_audit_log WHERE target_key = ? AND action = 'background.purge'
@@ -803,16 +812,16 @@ describe('Admin background operations', () => {
     expect(restoreResponse.status).toBe(409)
     expect(restoreResponse.headers.get('content-type')).toContain('application/json')
     expect(restoreResponse.headers.get('x-content-type-options')).toBe('nosniff')
-
+    
     const body = await restoreResponse.json()
     expect(body).toEqual({ error: expect.any(String) })
-
+    
     // Verify no restore audit was created
     const restoreAuditCount = await database.prepare(`
       SELECT COUNT(*) AS count FROM admin_audit_log WHERE target_key = ? AND action = 'background.restore'
     `).bind(`background:${id}`).first<number>('count')
     expect(restoreAuditCount).toBe(0)
-
+    
     // Verify background still in recovery state
     const stillRecovery = await database.prepare(`
       SELECT status, purge_started_at AS purgeStartedAt FROM background_media WHERE id = ?
@@ -824,9 +833,9 @@ describe('Admin background operations', () => {
     // Section 12: Permanent regression test for partial R2 deletion scenario
     // Video backgrounds have TWO R2 objects: object_key (video) and poster_object_key (thumbnail)
     // If R2 delete fails after deleting the first object, purge_started_at recovery state prevents inconsistency
-
+    
     const cookie = await authenticatedCookie('admin')
-
+    
     // For this test, we simulate the scenario by creating an image background,
     // publishing, archiving, then manually injecting a poster_object_key to simulate
     // a video background with two objects
@@ -834,7 +843,7 @@ describe('Admin background operations', () => {
     const { background } = await created.json() as { background: { id: string } }
     const id = background.id
     const handler = createAdminHandler(env, { now: () => NOW + 12 })
-
+    
     await handler.fetch(request(`/api/admin/backgrounds/${id}/publish`, cookie, {
       method: 'POST',
       headers: { origin: ORIGIN },
@@ -843,38 +852,38 @@ describe('Admin background operations', () => {
       method: 'POST',
       headers: { origin: ORIGIN },
     }))
-
+    
     // Manually inject a second R2 object to simulate video + poster scenario
     // Inject R2 failure during purge to test recovery state
     const originalDelete = bucket.bucket.delete
     bucket.bucket.delete = vi.fn(async () => {
       throw new Error('Injected R2 deletion failure')
     })
-
+    
     const purgeResponse = await handler.fetch(request(`/api/admin/backgrounds/${id}/purge`, cookie, {
       method: 'DELETE',
       headers: { origin: ORIGIN },
     }))
-
+    
     // Purge should fail with 503 due to R2 failure
     expect(purgeResponse.status).toBe(503)
-
+    
     bucket.bucket.delete = originalDelete
-
+    
     // CRITICAL: Verify purge_started_at was set (recovery state)
     const recoveryState = await database.prepare(`
       SELECT purge_started_at AS purgeStartedAt FROM background_media WHERE id = ?
     `).bind(id).first<{ purgeStartedAt: number | null }>()
-
+    
     expect(recoveryState?.purgeStartedAt).toBeTypeOf('number')
-
+    
     // Verify lifecycle transitions are blocked
     const restoreAttempt = await handler.fetch(request(`/api/admin/backgrounds/${id}/restore`, cookie, {
       method: 'POST',
       headers: { origin: ORIGIN },
     }))
     expect(restoreAttempt.status).toBe(409)
-
+    
     const republishAttempt = await handler.fetch(request(`/api/admin/backgrounds/${id}/publish`, cookie, {
       method: 'POST',
       headers: { origin: ORIGIN },
@@ -890,6 +899,12 @@ describe('Admin background operations', () => {
     }))
 
   it('merges every shipped static background into the admin catalogue with metadata', async () => {
+    const defaults = await vi.importActual<typeof import('../../src/features/backgrounds/staticDefinitions')>(
+      '../../src/features/backgrounds/staticDefinitions',
+    )
+    expect(defaults.STATIC_BACKGROUND_DEFINITIONS).toEqual([])
+    expect(defaults.STATIC_BACKGROUND_IDS).toEqual([])
+    expect(defaults.BACKGROUND_BUCKET_ORIGIN).toBe('')
     const cookie = await authenticatedCookie('admin')
     const handler = createAdminHandler(env, { now: () => NOW + 20 })
     const response = await handler.fetch(request('/api/admin/backgrounds', cookie))
@@ -897,17 +912,16 @@ describe('Admin background operations', () => {
     const body = await response.json() as { backgrounds: Array<Record<string, unknown>> }
 
     const shipped = body.backgrounds.filter((entry) => entry.isShipped === true)
-    expect(shipped).toHaveLength(STATIC_BACKGROUND_IDS.length)
-    expect(shipped.map((entry) => entry.id)).toEqual([...STATIC_BACKGROUND_IDS].sort())
+    expect(shipped).toHaveLength(9)
+    expect(shipped.map((entry) => entry.id)).toEqual([...PUBLIC_BACKGROUND_IDS].sort())
     for (const entry of shipped) {
       expect(entry).toMatchObject({
         revision: 1,
         status: 'published',
         kind: 'video',
         contentType: 'video/mp4',
-        // Shipped files carry no rights clearance: shipping a file is not
-        // evidence of permission, so the value stays `not-reviewed` exactly as
-        // this synthetic fixture intentionally models unreviewed media.
+        // Synthetic definitions still use the real unreviewed-rights default;
+        // catalogue membership must never imply permission.
         rightsStatus: 'not-reviewed',
         isShipped: true,
         createdAt: 0,
@@ -921,17 +935,17 @@ describe('Admin background operations', () => {
       expect(entry.posterUrl).toBeTruthy()
     }
 
-    const urbanStrollTrio = [
-      ['demo-stroll-one', 'Demo One'],
-      ['demo-stroll-two', 'Demo Two'],
-      ['demo-stroll-three', 'Demo Three'],
+    const syntheticGardenTrio = [
+      ['demo-garden-dawn', 'Synthetic Garden at Dawn'],
+      ['demo-garden-noon', 'Synthetic Garden at Noon'],
+      ['demo-garden-night', 'Synthetic Garden at Night'],
     ] as const
-    for (const [id, title] of urbanStrollTrio) {
+    for (const [id, title] of syntheticGardenTrio) {
       const entry = shipped.find((candidate) => candidate.id === id)
       expect(entry).toMatchObject({
         title,
         game: 'zzz',
-        collection: 'urban-stroll',
+        collection: 'synthetic-garden',
         width: 1920,
         height: 1080,
         fps: 24,
@@ -1062,18 +1076,18 @@ describe('Admin background operations', () => {
 
   it('creates and updates a shipped override through PATCH, preserving status and other fields', async () => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-stroll-one'
+    const id = 'demo-garden-dawn'
 
     const first = await patchMetadata(id, cookie, JSON.stringify({ title: 'Renamed', displayOrder: 3 }))
     expect(first.status).toBe(200)
     expect((await first.json() as { background: Record<string, unknown> }).background).toMatchObject({
       id, isShipped: true, status: 'published', title: 'Renamed', displayOrder: 3,
-      game: 'zzz', collection: 'urban-stroll',
+      game: 'zzz', collection: 'synthetic-garden',
     })
 
     const second = await patchMetadata(id, cookie, JSON.stringify({ game: 'custom-game' }), 21)
     expect((await second.json() as { background: Record<string, unknown> }).background).toMatchObject({
-      title: 'Renamed', game: 'custom-game', collection: 'urban-stroll', displayOrder: 3,
+      title: 'Renamed', game: 'custom-game', collection: 'synthetic-garden', displayOrder: 3,
     })
 
     const overrides = await createAdminHandler(env, { now: () => NOW + 21 }).fetch(request('/api/backgrounds/overrides'))
@@ -1135,7 +1149,7 @@ describe('Admin background operations', () => {
 
   it.each(['published', 'archived', 'tombstoned'] as const)('preserves concurrent distinct shipped metadata fields and existing %s status', async (status) => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     await database.prepare(`
       INSERT INTO static_background_overrides (id, status, title, game, collection, display_order, updated_at)
       VALUES (?, ?, 'Before', 'zzz', 'Original collection', 7, ?)
@@ -1150,7 +1164,7 @@ describe('Admin background operations', () => {
 
   it('preserves concurrent distinct shipped metadata fields on first-ever override creation', async () => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     await raceShippedPatches(id, cookie, [{ title: 'First title', displayOrder: 0 }, { game: 'first-game', collection: 'First collection' }])
 
     const row = await database.prepare('SELECT status, title, game, collection, display_order AS displayOrder FROM static_background_overrides WHERE id = ?')
@@ -1160,7 +1174,7 @@ describe('Admin background operations', () => {
 
   it('preserves explicit shipped metadata clears alongside a concurrent distinct field patch', async () => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     await database.prepare(`
       INSERT INTO static_background_overrides (id, status, title, game, collection, display_order, updated_at)
       VALUES (?, 'archived', 'Before', 'zzz', 'Before collection', 7, ?)
@@ -1175,7 +1189,7 @@ describe('Admin background operations', () => {
 
   it('keeps last-writer behaviour for concurrent patches of the same shipped field', async () => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     const firstCommit = await raceShippedPatches(id, cookie, [{ title: 'Writer one' }, { title: 'Writer two' }])
     const row = await database.prepare('SELECT title FROM static_background_overrides WHERE id = ?').bind(id).first<{ title: string }>()
     expect(row?.title).toBe(firstCommit.title === 'Writer one' ? 'Writer two' : 'Writer one')
@@ -1183,7 +1197,7 @@ describe('Admin background operations', () => {
 
   it.each([false, true])('rolls back shipped metadata when its audit fails with existing override=%s', async (existing) => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     if (existing) {
       await database.prepare(`
         INSERT INTO static_background_overrides (id, status, title, updated_at) VALUES (?, 'tombstoned', 'Before', ?)
@@ -1214,7 +1228,7 @@ describe('Admin background operations', () => {
     const missingUpload = await patchMetadata('11111111-1111-4111-8111-111111111111', cookie, JSON.stringify({ title: 'ok' }))
     expect(missingUpload.status).toBe(404)
     expect(await missingUpload.json()).toEqual({ error: 'background_not_found' })
-    const missingShipped = await patchMetadata('zzz-not-a-real-background', cookie, JSON.stringify({ title: 'ok' }))
+    const missingShipped = await patchMetadata('demo-missing-background', cookie, JSON.stringify({ title: 'ok' }))
     expect(missingShipped.status).toBe(404)
     expect(await missingShipped.json()).toEqual({ error: 'background_not_found' })
 
@@ -1227,7 +1241,7 @@ describe('Admin background operations', () => {
   it('archives and restores a shipped background without touching R2', async () => {
     const cookie = await authenticatedCookie('admin')
     const handler = createAdminHandler(env, { now: () => NOW + 22 })
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     const action = (name: string) => handler.fetch(request(`/api/admin/backgrounds/${id}/${name}`, cookie, {
       method: 'POST', headers: { origin: ORIGIN },
     }))
@@ -1266,7 +1280,7 @@ describe('Admin background operations', () => {
 
   it.each(['restore', 'purge'] as const)('rejects a stale shipped %s and rolls back its audit after a concurrent tombstone', async (action) => {
     const cookie = await authenticatedCookie('admin')
-    const id = 'demo-background-four'
+    const id = 'demo-room-noon'
     await database.prepare("INSERT INTO static_background_overrides (id, status, updated_at) VALUES (?, 'archived', ?)").bind(id, NOW).run()
     const originalBatch = database.batch.bind(database)
     // Miniflare's remote binding proxy does not preserve spyOn assignment.
@@ -1290,7 +1304,7 @@ describe('Admin background operations', () => {
     const adminCookie = await authenticatedCookie('admin')
     const userCookie = await authenticatedCookie('user')
     const handler = createAdminHandler(env, { now: () => NOW + 23 })
-    const id = 'demo-background-five'
+    const id = 'demo-room-night'
 
     // Purge on a non-archived shipped background is a conflict.
     expect((await handler.fetch(request(`/api/admin/backgrounds/${id}/purge`, adminCookie, {
@@ -1336,11 +1350,29 @@ describe('Admin background operations', () => {
     ]))
   })
 
+  it('enforces the eight-background selection limit and rejects duplicates without changing saved selections', async () => {
+    const cookie = await authenticatedCookie('user')
+    const handler = createAdminHandler(env, { now: () => NOW + 24 })
+    const selectedIds = PUBLIC_BACKGROUND_IDS.slice(0, 8)
+    const selection = { selectedIds, autoRotate: true, intervalSeconds: 30 }
+    const select = (ids: string[]) => handler.fetch(request('/api/account/background-selection', cookie, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', origin: ORIGIN },
+      body: JSON.stringify({ ...selection, selectedIds: ids }),
+    }))
+
+    expect((await select(selectedIds)).status).toBe(200)
+    expect((await select(PUBLIC_BACKGROUND_IDS)).status).toBe(400)
+    expect((await select([selectedIds[0], selectedIds[0]])).status).toBe(400)
+    const loaded = await handler.fetch(request('/api/account/background-selection', cookie))
+    expect(await loaded.json()).toEqual({ selection })
+  })
+
   it('accepts published shipped ids for account selection and rejects unavailable ones', async () => {
     const adminCookie = await authenticatedCookie('admin')
     const userCookie = await authenticatedCookie('user')
     const handler = createAdminHandler(env, { now: () => NOW + 24 })
-    const id = 'demo-background-seven'
+    const id = 'demo-study-night'
     const select = (selectedIds: string[]) => handler.fetch(request('/api/account/background-selection', userCookie, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', origin: ORIGIN },
@@ -1372,7 +1404,7 @@ describe('Admin background operations', () => {
   ] as const)('denies shipped background mutations to %s without writing overrides', async (role, status) => {
     const cookie = role ? await authenticatedCookie(role) : undefined
     const handler = createAdminHandler(env, { now: () => NOW + 25 })
-    const id = 'demo-background-six'
+    const id = 'demo-room-dawn'
     const attempts = [
       () => handler.fetch(request(`/api/admin/backgrounds/${id}`, cookie, {
         method: 'PATCH',

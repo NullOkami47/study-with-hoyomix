@@ -6,7 +6,7 @@
 import { computed } from 'vue'
 
 import { translate, type Locale, type TranslationKey } from '../../i18n'
-import { placeholderArtwork } from './artwork'
+import { placeholderArtwork, useArtwork } from './artwork'
 import { gameLabel, type GameEntry } from './catalogueIndex'
 
 const props = defineProps<{ game: GameEntry; locale: Locale }>()
@@ -29,6 +29,13 @@ const counts = computed(() =>
   }),
 )
 const openLabel = computed(() => format('musicLibrary.browseGame', { game: name.value }))
+
+const representativeTrack = computed(() => props.game.representativeTrack)
+const artworkKey = computed(() => `game:${props.game.id}:${representativeTrack.value?.id ?? ''}`)
+const { artworkUrl, isLoaded, hasFailed, onLoad, onError } = useArtwork(
+  artworkKey,
+  representativeTrack,
+)
 </script>
 
 <template>
@@ -40,7 +47,21 @@ const openLabel = computed(() => format('musicLibrary.browseGame', { game: name.
       :aria-label="openLabel"
       @click="emit('open', game)"
     >
-      <span class="game-card__artwork" aria-hidden="true" :style="artworkStyle" />
+      <span class="game-card__artwork" aria-hidden="true" :style="artworkStyle">
+        <img
+          v-if="artworkUrl && !hasFailed"
+          :key="artworkUrl"
+          :src="artworkUrl"
+          alt=""
+          loading="lazy"
+          decoding="async"
+          class="game-card__image"
+          :class="{ 'is-loaded': isLoaded }"
+          data-game-artwork
+          @load="onLoad"
+          @error="onError"
+        />
+      </span>
       <span class="game-card__name" data-game-name>{{ name }}</span>
       <span class="game-card__counts" data-game-counts>{{ counts }}</span>
     </button>
@@ -68,15 +89,28 @@ const openLabel = computed(() => format('musicLibrary.browseGame', { game: name.
 .game-card__button:hover { filter: var(--control-hover-filter); }
 .game-card__button:active { filter: var(--control-active-filter); }
 .game-card__artwork {
+  position: relative;
+  overflow: hidden;
   inline-size: 100%;
   aspect-ratio: 16 / 9;
   background: var(--artwork, var(--liquid-selected));
   border-radius: 0.5rem;
   box-shadow: var(--liquid-inner-light);
 }
+.game-card__image {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity var(--liquid-motion) var(--liquid-easing);
+}
+.game-card__image.is-loaded { opacity: 1; }
 .game-card__name { min-width: 0; overflow-wrap: anywhere; font-size: 1rem; font-weight: 650; }
 .game-card__counts { color: var(--liquid-text-secondary); font-size: 0.75rem; }
 @media (prefers-reduced-motion: reduce) {
-  .game-card__button { transition-duration: 0ms; }
+  .game-card__button,
+  .game-card__image { transition-duration: 0ms; }
 }
 </style>

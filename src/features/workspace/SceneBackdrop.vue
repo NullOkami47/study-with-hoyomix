@@ -151,9 +151,10 @@ function isTarget(index: number): boolean {
 }
 function onUnavailable(index: number): void {
   if (!isTarget(index)) return
-  // A buffered/paused frame may stay visible; an empty decoder must not cover
-  // the poster with an opaque black video element.
-  if (!video || video.readyState < 2 || video.error) slots.value[index].hasFrame = false
+  // Same-source loop seeks may briefly retain only metadata. Keep a previously
+  // presented frame visible until progress resumes or recovery reloads it.
+  // Initial loading never gains a frame here; an empty decoder/error reveals the poster.
+  if (!video || video.readyState === 0 || video.error) slots.value[index].hasFrame = false
   armRecovery()
 }
 function onProgress(index: number): void {

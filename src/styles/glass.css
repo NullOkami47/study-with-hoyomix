@@ -1,0 +1,648 @@
+/*
+ * Liquid Glass material system for the Studio visual style.
+ * Original implementation for Study with HOYO-MiX (GPL-3.0). Not derived from liquid-glass-studio or
+ * StudyWithMiku source; StudyWithMiku served as visual reference only.
+ *
+ * Scope: every rule is scoped with :root[data-theme="studio"], and every --lg-* / --lgm-* custom
+ * property is defined only under that scope. Cinematic retains the shared pre-108 tokens.
+ * The old Studio WebGL substrate is not layered underneath this material.
+ *
+ * Tiers. Three backdrop kinds (clear, regular, thick), two non-backdrop kinds (thick-solid for popovers
+ * that overflow a glass parent, which Chromium would otherwise turn into a Backdrop Root hole, and
+ * inset for glass nested in glass), and a scrim. Elements map a kind onto per-element slots (--lgm-*);
+ * one recipe paints every glass root from those slots.
+ *
+ * Root-variable precedence (no cascade layers). Every root-variable rule is exactly
+ * :root[data-theme="studio"] optionally followed by :where(<qualifier>), so all are (0,2,0) and
+ * file order decides: 1 base (= bright tone) > 2 tone > 3 mobile blur > 4 low power > 5 no backdrop >
+ * 6 prefers-contrast: more > 7 prefers-reduced-transparency > 8 forced-colors.
+ * Scene values (--lg-scene-*) come from rules 1-4 only; effective values (--lg-tint-*, --lg-sheen-*,
+ * --lg-backdrop-*) default to the scene values and only rules 5-8 override them. The hero refraction
+ * rule reads the scene values, every other element reads the effective values.
+ *
+ * Studio optical tuning: a feathered neutral centre protects white text while the
+ * rim stays clear. Native backdrop compositing follows live video without uploads
+ * or duplicate decoders. Pixel contrast, not the historical #108 tint recipe, is
+ * the acceptance gate. Geometry is inherited from the existing controls.
+ */
+
+/* 1. Base defaults (bright tone, the safe value) ------------------------------------------------ */
+:root[data-theme="studio"] {
+  --lg-base: 22 24 32;
+  --lg-text-primary: #f7f8fa;
+  --lg-text-secondary: rgb(222 227 236);
+  --lg-text-shadow: 0 0.5px 1.5px rgb(0 0 0 / 35%);
+  --lg-fill-rest-a: 0.07;
+  --lg-fill-hover-a: 0.10;
+  --lg-fill-press-a: 0.10;
+  --lg-fill-rest: rgb(255 255 255 / var(--lg-fill-rest-a));
+  --lg-fill-hover: rgb(255 255 255 / var(--lg-fill-hover-a));
+  --lg-fill-press: rgb(255 255 255 / var(--lg-fill-press-a));
+  --lg-fill-selected: rgb(214 230 250 / 18%);
+  --lg-fill-selected-edge: inset 0 1px 0 rgb(255 255 255 / 18%);
+  --lg-separator: rgb(255 255 255 / 12%);
+  --lg-solid-overlay: rgb(22 24 32 / 92%);
+  --lg-dense-tint: max(calc(0.84 + var(--studio-gray, 0.26) * 0.08), var(--lg-tint-thick));
+  --lg-dense-centre: calc(0.78 + var(--studio-gray, 0.26) * 0.12);
+  --lg-radius-shell: 2.5rem;
+  --lg-radius-popover: 1.5rem;
+  --lg-radius-control: 0.875rem;
+  --lg-radius-inner: 1rem;
+  --lg-scrim: rgb(4 8 14 / 46%);
+
+  --lg-dur-fast: 160ms;
+  --lg-dur-enter: 320ms;
+  --lg-dur-sheet: 380ms;
+  --lg-dur-tone: 600ms;
+  --lg-dur-scrim: 240ms;
+  /* Spring, damping ratio ~0.68 with a slight overshoot; used only by the press scale. */
+  --lg-ease-spring: linear(0, 0.121, 0.365, 0.615, 0.814, 0.947, 1.02, 1.05, 1.053, 1.043, 1.03, 1.017, 1.007, 1.001, 0.998, 0.997, 0.997, 0.998, 1);
+  /* Near-critically damped (~0.9); opacity and the backdrop condense. */
+  --lg-ease-smooth: linear(0, 0.121, 0.344, 0.557, 0.722, 0.837, 0.911, 0.955, 0.979, 0.992, 0.998, 1.001, 1.001, 1.001, 1.001, 1.001, 1);
+  /* backdrop-filter is deliberately not transitioned to avoid repeatedly
+     re-filtering live video during a blur transition. Surfaces
+     fade in; optical/CSS fallback changes must be immediate to prevent a
+     transparent flash while an expanded player scrolls. */
+  --lg-transition-surface:
+    opacity var(--lg-dur-enter) var(--lg-ease-smooth),
+    filter var(--motion-duration) ease;
+  --lg-transition-sheet:
+    opacity var(--lg-dur-sheet) var(--lg-ease-smooth),
+    filter var(--motion-duration) ease;
+  --lg-transition-press: scale var(--lg-dur-fast) var(--lg-ease-spring);
+
+  /* Backdrop columns: desktop values here; mobile and low power below. */
+  --lg-blur-clear: min(var(--studio-blur, 16px), 12px);
+  --lg-blur-regular: var(--studio-blur, 16px);
+  --lg-blur-thick: min(calc(var(--studio-blur, 16px) + 2px), 22px);
+  --lg-sat-clear: 1.25;
+  --lg-sat-regular: 1.2;
+  --lg-sat-thick: 1.15;
+  --lg-bright-clear: 0.84;
+  --lg-bright-regular: 0.85;
+  --lg-bright-thick: 0.86;
+
+  /* Scene tint alpha and sheen (bright tone). */
+  --lg-scene-tint-clear: calc(0.55 + var(--studio-gray, 0.26) * 0.12);
+  --lg-scene-tint-regular: calc(0.60 + var(--studio-gray, 0.26) * 0.12);
+  --lg-scene-tint-thick: calc(0.66 + var(--studio-gray, 0.26) * 0.12);
+  --lg-scene-sheen-clear: 0.06;
+  --lg-scene-sheen-regular: 0.04;
+  --lg-scene-sheen-thick: 0.04;
+  --lg-scene-backdrop-clear: blur(var(--lg-blur-clear)) saturate(var(--lg-sat-clear)) brightness(var(--lg-bright-clear));
+  --lg-scene-backdrop-regular: blur(var(--lg-blur-regular)) saturate(var(--lg-sat-regular)) brightness(var(--lg-bright-regular));
+  --lg-scene-backdrop-thick: blur(var(--lg-blur-thick)) saturate(var(--lg-sat-thick)) brightness(var(--lg-bright-thick));
+
+  /* Historical hero aliases retained for material-token compatibility.
+     Native ready surfaces use the optical recipe at the end of this file. */
+  --lg-hero-blur: min(calc(var(--studio-blur, 16px) * 0.25), 6px);
+  --lg-hero-bright: 0.90;
+  --lg-hero-tint: calc(0.65 + var(--studio-gray, 0.26) * 0.12);
+  --lg-hero-rim-tint: 0.25;
+
+  /* Effective values: the scene values, unless a preference block (5-8) overrides them. */
+  --lg-tint-clear: var(--lg-scene-tint-clear);
+  --lg-tint-regular: var(--lg-scene-tint-regular);
+  --lg-tint-thick: var(--lg-scene-tint-thick);
+  --lg-tint-thick-solid: 0.92;
+  --lg-tint-inset: var(--lg-fill-rest-a);
+  --lg-sheen-clear: var(--lg-scene-sheen-clear);
+  --lg-sheen-regular: var(--lg-scene-sheen-regular);
+  --lg-sheen-thick: var(--lg-scene-sheen-thick);
+  --lg-sheen-thick-solid: 0.05;
+  --lg-sheen-inset: 0;
+  --lg-gloss-clear: 0.03;
+  --lg-gloss-regular: 0.015;
+  --lg-gloss-thick: 0.02;
+  --lg-gloss-thick-solid: 0.02;
+  --lg-gloss-inset: 0;
+  --lg-backdrop-clear: var(--lg-scene-backdrop-clear);
+  --lg-backdrop-regular: var(--lg-scene-backdrop-regular);
+  --lg-backdrop-thick: var(--lg-scene-backdrop-thick);
+
+  /* Two-light rim: a bright leading top edge and a dimmer opposite edge. */
+  --lg-rim-lead-clear: 0.42;
+  --lg-rim-trail-clear: 0.30;
+  --lg-rim-lead-regular: 0.38;
+  --lg-rim-trail-regular: 0.26;
+  --lg-rim-lead-thick: 0.30;
+  --lg-rim-trail-thick: 0.20;
+  --lg-rim-lead-inset: 0.12;
+  --lg-rim-trail-inset: 0.12;
+
+  /* Specular edge: a lit top line, a faint caustic on the bottom edge (light leaving the slab) and a
+     soft inner glow that thickens the rim. Edge-only, so the text area keeps its contrast budget. */
+  --lg-inner-clear: inset 0 1px 0 rgb(255 255 255 / 46%), inset 0 -1px 0 rgb(255 255 255 / 12%), inset 0 0 0 0.5px rgb(255 255 255 / 10%);
+  --lg-inner-regular: inset 0 1px 0 rgb(255 255 255 / 40%), inset 0 -1px 0 rgb(255 255 255 / 10%), inset 0 0 0 0.5px rgb(255 255 255 / 9%);
+  --lg-inner-thick: inset 0 1px 0 rgb(255 255 255 / 28%), inset 0 -1px 0 rgb(255 255 255 / 8%), inset 0 0 0 0.5px rgb(255 255 255 / 8%);
+  --lg-inner-inset: inset 0 1px 0 rgb(255 255 255 / 6%);
+  --lg-drop-clear: 0 6px 20px rgb(0 0 0 / 22%);
+  --lg-drop-regular: 0 10px 32px rgb(0 0 0 / 26%), 0 1px 3px rgb(0 0 0 / 18%);
+  --lg-drop-thick: 0 18px 48px rgb(0 0 0 / 34%), 0 2px 6px rgb(0 0 0 / 18%);
+  --lg-drop-inset: 0 0 #0000;
+
+  /* Legacy aliases (Studio only; tokens.css keeps the global values for Cinematic and admin). */
+  --liquid-tint: rgb(var(--lg-base) / var(--lg-tint-regular));
+  --liquid-popover-tint: rgb(var(--lg-base) / var(--lg-tint-thick));
+  --liquid-blur: var(--lg-blur-regular);
+  --liquid-saturation: var(--lg-sat-regular);
+  --liquid-edge-light: rgb(255 255 255 / 45%);
+  --liquid-inner-light: inset 0 1px 0 rgb(255 255 255 / 12%);
+  --liquid-shadow: var(--lg-drop-thick);
+  --liquid-selected: var(--lg-fill-selected);
+  --liquid-separator: var(--lg-separator);
+  --liquid-text-primary: var(--lg-text-primary);
+  --liquid-text-secondary: var(--lg-text-secondary);
+  --liquid-motion: var(--lg-dur-fast);
+  --liquid-easing: var(--lg-ease-smooth);
+}
+@supports not (transition-timing-function: linear(0, 1)) {
+  :root[data-theme="studio"] {
+    --lg-ease-spring: cubic-bezier(0.34, 1.3, 0.64, 1);
+    --lg-ease-smooth: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-theme="studio"] {
+    --lg-dur-fast: 0ms;
+    --lg-dur-enter: 0ms;
+    --lg-dur-sheet: 0ms;
+    --lg-dur-tone: 0ms;
+    --lg-dur-scrim: 0ms;
+  }
+}
+
+/* 2. Optional tone overrides. The native owner does not sample the scene and
+      conservatively retains the bright defaults unless a tone is supplied. */
+:root[data-theme="studio"]:where([data-scene-tone="mid"]) {
+  --lg-bright-clear: 0.88;
+  --lg-bright-regular: 0.90;
+  --lg-bright-thick: 0.92;
+  --lg-scene-tint-clear: 0.44;
+  --lg-scene-tint-regular: 0.52;
+  --lg-scene-tint-thick: 0.64;
+  --lg-scene-sheen-clear: 0.08;
+  --lg-scene-sheen-regular: 0.07;
+  --lg-scene-sheen-thick: 0.06;
+  --lg-hero-tint: 0.52;
+  --lg-scrim: rgb(4 8 14 / 38%);
+}
+:root[data-theme="studio"]:where([data-scene-tone="dark"]) {
+  --lg-bright-clear: 1;
+  --lg-bright-regular: 1;
+  --lg-bright-thick: 1;
+  --lg-scene-tint-clear: 0.36;
+  --lg-scene-tint-regular: 0.42;
+  --lg-scene-tint-thick: 0.58;
+  --lg-scene-sheen-clear: 0.10;
+  --lg-scene-sheen-regular: 0.10;
+  --lg-scene-sheen-thick: 0.08;
+  --lg-hero-bright: 1;
+  --lg-hero-tint: 0.42;
+  --lg-scrim: rgb(4 8 14 / 32%);
+}
+
+/* 3. Mobile blur column (also iPad and narrow fine-pointer windows) ------------------------------- */
+@media (pointer: coarse), (max-width: 47.99rem) {
+  :root[data-theme="studio"] {
+    --lg-blur-clear: 10px;
+    --lg-blur-regular: 14px;
+    --lg-blur-thick: 14px;
+  }
+}
+
+/* 4. Low-power column (wins over desktop and mobile) ---------------------------------------------- */
+:root[data-theme="studio"]:where([data-glass-power="low"]) {
+  --lg-blur-clear: 8px;
+  --lg-blur-regular: 12px;
+  --lg-blur-thick: 12px;
+}
+
+/* 5. No backdrop-filter support. Safari/iOS <= 17 support only the prefixed property, do not match
+      this condition and keep their blur. The attribute block lets JS (and tests) force the same. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root[data-theme="studio"] {
+    --lg-tint-clear: 0.86;
+    --lg-tint-regular: 0.88;
+    --lg-tint-thick: 0.92;
+    --lg-backdrop-clear: none;
+    --lg-backdrop-regular: none;
+    --lg-backdrop-thick: none;
+  }
+}
+:root[data-theme="studio"]:where([data-glass-backdrop="none"]) {
+  --lg-tint-clear: 0.86;
+  --lg-tint-regular: 0.88;
+  --lg-tint-thick: 0.92;
+  --lg-backdrop-clear: none;
+  --lg-backdrop-regular: none;
+  --lg-backdrop-thick: none;
+}
+
+/* 6. Increased contrast: opaque surfaces, solid rim, secondary text = primary. */
+@media (prefers-contrast: more) {
+  :root[data-theme="studio"] {
+    --lg-fill-rest-a: 0.18;
+    --lg-fill-hover-a: 0.22;
+    --lg-fill-press-a: 0.22;
+    --lg-separator: rgb(255 255 255 / 30%);
+    --lg-text-secondary: #f7f8fa;
+    --lg-tint-clear: 0.96;
+    --lg-tint-regular: 0.96;
+    --lg-tint-thick: 0.96;
+    --lg-tint-thick-solid: 0.96;
+    --lg-backdrop-clear: none;
+    --lg-backdrop-regular: none;
+    --lg-backdrop-thick: none;
+    --lg-sheen-clear: 0;
+    --lg-sheen-regular: 0;
+    --lg-sheen-thick: 0;
+    --lg-sheen-thick-solid: 0;
+    --lg-gloss-clear: 0;
+    --lg-gloss-regular: 0;
+    --lg-gloss-thick: 0;
+    --lg-gloss-thick-solid: 0;
+    --lg-rim-lead-clear: 0.55;
+    --lg-rim-trail-clear: 0.55;
+    --lg-rim-lead-regular: 0.55;
+    --lg-rim-trail-regular: 0.55;
+    --lg-rim-lead-thick: 0.55;
+    --lg-rim-trail-thick: 0.55;
+  }
+}
+
+/* 7. Reduced transparency: legible near-solid surfaces, no backdrop, denser scrim. */
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-theme="studio"] {
+    --lg-fill-rest-a: 0.14;
+    --lg-fill-hover-a: 0.18;
+    --lg-fill-press-a: 0.18;
+    --lg-tint-clear: 0.92;
+    --lg-tint-regular: 0.94;
+    --lg-tint-thick: 0.96;
+    --lg-tint-thick-solid: 0.96;
+    --lg-backdrop-clear: none;
+    --lg-backdrop-regular: none;
+    --lg-backdrop-thick: none;
+    --lg-sheen-clear: 0;
+    --lg-sheen-regular: 0;
+    --lg-sheen-thick: 0;
+    --lg-sheen-thick-solid: 0;
+    --lg-gloss-clear: 0;
+    --lg-gloss-regular: 0;
+    --lg-gloss-thick: 0;
+    --lg-gloss-thick-solid: 0;
+    --lg-scrim: rgb(4 8 14 / 60%);
+  }
+}
+
+/* 8. Forced colours: the UA paints Canvas/CanvasText; drop every effect. */
+@media (forced-colors: active) {
+  :root[data-theme="studio"] {
+    --lg-backdrop-clear: none;
+    --lg-backdrop-regular: none;
+    --lg-backdrop-thick: none;
+    --lg-sheen-clear: 0;
+    --lg-sheen-regular: 0;
+    --lg-sheen-thick: 0;
+    --lg-sheen-thick-solid: 0;
+    --lg-gloss-clear: 0;
+    --lg-gloss-regular: 0;
+    --lg-gloss-thick: 0;
+    --lg-gloss-thick-solid: 0;
+  }
+}
+
+/* Glass-scoped aliases: reach every descendant of a glass surface and nothing outside one. */
+:root[data-theme="studio"] .liquid-shell,
+:root[data-theme="studio"] .liquid-popover,
+:root[data-theme="studio"] .surface-glass {
+  --colour-text-muted: var(--lg-text-secondary);
+  /* Inset controls keep the brand's teal cast, translucent rather than the opaque #132a31 plate. */
+  --colour-surface-opaque: rgb(19 42 49 / 52%);
+}
+
+/* Material kinds -> element slots ----------------------------------------------------------------- */
+/* Selector lists, never :is(), in the subject position: Chromium buckets a rule by its rightmost
+   compound, and an :is() there puts the rule in the universal bucket, which made every style recalc
+   test it on every element (5-6x the recalc time on a throttled phone). */
+/* Class defaults: .liquid-shell and .surface-glass are regular, .liquid-popover is thick. (0,3,0) */
+:root[data-theme="studio"] .liquid-shell,
+:root[data-theme="studio"] .surface-glass {
+  --lgm-base: var(--lg-base);
+  --lgm-tint: var(--lg-tint-regular);
+  --lgm-sheen: var(--lg-sheen-regular);
+  --lgm-gloss: var(--lg-gloss-regular);
+  --lgm-backdrop: var(--lg-backdrop-regular);
+  --lgm-inner: var(--lg-inner-regular);
+  --lgm-drop: var(--lg-drop-regular);
+  --lgm-rim-lead: var(--lg-rim-lead-regular);
+  --lgm-rim-trail: var(--lg-rim-trail-regular);
+  --lgm-text-shadow: var(--lg-text-shadow);
+}
+:root[data-theme="studio"] .liquid-popover {
+  --lgm-base: var(--lg-base);
+  --lgm-tint: var(--lg-tint-thick);
+  --lgm-sheen: var(--lg-sheen-thick);
+  --lgm-gloss: var(--lg-gloss-thick);
+  --lgm-backdrop: var(--lg-backdrop-thick);
+  --lgm-inner: var(--lg-inner-thick);
+  --lgm-drop: var(--lg-drop-thick);
+  --lgm-rim-lead: var(--lg-rim-lead-thick);
+  --lgm-rim-trail: var(--lg-rim-trail-thick);
+  --lgm-text-shadow: none;
+}
+/* Exceptions by selector (0,4,0), so no component needs a new attribute. */
+:root[data-theme="studio"] .background-switcher.liquid-shell {
+  --lgm-tint: var(--lg-tint-clear);
+  --lgm-sheen: var(--lg-sheen-clear);
+  --lgm-gloss: var(--lg-gloss-clear);
+  --lgm-backdrop: var(--lg-backdrop-clear);
+  --lgm-inner: var(--lg-inner-clear);
+  --lgm-drop: var(--lg-drop-clear);
+  --lgm-rim-lead: var(--lg-rim-lead-clear);
+  --lgm-rim-trail: var(--lg-rim-trail-clear);
+  --lgm-text-shadow: var(--lg-text-shadow);
+}
+:root[data-theme="studio"] .study-workspace__sync-notice.liquid-popover {
+  --lgm-tint: var(--lg-tint-regular);
+  --lgm-sheen: var(--lg-sheen-regular);
+  --lgm-gloss: var(--lg-gloss-regular);
+  --lgm-backdrop: var(--lg-backdrop-regular);
+  --lgm-inner: var(--lg-inner-regular);
+  --lgm-drop: var(--lg-drop-regular);
+  --lgm-rim-lead: var(--lg-rim-lead-regular);
+  --lgm-rim-trail: var(--lg-rim-trail-regular);
+  --lgm-text-shadow: var(--lg-text-shadow);
+}
+:root[data-theme="studio"] .fan-notice.surface-glass,
+:root[data-theme="studio"] .merge-dialog.surface-glass {
+  --lgm-tint: var(--lg-tint-thick);
+  --lgm-sheen: var(--lg-sheen-thick);
+  --lgm-gloss: var(--lg-gloss-thick);
+  --lgm-backdrop: var(--lg-backdrop-thick);
+  --lgm-inner: var(--lg-inner-thick);
+  --lgm-drop: var(--lg-drop-thick);
+  --lgm-rim-lead: var(--lg-rim-lead-thick);
+  --lgm-rim-trail: var(--lg-rim-trail-thick);
+  --lgm-text-shadow: none;
+}
+/* Sheets fade a little slower than small surfaces. */
+:root[data-theme="studio"] .overlay-sheet--centre,
+:root[data-theme="studio"] .overlay-sheet--panel,
+:root[data-theme="studio"] .queue-drawer {
+  --lgm-transition: var(--lg-transition-sheet);
+}
+
+/* The recipe: one property-setting rule for every glass root. It never sets color or geometry. */
+:root[data-theme="studio"] .liquid-shell,
+:root[data-theme="studio"] .liquid-popover,
+:root[data-theme="studio"] .surface-glass {
+  text-shadow: var(--lgm-text-shadow);
+  background:
+    radial-gradient(120% 70% at 50% -25%, rgb(255 255 255 / var(--lgm-sheen)), transparent 62%),
+    linear-gradient(160deg, rgb(255 255 255 / var(--lgm-gloss)), transparent 38%),
+    rgb(var(--lgm-base) / var(--lgm-tint));
+  -webkit-backdrop-filter: var(--lgm-backdrop);
+  backdrop-filter: var(--lgm-backdrop);
+  box-shadow: var(--lgm-inner), var(--lgm-drop);
+  transition: var(--lgm-transition, var(--lg-transition-surface));
+}
+
+/* Rim. .liquid-* keep the masked ::before from tokens.css; only its gradient changes. */
+:root[data-theme="studio"] .liquid-shell::before,
+:root[data-theme="studio"] .liquid-popover::before {
+  background: linear-gradient(155deg, rgb(255 255 255 / var(--lgm-rim-lead)), rgb(255 255 255 / calc(var(--lgm-rim-trail) * 0.5)) 45%, rgb(255 255 255 / var(--lgm-rim-trail)));
+}
+/* .surface-glass roots have no pseudo-element (some are position: fixed): border colours only. */
+:root[data-theme="studio"] .surface-glass {
+  border-color: rgb(255 255 255 / var(--lgm-rim-trail));
+  border-top-color: rgb(255 255 255 / var(--lgm-rim-lead));
+}
+/* State colours win over the rim (values copied from AuthNoticeToast.vue and NoticeCentre.vue). */
+:root[data-theme="studio"] .auth-notice-toast--error.surface-glass { border-inline-start-color: #c2410c; }
+:root[data-theme="studio"] .notice-centre__item[data-notice-severity="critical"] { border-color: color-mix(in srgb, #f87171 60%, transparent); }
+:root[data-theme="studio"] .notice-centre__item[data-notice-severity="warning"] { border-color: color-mix(in srgb, #fbbf24 55%, transparent); }
+
+/* Thick-solid: popovers that are DOM descendants of a backdrop-filtered surface (a Chromium Backdrop
+   Root) and overflow it. No backdrop; near-opaque thick material with rim, sheen and drop. */
+:root[data-theme="studio"] .focus-bar__phase-menu,
+:root[data-theme="studio"] .focus-bar__sleep-popover,
+:root[data-theme="studio"] .focus-bar__advanced-popover,
+:root[data-theme="studio"] .chksz-info__panel {
+  --lgm-tint: var(--lg-tint-thick-solid);
+  --lgm-backdrop: none;
+  --lgm-sheen: var(--lg-sheen-thick-solid);
+  --lgm-gloss: var(--lg-gloss-thick-solid);
+  --lgm-inner: var(--lg-inner-thick);
+  --lgm-drop: var(--lg-drop-thick);
+  --lgm-rim-lead: var(--lg-rim-lead-thick);
+  --lgm-rim-trail: var(--lg-rim-trail-thick);
+  --lgm-text-shadow: none;
+}
+
+/* Dense reading surfaces need a quieter CSS-fallback centre. Preserve the
+   existing stronger solid popovers and preference-driven opaque fallbacks. */
+:root[data-theme="studio"] .overlay-sheet.liquid-popover,
+:root[data-theme="studio"] .queue-drawer.liquid-popover,
+:root[data-theme="studio"] .chat-window.liquid-popover {
+  --lgm-tint: var(--lg-dense-tint);
+}
+
+/* Nesting (owns "no nested blur"): glass inside glass becomes an inset fill. (0,5,0) */
+:root[data-theme="studio"] :is(.liquid-shell, .liquid-popover, .surface-glass) .liquid-shell:not(.focus-bar__phase-menu, .focus-bar__sleep-popover, .focus-bar__advanced-popover, .chksz-info__panel),
+:root[data-theme="studio"] :is(.liquid-shell, .liquid-popover, .surface-glass) .liquid-popover:not(.focus-bar__phase-menu, .focus-bar__sleep-popover, .focus-bar__advanced-popover, .chksz-info__panel),
+:root[data-theme="studio"] :is(.liquid-shell, .liquid-popover, .surface-glass) .surface-glass:not(.focus-bar__phase-menu, .focus-bar__sleep-popover, .focus-bar__advanced-popover, .chksz-info__panel) {
+  --lgm-base: 255 255 255;
+  --lgm-tint: var(--lg-tint-inset);
+  --lgm-sheen: var(--lg-sheen-inset);
+  --lgm-gloss: var(--lg-gloss-inset);
+  --lgm-backdrop: none;
+  --lgm-inner: var(--lg-inner-inset);
+  --lgm-drop: var(--lg-drop-inset);
+  --lgm-rim-lead: var(--lg-rim-lead-inset);
+  --lgm-rim-trail: var(--lg-rim-trail-inset);
+  --lgm-text-shadow: inherit;
+}
+
+/* The floating chat keeps its lifted shadow while dragged, and pauses transitions. */
+:root[data-theme="studio"] .chat-window--active {
+  --lgm-drop: 0 1.25rem 2.75rem rgb(0 0 0 / 38%);
+  --lgm-transition: none;
+}
+
+/* Hub scrim: no blur, tone-dependent density. */
+:root[data-theme="studio"] .overlay-sheet__backdrop {
+  background: var(--lg-scrim);
+  transition: opacity var(--lg-dur-scrim) ease-out;
+}
+
+/* Increased contrast and forced colours: element tweaks. */
+@media (prefers-contrast: more) {
+  :root[data-theme="studio"] .liquid-shell::before,
+  :root[data-theme="studio"] .liquid-popover::before {
+    background: rgb(255 255 255 / 55%);
+  }
+}
+@media (forced-colors: active) {
+  :root[data-theme="studio"] .liquid-shell::before,
+  :root[data-theme="studio"] .liquid-popover::before {
+    content: none;
+  }
+}
+
+/* Component internals (literal selectors with the specificity they need) ------------------------- */
+/* Control Centre active rail item: the inset controls' translucent teal instead of a blur nested in
+   the hub's blur, so the active tab keeps its brand tint (visual review F8).
+   (0,4,2) beats the scoped (0,3,2); covers the desktop rail and the phone primary/"more" row. */
+:root[data-theme="studio"] .control-centre__rail button[aria-current="true"]::before {
+  background: var(--colour-surface-opaque);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  opacity: 1;
+}
+/* Chat: no per-message blur. (0,4,0) beats every (0,3,0) scoped ChatPanel rule. */
+:root[data-theme="studio"] .chat-panel .chat-message__actions {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+@media (hover: hover) {
+  /* The floating pill only; the touch inline row keeps its transparent look. */
+  :root[data-theme="studio"] .chat-panel .chat-message__actions {
+    background: var(--lg-solid-overlay);
+  }
+}
+:root[data-theme="studio"] .chat-panel .chat-panel__jump {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: var(--lg-solid-overlay);
+}
+/* Player bar controls: inset fills (scoped rules are (0,2,0) and (0,3,1)). */
+:root[data-theme="studio"] .player-bar .player-bar__artwork { background: var(--lg-fill-rest); }
+:root[data-theme="studio"] .player-bar button:hover { background: var(--lg-fill-hover); }
+:root[data-theme="studio"] .player-bar button:active { background: var(--lg-fill-press); }
+:root[data-theme="studio"] .player-bar .player-bar__play,
+:root[data-theme="studio"] .player-bar button.player-bar__play:is(:hover, :active) {
+  background: var(--lg-fill-selected);
+  box-shadow: var(--lg-fill-selected-edge);
+}
+:root[data-theme="studio"] .player-bar button.player-bar__play:focus-visible {
+  box-shadow: var(--lg-fill-selected-edge), var(--focus-ring);
+}
+/* Focus rings inside overflow: hidden windows draw inward so they are never clipped. */
+:root[data-theme="studio"] .chat-window__header button:focus-visible,
+:root[data-theme="studio"] .overlay-sheet__header button:focus-visible,
+:root[data-theme="studio"] .chat-window__resize:focus-visible,
+:root[data-theme="studio"] .chat-window__grip:focus-visible {
+  outline-offset: -0.1875rem;
+}
+:root[data-theme="studio"] .settings-sheet #settings-glass-refraction-help,
+:root[data-theme="studio"] .settings-sheet [data-settings-glass-refraction-hint] {
+  color: var(--colour-text-muted);
+  line-height: 1.5;
+}
+
+/* Press feedback: a spring scale on buttons that have no transform press today. Each element has one
+   transition list, so the complete list is re-stated for Studio. The sleep and advanced popovers
+   are DOM descendants of the toolbar, but their SleepTimer and AdvancedFilters buttons keep their own
+   transform press; :where() keeps that exclusion at zero specificity, so these stay (0,3,1)/(0,4,1). */
+:root[data-theme="studio"] .focus-bar__toolbar button:where(:not(.focus-bar__sleep-popover button):not(.focus-bar__advanced-popover button)) {
+  transition: background var(--liquid-motion) var(--liquid-easing), var(--lg-transition-press);
+}
+:root[data-theme="studio"] .queue-drawer__header button {
+  transition: var(--lg-transition-press);
+}
+:root[data-theme="studio"] :is(.focus-bar__toolbar, .queue-drawer__header) button:where(:not(.focus-bar__sleep-popover button):not(.focus-bar__advanced-popover button)):active {
+  scale: 0.96;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-theme="studio"] :is(.focus-bar__toolbar, .queue-drawer__header) button:where(:not(.focus-bar__sleep-popover button):not(.focus-bar__advanced-popover button)) {
+    transition: none;
+  }
+  :root[data-theme="studio"] :is(.focus-bar__toolbar, .queue-drawer__header) button:where(:not(.focus-bar__sleep-popover button):not(.focus-bar__advanced-popover button)):active {
+    scale: none;
+  }
+}
+
+/* Geometry-neutral enter: transient surfaces fade in (opacity only, compositor-driven). Nothing here
+   changes a box, so geometry specs keep measuring final boxes. Exit is not animated. */
+@starting-style {
+  :root[data-theme="studio"] .overlay-sheet--centre,
+  :root[data-theme="studio"] .overlay-sheet--panel,
+  :root[data-theme="studio"] .queue-drawer,
+  :root[data-theme="studio"] .chat-window,
+  :root[data-theme="studio"] [data-pwa-update-notice],
+  :root[data-theme="studio"] .auth-notice-toast,
+  :root[data-theme="studio"] .notice-centre__item {
+    opacity: 0;
+  }
+  :root[data-theme="studio"] .focus-bar__phase-menu,
+  :root[data-theme="studio"] .focus-bar__sleep-popover,
+  :root[data-theme="studio"] .focus-bar__advanced-popover,
+  :root[data-theme="studio"] .chksz-info__panel,
+  :root[data-theme="studio"] .overlay-sheet__backdrop {
+    opacity: 0;
+  }
+}
+
+/* One native optical layer per eligible Studio surface. The controller owns only
+   geometry and filters; this stylesheet owns legibility, tint and specular light.
+   A ready host must not create another backdrop root above its own overlay. */
+:root[data-theme="studio"] [data-studio-glass-ready="true"] {
+  --lgm-transition: opacity var(--lg-dur-enter) var(--lg-ease-smooth), filter var(--motion-duration) ease;
+  background: transparent;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:root[data-theme="studio"] [data-studio-glass-ready="true"] > .studio-native-glass-overlay {
+  --studio-native-blur: min(calc(var(--studio-blur, 16px) * 0.125), 4px);
+  background:
+    radial-gradient(140% 60% at 18% -25%, rgb(255 255 255 / 12%), transparent 65%),
+    rgb(var(--lg-base) / 22%);
+}
+/* The prepended optical child used to cover the negative-z masked rim. Keep the
+   same fine directional reflection above it, not a brighter all-around glow. */
+:root[data-theme="studio"] [data-studio-glass-ready="true"]::before {
+  z-index: 0;
+  pointer-events: none;
+}
+/* Content-heavy shells share a denser optical centre, leaving the existing
+   feather and refraction visible at their edges. Hero capsules stay clear. */
+:root[data-theme="studio"] .overlay-sheet[data-studio-glass-ready="true"],
+:root[data-theme="studio"] .queue-drawer[data-studio-glass-ready="true"],
+:root[data-theme="studio"] .chat-window[data-studio-glass-ready="true"],
+:root[data-theme="studio"] .focus-bar__sleep-popover[data-studio-glass-ready="true"],
+:root[data-theme="studio"] .focus-bar__advanced-popover[data-studio-glass-ready="true"] {
+  --lg-optical-centre: var(--lg-dense-centre);
+}
+/* The feathered centre is quiet enough for small white text, not a hard dark
+   capsule. It is not a second blur pass and never captures the scene. */
+:root[data-theme="studio"] [data-studio-glass-ready="true"]::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: rgb(var(--lg-base) / var(--lg-optical-centre, calc(0.55 + var(--studio-gray, 0.26) * 0.16)));
+  mask-image: linear-gradient(90deg, transparent, #000 16px, #000 calc(100% - 16px), transparent), linear-gradient(180deg, transparent, #000 14px, #000 calc(100% - 14px), transparent);
+  mask-composite: intersect;
+  pointer-events: none;
+}
+/* Opaque/unsupported policies never leave an optical child over a CSS fallback. */
+:root[data-theme="studio"][data-glass-backdrop="none"] .studio-native-glass-overlay { display: none; }
+:root[data-theme="studio"][data-glass-backdrop="none"] [data-studio-glass-ready="true"] {
+  background: rgb(var(--lg-base) / 94%);
+}
+:root[data-theme="studio"][data-glass-backdrop="none"] [data-studio-glass-ready="true"]::after {
+  content: none;
+  background: transparent;
+}
+@media (max-width: 47.99rem) {
+  :root[data-theme="studio"] [data-workspace-modal="true"] .focus-bar.liquid-shell,
+  :root[data-theme="studio"] [data-workspace-modal="true"] .player-bar.liquid-shell,
+  :root[data-theme="studio"] [data-workspace-modal="true"] .background-switcher.liquid-shell {
+    --lgm-backdrop: none;
+  }
+  :root[data-theme="studio"] [data-workspace-modal="true"] .focus-bar > .studio-native-glass-overlay,
+  :root[data-theme="studio"] [data-workspace-modal="true"] .player-bar > .studio-native-glass-overlay { display: none; }
+}

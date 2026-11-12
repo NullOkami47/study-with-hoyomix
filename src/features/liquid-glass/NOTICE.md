@@ -1,5 +1,16 @@
 # Liquid Glass renderer notice
 
+The current Studio renderer (`StudioGlassEnvironment`, `studioNativeRenderer`,
+`studioDisplacement`, and `studioSvgOptics`) is original GPL-3.0 project code.
+It uses native backdrop compositing and existing first-party displacement tiles;
+no source from simple-liquid-glass or gentpan/liquidglass is incorporated.
+Their pinned evaluation is documented in `RENDERER.md`.
+
+The older Studio multipass modules remain for diagnostics and historical callers,
+but are no longer mounted by the application. Cinematic retains its separately
+owned single-pass renderer. The following attribution continues to apply to all
+retained adapted code.
+
 This feature contains a limited port from **liquid-glass-studio**:
 
 - Repository: <https://github.com/iyinchao/liquid-glass-studio>

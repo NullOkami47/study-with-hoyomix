@@ -4,7 +4,6 @@ import type { Track } from '../catalog/types'
 import {
   clearArtworkCache,
   fetchChkszArtwork,
-  getJellyfinArtworkUrl,
   isValidArtworkUrl,
   placeholderArtwork,
   resolveChkszArtwork,
@@ -70,7 +69,7 @@ describe('placeholderArtwork', () => {
   })
 
   it('returns a usable CSS background rather than a bare colour', () => {
-    const value = placeholderArtwork('zzz-tiny-giant')
+    const value = placeholderArtwork('demo-zzz-study')
     expect(value).toMatch(/^linear-gradient\(/)
     expect(value).toMatch(/hsl\(/)
   })
@@ -94,13 +93,21 @@ describe('placeholderArtwork', () => {
 })
 
 describe('isValidArtworkUrl', () => {
+  it('accepts existing same-origin LX and GD artwork routes for canonical NetEase bindings',()=>{
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/9000000002')).toBe(true)
+    expect(isValidArtworkUrl('/api/providers/gd-studio/artwork/9000000002')).toBe(true)
+    expect(isValidArtworkUrl('https://evil.example/api/providers/lx/artwork/9000000002')).toBe(false)
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/9000000002?url=https://evil.example')).toBe(false)
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/not-a-number')).toBe(false)
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/123456789012345678901')).toBe(false)
+  })
   it('accepts safe relative provider artwork URLs', () => {
     expect(
       isValidArtworkUrl('/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fcover.jpg'),
     ).toBe(true)
     expect(
       isValidArtworkUrl('/api/providers/jellyfin/artwork/6213b704a0d954293110f4d561b0f614'),
-    ).toBe(true)
+    ).toBe(false)
   })
 
   it('rejects external or unapproved endpoints', () => {
@@ -108,12 +115,6 @@ describe('isValidArtworkUrl', () => {
     expect(isValidArtworkUrl('javascript:alert(1)')).toBe(false)
     expect(isValidArtworkUrl('')).toBe(false)
     expect(isValidArtworkUrl('   ')).toBe(false)
-  })
-})
-
-describe('getJellyfinArtworkUrl', () => {
-  it('constructs correct encoded URL for Jellyfin item artwork', () => {
-    expect(getJellyfinArtworkUrl('item/123')).toBe('/api/providers/jellyfin/artwork/item%2F123')
   })
 })
 
@@ -128,20 +129,71 @@ describe('Artwork resolution & useArtwork composable', () => {
     vi.restoreAllMocks()
   })
 
-  it('starts with Jellyfin candidate when track has Jellyfin source', () => {
-    const { artworkUrl, isLoaded, hasFailed, onLoad } = useArtwork('album:Album One', trackWithJellyfin)
-
-    expect(artworkUrl.value).toBe('/api/providers/jellyfin/artwork/jf-item-123')
-    expect(isLoaded.value).toBe(false)
-    expect(hasFailed.value).toBe(false)
-
-    // Simulating successful image load
-    onLoad()
-    expect(isLoaded.value).toBe(true)
-    expect(hasFailed.value).toBe(false)
+  it('skips retired Jellyfin artwork and preserves the LX to GD cover fallback', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const track = { ...trackWithJellyfin, sources: [
+      { provider: 'jellyfin', externalId: 'retired-item' },
+      { provider: 'chksz', externalId: '9000000002' },
+    ] }
+    const artwork = useArtwork('album:retired-jellyfin', track)
+    expect(artwork.artworkUrl.value).toBe('/api/providers/lx/artwork/9000000002')
+    artwork.onError()
+    expect(artwork.artworkUrl.value).toBe('/api/providers/gd-studio/artwork/9000000002')
+    artwork.onLoad()
+    expect(artwork.isLoaded.value).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('falls back to ChKSz when Jellyfin candidate errors', async () => {
+  it('uses a placeholder for a Jellyfin-only historical binding without resolving audio', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const artwork = useArtwork('album:retired-only', {
+      ...trackWithJellyfin,
+      sources: [{ provider: 'jellyfin', externalId: 'retired-item' }],
+    })
+    expect(artwork.artworkUrl.value).toBeUndefined()
+    expect(artwork.hasFailed.value).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('uses key-free artwork routes despite a historical Jellyfin binding without resolving audio',()=>{
+    const fetchSpy=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(null,{status:503}))
+    const track={...trackWithJellyfin,sources:[{provider:'jellyfin',externalId:'jf-item-123'},{provider:'chksz',externalId:'9000000002'}]}
+    const art=useArtwork('album:canonical',track)
+    expect(art.artworkUrl.value).toBe('/api/providers/lx/artwork/9000000002')
+    art.onError()
+    expect(art.artworkUrl.value).toBe('/api/providers/gd-studio/artwork/9000000002')
+    art.onLoad()
+    expect(art.isLoaded.value).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    const cached=useArtwork('album:canonical',track)
+    expect(cached.artworkUrl.value).toBe('/api/providers/gd-studio/artwork/9000000002')
+  })
+
+  it('resolves canonical NetEase and standalone GD bindings without an Owner ChKSz key',()=>{
+    const fetchSpy=vi.spyOn(globalThis,'fetch')
+    const netease=useArtwork('album:netease',{...trackWithChkszOnly,sources:[{provider:'chksz',externalId:'9000000002'}]})
+    const gd=useArtwork('album:gd',{...trackWithChkszOnly,sources:[{provider:'gd-studio',externalId:'netease:9000000002:999'}]})
+    expect(netease.artworkUrl.value).toBe('/api/providers/lx/artwork/9000000002')
+    expect(gd.artworkUrl.value).toBe('/api/providers/gd-studio/artwork/9000000002')
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('evicts a failed cached GD image before trying the remaining legacy fallback',async()=>{
+    const url='/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fcover.jpg'
+    const fetchSpy=vi.spyOn(globalThis,'fetch').mockResolvedValue(Response.json({metadata:{artworkUrl:url}}))
+    const track={...trackWithChkszOnly,sources:[{provider:'chksz',externalId:'9000000002'}]}
+    const first=useArtwork('album:cached-gd',track)
+    first.onError()
+    first.onLoad()
+    const cached=useArtwork('album:cached-gd',track)
+    expect(cached.artworkUrl.value).toBe('/api/providers/gd-studio/artwork/9000000002')
+    cached.onError()
+    await new Promise(resolve=>setTimeout(resolve,10))
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    expect(cached.artworkUrl.value).toBe(url)
+  })
+
+  it('resolves a legacy ChKSz binding without requesting retired Jellyfin artwork', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(
         JSON.stringify({
@@ -153,15 +205,12 @@ describe('Artwork resolution & useArtwork composable', () => {
       ),
     )
 
-    const { artworkUrl, hasFailed, onError, onLoad, isLoaded } = useArtwork(
+    const { artworkUrl, hasFailed, onLoad, isLoaded } = useArtwork(
       'album:Album One',
       trackWithJellyfin,
     )
 
-    expect(artworkUrl.value).toBe('/api/providers/jellyfin/artwork/jf-item-123')
-
-    // Simulate Jellyfin image load error (e.g. 404 from upstream Jellyfin item)
-    onError()
+    expect(artworkUrl.value).toBeUndefined()
 
     // Wait for async ChKSz resolve
     await new Promise((resolve) => setTimeout(resolve, 10))
@@ -184,7 +233,7 @@ describe('Artwork resolution & useArtwork composable', () => {
     expect(isLoaded.value).toBe(true)
   })
 
-  it('marks failed and cleans up if both Jellyfin and ChKSz fail', async () => {
+  it('marks failed when the remaining legacy ChKSz artwork fails', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(JSON.stringify({ error: 'unavailable' }), {
         status: 502,
@@ -192,11 +241,9 @@ describe('Artwork resolution & useArtwork composable', () => {
       }),
     )
 
-    const { artworkUrl, hasFailed, onError } = useArtwork('album:Album One', trackWithJellyfin)
-    expect(artworkUrl.value).toBe('/api/providers/jellyfin/artwork/jf-item-123')
+    const { artworkUrl, hasFailed } = useArtwork('album:Album One', trackWithJellyfin)
+    expect(artworkUrl.value).toBeUndefined()
 
-    // Trigger error on Jellyfin
-    onError()
     await new Promise((resolve) => setTimeout(resolve, 10))
 
     expect(hasFailed.value).toBe(true)

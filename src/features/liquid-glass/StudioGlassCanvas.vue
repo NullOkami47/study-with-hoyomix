@@ -12,11 +12,12 @@ import { studioFragmentBgHblurShader } from './shaders/studio-fragment-bg-hblur.
 import { studioFragmentMainShader } from './shaders/studio-fragment-main.glsl'
 import { studioCornerRadiusCss, studioEdgeDispersion } from './studioOptics'
 
-const props = withDefaults(defineProps<{ blurRadius?: number; glassGray?: number; edge?: number; lowPower: boolean; plate?: boolean }>(), {
+const props = withDefaults(defineProps<{ blurRadius?: number; glassGray?: number; edge?: number; lowPower: boolean; plate?: boolean; enabled?: boolean }>(), {
   blurRadius: DEFAULT_STUDIO_BLUR,
   glassGray: DEFAULT_STUDIO_GLASS_GRAY,
   edge: DEFAULT_STUDIO_EDGE,
   plate: false,
+  enabled: true,
 })
 const host = ref<HTMLDivElement | null>(null)
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -25,6 +26,9 @@ let renderer: MultiPassRenderer | null = null
 let rendererCanvas: HTMLCanvasElement | null = null
 let raf: number | null = null
 let disposed = false
+let runtimeActive = false
+let runtimeGeneration = 0
+let ownsWorkspaceMarker = false
 let resizeObserver: ResizeObserver | null = null
 let mutationObserver: MutationObserver | null = null
 let motionQuery: MediaQueryList | null = null
@@ -122,8 +126,11 @@ function renderDpr(): number {
 function setStudioGlassActive(active: boolean): void {
   // A plate is one surface inside a dialog. It must not switch the workspace renderer off.
   if (props.plate) return
-  if (active) document.documentElement.dataset.studioGlass = 'active'
-  else if (document.documentElement.dataset.studioGlass === 'active') delete document.documentElement.dataset.studioGlass
+  if (active) { document.documentElement.dataset.studioGlass = 'active'; ownsWorkspaceMarker = true }
+  else if (ownsWorkspaceMarker) {
+    if (document.documentElement.dataset.studioGlass === 'active') delete document.documentElement.dataset.studioGlass
+    ownsWorkspaceMarker = false
+  }
 }
 function updateRenderedSurfaces(elements: HTMLElement[]): void {
   const next = new Set(elements)
@@ -324,7 +331,7 @@ function pixelSignature(uniforms: Record<string, unknown>): string | null {
   return parts.join('|')
 }
 function renderFrame(): boolean {
-  if (!renderer || !canvasRef.value || !sceneTexture || isHidden()) return false
+  if (!props.enabled || !runtimeActive || !renderer || !canvasRef.value || !sceneTexture || isHidden()) return false
   syncSceneSource()
   if (!sceneReady) return false
   const dpr = renderDpr(); const shapes = collectGlassShapes(); const shapeCount = Math.min(shapes.length, MAX_SHAPES)
@@ -359,8 +366,12 @@ function renderFrame(): boolean {
   return true
 }
 function scheduleRender(): void {
-  if (raf !== null || !renderer || isHidden()) return
-  raf = requestAnimationFrame(() => { raf = null; renderFrame() })
+  if (!props.enabled || !runtimeActive || raf !== null || !renderer || isHidden()) return
+  const generation = runtimeGeneration
+  raf = requestAnimationFrame(() => {
+    if (generation !== runtimeGeneration) return
+    raf = null; renderFrame()
+  })
 }
 function cancelScheduledRender(): void { if (raf !== null) { cancelAnimationFrame(raf); raf = null } }
 function resize(): void {
@@ -423,7 +434,7 @@ watch(() => props.edge, (value) => {
 })
 
 function initialiseRenderer(): void {
-  if (disposed || renderer || animatedBackdrop.value || !canvasRef.value) return
+  if (disposed || !props.enabled || !runtimeActive || renderer || animatedBackdrop.value || !canvasRef.value) return
   rendererCanvas = canvasRef.value
   rendererCanvas.addEventListener('webglcontextlost', onContextLost)
   try {
@@ -439,8 +450,10 @@ function initialiseRenderer(): void {
 }
 watch(animatedBackdrop, (animated) => { if (animated) disableRenderer(); else initialiseRenderer() }, { flush: 'post' })
 
-onMounted(() => {
-  if (!host.value) return
+function startRuntime(): void {
+  if (disposed || !props.enabled || runtimeActive || !host.value) return
+  runtimeActive = true
+  syncBackdropKind()
   setStudioGlassActive(false); clearRenderedSurfaces()
   document.addEventListener('visibilitychange', onVisibilityChange)
   window.addEventListener('scroll', onScroll, { capture: true, passive: true })
@@ -457,20 +470,27 @@ onMounted(() => {
     mutationObserver.observe(host.value.parentElement, { attributes: true, attributeFilter: ['aria-expanded', 'class', 'hidden', 'style'], childList: true, subtree: true })
   }
   watchBackdrop(); initialiseRenderer()
-})
+}
 
-onBeforeUnmount(() => {
-  disposed = true; cancelScheduledRender(); resizeObserver?.disconnect(); resizeObserver = null
+function stopRuntime(): void {
+  if (!runtimeActive) return
+  runtimeActive = false; runtimeGeneration += 1
+  cancelScheduledRender(); resizeObserver?.disconnect(); resizeObserver = null
   mutationObserver?.disconnect(); mutationObserver = null; releaseBackdrop(); motionQuery?.removeEventListener?.('change', onReducedMotionChange); motionQuery = null
   document.removeEventListener('visibilitychange', onVisibilityChange)
   window.removeEventListener('scroll', onScroll, { capture: true })
-  canvasRef.value?.removeEventListener('webglcontextlost', onContextLost); disableRenderer()
-})
+  disableRenderer()
+}
+// Owner opts this legacy renderer out when native SVG backdrop refraction owns Studio.
+// Stop all work, not just canvas painting: dormant instances must not observe the DOM.
+watch(() => props.enabled, enabled => { if (enabled) startRuntime(); else stopRuntime() }, { flush: 'post' })
+onMounted(startRuntime)
+onBeforeUnmount(() => { disposed = true; stopRuntime() })
 </script>
 
 <template>
   <div ref="host" class="studio-glass-canvas" :class="{ 'studio-glass-canvas--plate': plate }" data-studio-glass-canvas aria-hidden="true">
-    <canvas v-if="!animatedBackdrop" ref="canvasRef" aria-hidden="true" />
+    <canvas v-if="enabled && !animatedBackdrop" ref="canvasRef" aria-hidden="true" />
   </div>
 </template>
 

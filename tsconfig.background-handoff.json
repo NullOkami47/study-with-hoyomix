@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/**/*.d.ts",
+    "src/**/*.js",
+    "src/**/*.ts",
+    "src/**/*.vue",
+    "src/features/player/PlayerBar.backgroundHandoff.spec.ts",
+    "vitest.background-handoff.config.ts"
+  ]
+}

@@ -9,6 +9,8 @@ const props = defineProps<{ player: PlaybackStore }>()
 const { locale } = usePreferences()
 const text = (key: TranslationKey): string => translate(locale.value, key)
 
+const currentAttempts = computed(() => props.player.latestAttempts?.value ?? props.player.attempts.value)
+
 const enabledSources = computed(() => {
   const ids = props.player.manualProviderIds
     ? [...props.player.manualProviderIds.value]
@@ -99,6 +101,10 @@ function attemptStatus(providerId: string, ok: boolean, code?: ResolveFailureCod
     quota_exhausted: 'player.statusQuotaExhausted',
     forbidden: 'player.statusForbidden',
     not_found: 'player.statusNotFound',
+    csp_blocked: 'player.statusCspBlocked',
+    transport_blocked: 'player.statusTransportBlocked',
+    http_error: 'player.statusHttpError',
+    media_insecure: 'player.statusMediaInsecure',
   }
   return text(code ? keys[code] : 'player.statusUnavailable')
 }
@@ -106,6 +112,7 @@ function attemptStatus(providerId: string, ok: boolean, code?: ResolveFailureCod
 function onSourceChange(event: Event): void {
   void props.player.setSourceOverride((event.target as HTMLSelectElement).value || undefined)
 }
+
 </script>
 
 <template>
@@ -126,14 +133,15 @@ function onSourceChange(event: Event): void {
         <option v-for="provider in enabledSources" :key="provider" :value="provider">{{ providerName(provider) }}</option>
       </select>
     </label>
-    <div v-if="player.attempts.value.length" class="playback-diagnostics__attempts">
+    <div v-if="currentAttempts.length" class="playback-diagnostics__attempts">
       <h4>{{ text('library.attempts') }}</h4>
       <ul>
-        <li v-for="(attempt, index) in player.attempts.value" :key="`${attempt.providerId}-${index}`">
+        <li v-for="(attempt, index) in currentAttempts" :key="`${attempt.providerId}-${index}`">
           {{ attemptLabel(attempt) }} · {{ attemptStatus(attempt.providerId, attempt.ok, attempt.code) }}
         </li>
       </ul>
     </div>
+
   </section>
 </template>
 

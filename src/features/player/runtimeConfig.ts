@@ -1,8 +1,13 @@
+import { createGdStudioProvider } from './providers/gdStudio'
 import { createChkszProvider } from './providers/chksz'
-import { createJellyfinProvider } from './providers/jellyfin'
+import { createVkeysProvider } from './providers/vkeys'
 import { createLxUserProvider } from './providers/lxUser'
 import { ProviderRegistry, type ProviderRegistration } from './providers/registry'
-import type { AudioProvider, ProviderAttempt } from './providers/types'
+import type { AudioProvider } from './providers/types'
+import {
+  getDefaultGlobalSourceRepository,
+  type LxGlobalSourceRepository,
+} from './lx/globalSourceRepository'
 import {
   getDefaultChkszCredentialStore,
   type ChkszCredentialStore,
@@ -16,11 +21,18 @@ import {
   type PlaybackQualityPreferencesStore,
 } from './qualityPreferences'
 
+import { LX_INIT_TIMEOUT_MS, LX_RESOLVE_TIMEOUT_MS, LX_RPC_GRACE_MS } from './lx/runtime/protocol'
+import { MEDIA_PROBE_TIMEOUT_MS } from './mediaProbe'
+
 const CONFIG_ENDPOINT = '/api/providers/config'
 const TTL_MS = 5_000
 const PROVIDER_TIMEOUT_MS = 4_000
+// LX loads a sandbox, resolves through third-party endpoints, then may probe media. A single
+// 4 s registry deadline cancelled healthy mobile requests before those bounded phases finished.
+const LX_PROVIDER_TIMEOUT_MS = LX_INIT_TIMEOUT_MS + LX_RESOLVE_TIMEOUT_MS + MEDIA_PROBE_TIMEOUT_MS + LX_RPC_GRACE_MS
+const VKEYS_TIMEOUT_MS = 10_000
 
-export const CANONICAL_PROVIDER_IDS = ['chksz', 'lx', 'jellyfin'] as const
+export const CANONICAL_PROVIDER_IDS = ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'] as const
 export type CanonicalProviderId = typeof CANONICAL_PROVIDER_IDS[number]
 
 interface PublicProviderConfig {
@@ -42,12 +54,16 @@ export interface RuntimeProviderRepositoryOptions {
   chkszCredentials?: Pick<ChkszCredentialStore, 'key' | 'revision'>
   providerPreferences?: RuntimeProviderPreferences
   lxProviderFactory?: () => AudioProvider
-  qualityStore?: Pick<PlaybackQualityPreferencesStore, 'chkszQuality'>
+  /**
+   * The published global LX sources. Defaults to the page-wide repository; tests inject a fixture
+   * so they can describe a deployment with sources, or with none.
+   */
+  globalSourceRepository?: LxGlobalSourceRepository
+  qualityStore?: Pick<PlaybackQualityPreferencesStore, 'chkszQuality'> & Partial<Pick<PlaybackQualityPreferencesStore, 'gdStudioQuality'>>
 }
 
 export interface RuntimeProviderLoadOptions {
   forceRefresh?: boolean
-  onSubAttempt?: (attempt: ProviderAttempt) => void
 }
 
 /**
@@ -64,6 +80,8 @@ export interface PublicProviderState {
 
 export interface RuntimeProviderRepository {
   load(options?: RuntimeProviderLoadOptions): Promise<ProviderRegistry>
+  /** Current, unexpired configuration only; never fetches or rebuilds. */
+  peek(): ProviderRegistry | undefined
   prefetch(): Promise<void>
   states(options?: RuntimeProviderLoadOptions): Promise<readonly PublicProviderState[]>
 }
@@ -159,7 +177,7 @@ function parseRegistry(
   chkszCredentials: Pick<ChkszCredentialStore, 'key'>,
   providerPreferences: RuntimeProviderPreferences,
   lxProviderFactory: () => AudioProvider,
-  qualityStore: Pick<PlaybackQualityPreferencesStore, 'chkszQuality'>,
+  qualityStore: Pick<PlaybackQualityPreferencesStore, 'chkszQuality'> & Partial<Pick<PlaybackQualityPreferencesStore, 'gdStudioQuality'>>,
 ): ProviderRegistry {
   if (!isRecord(value) || !hasExactKeys(value, ['version', 'providers'])) {
     throw new Error('Invalid runtime provider response')
@@ -197,8 +215,12 @@ function parseRegistry(
       })
     } else if (provider.id === 'lx') {
       audioProvider = lxProviderFactory()
-    } else if (provider.id === 'jellyfin') {
-      audioProvider = createJellyfinProvider({})
+    } else if (provider.id === 'gd-studio') {
+      audioProvider = createGdStudioProvider({
+        qualityStore: qualityStore.gdStudioQuality ? { gdStudioQuality: qualityStore.gdStudioQuality } : undefined,
+      })
+    } else if (provider.id === 'vkeys') {
+      audioProvider = createVkeysProvider()
     }
     if (!audioProvider) continue
 
@@ -207,7 +229,8 @@ function parseRegistry(
       enabled: true,
       automaticEligible: provider.automaticEligible,
       priority: provider.priority,
-      timeoutMs: PROVIDER_TIMEOUT_MS,
+      timeoutMs: provider.id === 'lx' ? LX_PROVIDER_TIMEOUT_MS :
+        provider.id === 'vkeys' ? VKEYS_TIMEOUT_MS : PROVIDER_TIMEOUT_MS,
     })
   }
 
@@ -230,12 +253,14 @@ export function createRuntimeProviderRepository(
   const now = options.now ?? (() => performance.now())
   const chkszCredentials = options.chkszCredentials ?? getDefaultChkszCredentialStore()
   const providerPreferences = options.providerPreferences ?? getDefaultProviderPreferencesStore()
-  // The cached registry holds a single LX provider instance, so its sub-attempt sink cannot be
-  // captured per request at construction time. The provider relays through this mutable
-  // repository-scoped variable instead, and each `load()` installs the caller's sink into it.
-  let subAttemptSink: ((attempt: ProviderAttempt) => void) | undefined
+  // Without this the registry is inert: the provider would never look at a published source, and a
+  // source the Owner added would reach nobody. It is resolved lazily by the provider, so an empty
+  // (or unreachable) registry costs one cached request per minute and changes nothing else.
+  const globalSourceRepository = options.globalSourceRepository ?? getDefaultGlobalSourceRepository()
   const lxProviderFactory = options.lxProviderFactory ?? (() =>
-    createLxUserProvider({ onSubAttempt: (attempt) => subAttemptSink?.(attempt) }))
+    createLxUserProvider({
+      globalSourceRepository,
+    }))
   const qualityStore = options.qualityStore ?? getDefaultPlaybackQualityPreferencesStore()
   const requestUrl = new URL(CONFIG_ENDPOINT, window.location.origin).toString()
   let cached:
@@ -252,15 +277,6 @@ export function createRuntimeProviderRepository(
   }
 
   const load = (loadOptions: RuntimeProviderLoadOptions = {}): Promise<ProviderRegistry> => {
-    // Installed before every return path, including the cache-hit early returns below, so a
-    // resolution served from the cached registry still receives the current request's sink.
-    //
-    // A load that supplies no sink -- `states()`, `prefetch()`, the speculative preload --
-    // must not *clear* the installed one. Those loads can run while a resolution is still in
-    // flight, and clearing the sink would silently discard that resolution's per-source LX
-    // attempts. Keeping the last real sink is safe because every sink ignores attempts whose
-    // request has already been superseded.
-    subAttemptSink = loadOptions.onSubAttempt ?? subAttemptSink
     if (inFlight) return inFlight
     if (!loadOptions.forceRefresh && cached && now() - cached.loadedAt < TTL_MS) {
       // A local preference change or credential change must take effect at this
@@ -289,7 +305,15 @@ export function createRuntimeProviderRepository(
           throw new Error('Invalid runtime provider response')
         }
         body = await response.json()
-        registry = parseRegistry(body, chkszCredentials, providerPreferences, lxProviderFactory, qualityStore)
+        // A routine TTL refresh of identical configuration must not replace provider instances:
+        // next-track preparations compare their verified selection with the current registry.
+        // Active-source recovery explicitly forces a rebuild and keeps its fresh-provider contract.
+        const unchanged = !loadOptions.forceRefresh && cached?.body !== undefined &&
+          cached.preferenceRevision === providerPreferences.revision() &&
+          cached.credentialRevision === (chkszCredentials.revision?.() ?? 0) &&
+          JSON.stringify(body) === JSON.stringify(cached.body)
+        registry = unchanged ? cached!.registry :
+          parseRegistry(body, chkszCredentials, providerPreferences, lxProviderFactory, qualityStore)
       } catch {
         body = undefined
         registry = new ProviderRegistry([])
@@ -341,5 +365,13 @@ export function createRuntimeProviderRepository(
     }
   }
 
-  return { load, prefetch, states }
+  const peek = (): ProviderRegistry | undefined => {
+    if (inFlight || !cached || cached.body === undefined) return undefined
+    const age = now() - cached.loadedAt
+    if (age < 0 || age >= TTL_MS || cached.preferenceRevision !== providerPreferences.revision() ||
+      cached.credentialRevision !== (chkszCredentials.revision?.() ?? 0)) return undefined
+    return cached.registry
+  }
+
+  return { load, peek, prefetch, states }
 }

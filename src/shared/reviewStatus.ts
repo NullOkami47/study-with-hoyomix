@@ -9,8 +9,8 @@
  * round-trip through the Sheets staging path. One definition removes that whole failure mode.
  *
  * Provenance of the three values:
- * - `the original development notes`
- * - `the original development notes`
+ * - the catalogue validation contract
+ * - the catalogue validation contract
  * - `workers/catalogue/staging.ts` (the enforcing layer)
  *
  * `verified` is deliberately **not** a member. It was invented by the catalogue generator and is
@@ -68,7 +68,7 @@ export function isReviewedStatus(value: unknown): boolean {
  * Whether a track must still be shown as needing classification.
  *
  * Two independent reasons, mirroring `workers/catalogue/staging.ts` and
- * `scripts/publish-catalogue-to-d1.mjs`:
+ * the catalogue validation contract:
  *
  * 1. the vocal status is explicitly `uncertain`, or
  * 2. the review status is not one that counts as signed off.

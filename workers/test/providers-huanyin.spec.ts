@@ -7,9 +7,9 @@ import {
 import { createExactMediaUrlValidator } from '../providers/resolverMediaUrl'
 
 const HUANYIN_ORIGIN = 'https://music-dl.example.invalid'
-const EXTERNAL_ID = 'netease:2100334024'
-const EXTERNAL_ID_WITH_QUALITY = 'netease:2100334024:320k'
-const MEDIA_URL = 'https://media.example.invalid/audio/2100334024.mp3'
+const EXTERNAL_ID = 'netease:9000000001'
+const EXTERNAL_ID_WITH_QUALITY = 'netease:9000000001:320k'
+const MEDIA_URL = 'https://media.example.invalid/audio/9000000001.mp3'
 
 const validResponse = (overrides: Record<string, unknown> = {}) => ({
   code: 200,
@@ -38,11 +38,11 @@ const resolve = (
 
 describe('HuanYin external ID parser', () => {
   it.each([
-    ['netease:2100334024', { source: 'netease', id: '2100334024' }],
-    ['netease:2100334024:128k', { source: 'netease', id: '2100334024', quality: '128k' }],
-    ['netease:2100334024:320k', { source: 'netease', id: '2100334024', quality: '320k' }],
-    ['netease:2100334024:flac', { source: 'netease', id: '2100334024', quality: 'flac' }],
-    ['netease:2100334024:flac24bit', { source: 'netease', id: '2100334024', quality: 'flac24bit' }],
+    ['netease:9000000001', { source: 'netease', id: '9000000001' }],
+    ['netease:9000000001:128k', { source: 'netease', id: '9000000001', quality: '128k' }],
+    ['netease:9000000001:320k', { source: 'netease', id: '9000000001', quality: '320k' }],
+    ['netease:9000000001:flac', { source: 'netease', id: '9000000001', quality: 'flac' }],
+    ['netease:9000000001:flac24bit', { source: 'netease', id: '9000000001', quality: 'flac24bit' }],
     ['kuwo:12345678', { source: 'kuwo', id: '12345678' }],
     ['qq:001fNThf1S2PM9', { source: 'qq', id: '001fNThf1S2PM9' }],
     ['tencent:001fNThf1S2PM9', { source: 'tencent', id: '001fNThf1S2PM9' }],
@@ -54,19 +54,19 @@ describe('HuanYin external ID parser', () => {
   it.each([
     '',
     '   ',
-    ' netease:2100334024',
-    'netease:2100334024 ',
-    'NETEASE:2100334024',
-    'unknown:2100334024',
+    ' netease:9000000001',
+    'netease:9000000001 ',
+    'NETEASE:9000000001',
+    'unknown:9000000001',
     'netease:',
     'netease::320k',
-    'netease:2100334024:',
-    'netease:2100334024:64k',
-    'netease:2100334024:hires',
-    'netease:../2100334024',
-    'netease:2100334024?type=url',
-    'netease:2100334024#frag',
-    'https://music-dl.sayqz.com/api/?id=2100334024',
+    'netease:9000000001:',
+    'netease:9000000001:64k',
+    'netease:9000000001:hires',
+    'netease:../9000000001',
+    'netease:9000000001?type=url',
+    'netease:9000000001#frag',
+    'https://music-dl.sayqz.com/api/?id=9000000001',
     'La Vaguelette',
     `netease:${'a'.repeat(65)}`,
   ])('rejects non-canonical or malformed external ID: %s', (input) => {
@@ -93,7 +93,7 @@ describe('HuanYin metadata adapter', () => {
     expect(parsedUrl.pathname).toBe('/api/')
     expect(parsedUrl.searchParams.get('type')).toBe('url')
     expect(parsedUrl.searchParams.get('source')).toBe('netease')
-    expect(parsedUrl.searchParams.get('id')).toBe('2100334024')
+    expect(parsedUrl.searchParams.get('id')).toBe('9000000001')
     expect(parsedUrl.searchParams.get('br')).toBe('320k')
 
     expect(calledInit.method).toBe('GET')
@@ -120,13 +120,13 @@ describe('HuanYin metadata adapter', () => {
   })
 
   it('detects flac mimeType for flac quality', async () => {
-    const flacUrl = 'https://media.example.invalid/audio/2100334024.flac'
+    const flacUrl = 'https://media.example.invalid/audio/9000000001.flac'
     const fetchImpl = vi.fn(async () => jsonResponse({
       code: 200,
       url: flacUrl,
     })) as unknown as typeof fetch
 
-    const result = await resolve(fetchImpl, 'netease:2100334024:flac')
+    const result = await resolve(fetchImpl, 'netease:9000000001:flac')
 
     expect(result).toEqual({
       ok: true,

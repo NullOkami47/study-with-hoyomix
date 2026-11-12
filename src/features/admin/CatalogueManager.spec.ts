@@ -43,7 +43,7 @@ function setup(batch: ImportBatch | null = initial, role: 'admin' | 'owner' = 'a
     configured: true,
     role,
     sheetUrl: 'https://docs.google.com/spreadsheets/d/test-workbook/edit',
-    serviceAccountEmail: 'catalogue@example.iam.gserviceaccount.com',
+    serviceAccountEmail: 'catalogue@project.iam.gserviceaccount.com',
     lastBatch: batch,
   })
   vi.spyOn(repo, 'syncCatalogue').mockResolvedValue(initial)

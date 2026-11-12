@@ -7,9 +7,9 @@ import {
 import { createExactMediaUrlValidator } from '../providers/resolverMediaUrl'
 
 const GD_STUDIO_ORIGIN = 'https://music-api.gdstudio.xyz'
-const EXTERNAL_ID = 'netease:2100334024'
-const EXTERNAL_ID_WITH_BR = 'netease:2100334024:320'
-const MEDIA_URL = 'https://m701.music.126.net/audio/2100334024.mp3?token=ephemeral'
+const EXTERNAL_ID = 'netease:9000000001'
+const EXTERNAL_ID_WITH_BR = 'netease:9000000001:320'
+const MEDIA_URL = 'https://m701.music.126.net/audio/9000000001.mp3?token=ephemeral'
 
 const validResponse = (overrides: Record<string, unknown> = {}) => ({
   url: MEDIA_URL,
@@ -40,12 +40,12 @@ const resolve = (
 
 describe('GD Studio external ID parser', () => {
   it.each([
-    ['netease:2100334024', { source: 'netease', id: '2100334024' }],
-    ['netease:2100334024:320', { source: 'netease', id: '2100334024', br: 320 }],
-    ['netease:2100334024:128', { source: 'netease', id: '2100334024', br: 128 }],
-    ['netease:2100334024:192', { source: 'netease', id: '2100334024', br: 192 }],
-    ['netease:2100334024:740', { source: 'netease', id: '2100334024', br: 740 }],
-    ['netease:2100334024:999', { source: 'netease', id: '2100334024', br: 999 }],
+    ['netease:9000000001', { source: 'netease', id: '9000000001' }],
+    ['netease:9000000001:320', { source: 'netease', id: '9000000001', br: 320 }],
+    ['netease:9000000001:128', { source: 'netease', id: '9000000001', br: 128 }],
+    ['netease:9000000001:192', { source: 'netease', id: '9000000001', br: 192 }],
+    ['netease:9000000001:740', { source: 'netease', id: '9000000001', br: 740 }],
+    ['netease:9000000001:999', { source: 'netease', id: '9000000001', br: 999 }],
     ['tencent:001fNThf1S2PM9', { source: 'tencent', id: '001fNThf1S2PM9' }],
     ['tencent:001fNThf1S2PM9:320', { source: 'tencent', id: '001fNThf1S2PM9', br: 320 }],
     ['bilibili:BV1xx411c7mD', { source: 'bilibili', id: 'BV1xx411c7mD' }],
@@ -58,21 +58,21 @@ describe('GD Studio external ID parser', () => {
   it.each([
     '',
     '   ',
-    ' netease:2100334024',
-    'netease:2100334024 ',
-    'NETEASE:2100334024',
-    'unknown:2100334024',
+    ' netease:9000000001',
+    'netease:9000000001 ',
+    'NETEASE:9000000001',
+    'unknown:9000000001',
     'netease:',
     'netease::320',
-    'netease:2100334024:',
-    'netease:2100334024:64', // unsupported bitrate
-    'netease:2100334024:0',
-    'netease:2100334024:abc',
-    'netease:../2100334024',
-    'netease:2100334024?types=url',
-    'netease:2100334024#frag',
-    'netease:2100334024/audio',
-    'https://music-api.gdstudio.xyz/api.php?types=url&id=2100334024',
+    'netease:9000000001:',
+    'netease:9000000001:64', // unsupported bitrate
+    'netease:9000000001:0',
+    'netease:9000000001:abc',
+    'netease:../9000000001',
+    'netease:9000000001?types=url',
+    'netease:9000000001#frag',
+    'netease:9000000001/audio',
+    'https://music-api.gdstudio.xyz/api.php?types=url&id=9000000001',
     'La Vaguelette',
     'netease:La Vaguelette',
     `netease:${'a'.repeat(65)}`, // oversized ID
@@ -102,7 +102,7 @@ describe('GD Studio metadata adapter', () => {
     expect(parsedUrl.pathname).toBe('/api.php')
     expect(parsedUrl.searchParams.get('types')).toBe('url')
     expect(parsedUrl.searchParams.get('source')).toBe('netease')
-    expect(parsedUrl.searchParams.get('id')).toBe('2100334024')
+    expect(parsedUrl.searchParams.get('id')).toBe('9000000001')
     expect(parsedUrl.searchParams.get('br')).toBe('320')
     expect(Array.from(parsedUrl.searchParams.keys()).sort()).toEqual(['br', 'id', 'source', 'types'])
 
@@ -125,11 +125,11 @@ describe('GD Studio metadata adapter', () => {
     expect(parsedUrl.searchParams.has('br')).toBe(false)
     expect(parsedUrl.searchParams.get('types')).toBe('url')
     expect(parsedUrl.searchParams.get('source')).toBe('netease')
-    expect(parsedUrl.searchParams.get('id')).toBe('2100334024')
+    expect(parsedUrl.searchParams.get('id')).toBe('9000000001')
   })
 
   it('detects flac mimeType from media URL pathname', async () => {
-    const flacUrl = 'https://m701.music.126.net/audio/2100334024.flac'
+    const flacUrl = 'https://m701.music.126.net/audio/9000000001.flac'
     const fetchImpl = vi.fn(async () => jsonResponse(validResponse({ url: flacUrl }))) as unknown as typeof fetch
 
     const result = await resolve(fetchImpl, EXTERNAL_ID, (val) => new URL(val))

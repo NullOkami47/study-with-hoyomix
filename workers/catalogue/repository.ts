@@ -67,7 +67,19 @@ function group<T extends { track_id: string }>(rows: T[]): Map<string, T[]> {
   }
   return map
 }
-export function projectCatalogue(snapshot: CatalogueSnapshot): PublishedCatalogue {
+/** Largest serialised public catalogue the route will serve (browser safety bound). */
+export const MAX_CATALOGUE_BYTES = 10 * 1024 * 1024
+
+/** One-row read of the published revision (H-03): costs 1 row instead of the whole catalogue. */
+export async function readCatalogueRevision(db: D1Database): Promise<number> {
+  const row = await db.prepare('SELECT revision FROM catalogue_state WHERE id=1').first<{ revision: unknown }>()
+  const revision = row?.revision
+  if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1)
+    throw new Error('catalogue_unavailable')
+  return revision
+}
+
+function buildCatalogue(snapshot: CatalogueSnapshot): PublishedCatalogue {
   const games = group(snapshot.games),
     relations = group(snapshot.relations),
     aliases = group(snapshot.aliases),
@@ -101,10 +113,24 @@ export function projectCatalogue(snapshot: CatalogueSnapshot): PublishedCatalogu
         metadata: publicSourceMetadata(s.metadata_json),
       })),
   }))
-  const result = { revision: String(snapshot.revision), tracks: parseCatalog(tracks) }
-  if (new TextEncoder().encode(JSON.stringify(result)).byteLength > 10 * 1024 * 1024)
+  return { revision: String(snapshot.revision), tracks: parseCatalog(tracks) }
+}
+export function projectCatalogue(snapshot: CatalogueSnapshot): PublishedCatalogue {
+  const result = buildCatalogue(snapshot)
+  if (new TextEncoder().encode(JSON.stringify(result)).byteLength > MAX_CATALOGUE_BYTES)
     throw new Error('catalogue_unavailable')
   return result
+}
+/**
+ * The projection serialised exactly once: `body` is byte-identical to
+ * `JSON.stringify(projectCatalogue(snapshot))`, with the same 10 MiB bound applied to it.
+ */
+export function serialiseCatalogue(snapshot: CatalogueSnapshot): { revision: string; body: string } {
+  const result = buildCatalogue(snapshot)
+  const body = JSON.stringify(result)
+  if (new TextEncoder().encode(body).byteLength > MAX_CATALOGUE_BYTES)
+    throw new Error('catalogue_unavailable')
+  return { revision: result.revision, body }
 }
 export async function readPublishedCatalogue(db: D1Database): Promise<PublishedCatalogue> {
   return projectCatalogue(await readCatalogueSnapshot(db))

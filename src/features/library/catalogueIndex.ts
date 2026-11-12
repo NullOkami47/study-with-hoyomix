@@ -30,6 +30,7 @@ import { translate, type Locale, type TranslationKey } from '../../i18n'
 import { CANONICAL_GAME_IDS } from '../catalog/filterState'
 import { normaliseSearchText } from '../catalog/searchText'
 import type { GameId, Track } from '../catalog/types'
+import { hasArtworkSource } from './artwork'
 
 /** Locales whose labels are folded into the searchable text, so a Chinese label is findable. */
 export const SEARCH_LOCALES: readonly Locale[] = ['en', 'zh-Hant', 'zh-Hans']
@@ -76,6 +77,8 @@ export interface GameEntry {
   readonly id: GameId
   readonly albumIds: readonly string[]
   readonly trackCount: number
+  /** Reuses this game's existing catalogue artwork; never a separate asset or binding. */
+  readonly representativeTrack?: Track
 }
 
 export interface CatalogueIndex {
@@ -202,6 +205,7 @@ export function buildCatalogueIndex(tracks: readonly Track[]): CatalogueIndex {
     id,
     albumIds: albumIdsByGame.get(id) ?? [],
     trackCount: (trackIdsByGame.get(id) ?? []).length,
+    representativeTrack: (trackIdsByGame.get(id) ?? []).map(trackId => trackById.get(trackId)!).find(hasArtworkSource),
   }))
 
   return {

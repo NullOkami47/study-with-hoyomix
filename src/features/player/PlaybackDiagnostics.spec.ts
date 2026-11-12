@@ -1,4 +1,4 @@
-﻿import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Track } from '../catalog/types'
@@ -33,7 +33,7 @@ const SENTINEL_AUTH_HEADER = 'Bearer authorization-sentinel-4b7d'
 
 const lxTrack: Track = {
   ...track,
-  sources: [{ provider: 'lx', externalId: 'wy:2100334024' }],
+  sources: [{ provider: 'lx', externalId: 'wy:9000000001' }],
 }
 
 /** The label half of each rendered attempt line, before the ` · ` separator. */
@@ -82,6 +82,8 @@ async function collectLxAttempts(
 ): Promise<ProviderAttempt[]> {
   const attempts: ProviderAttempt[] = []
   const provider = createLxUserProvider({
+    // H-01: the fixture media host is listed explicitly, standing in for an operator allow-list.
+    cspSources: { connect: [], media: ['https://media.example.com'] },
     sourceRepository: createLxRepository(sources),
     runtimeClientFactory: () => client as LxRuntimeClient,
     qualityStore: { lxQuality: () => 'standard' },
@@ -97,7 +99,7 @@ async function collectLxAttempts(
  * The store's `resolve` seam is used to inject a fixed attempt trace so this spec pins the
  * rendering contract independently of resolution timing; the records fed in here are the real
  * provider's own output, captured by `collectLxAttempts`. The end-to-end coverage that the
- * production registry forwards the composite provider's `onSubAttempt` sink into
+ * resolver context forwards the composite provider's `onSubAttempt` sink into
  * `store.attempts` lives in `lxSubAttemptDiagnostics.spec.ts`.
  */
 function mountWithAttempts(attempts: ProviderAttempt[]) {
@@ -182,7 +184,7 @@ describe('PlaybackDiagnostics', () => {
     const trackWithChksz: Track = {
       ...track,
       sources: [
-        { provider: 'chksz', externalId: '3334421408' },
+        { provider: 'chksz', externalId: '9000000003' },
         { provider: 'youtube', externalId: 'abcdefghijk' },
       ],
     }
@@ -237,8 +239,8 @@ describe('PlaybackDiagnostics', () => {
     const multiProviderTrack: Track = {
       ...track,
       sources: [
-        { provider: 'chksz', externalId: '3334421408' },
-        { provider: 'lx', externalId: 'wy:2100334024' },
+        { provider: 'chksz', externalId: '9000000003' },
+        { provider: 'lx', externalId: 'wy:9000000001' },
         { provider: 'jellyfin', externalId: '1234567890abcdef1234567890abcdef' },
       ],
     }
@@ -255,7 +257,7 @@ describe('PlaybackDiagnostics', () => {
   it('labels each LX sub-attempt with its source name', async () => {
     const attempts = await collectLxAttempts(
       [
-        createLxSource('synthetic-pinned-source', 'Synthetic Pinned Source', 10, '// built-in'),
+        createLxSource('builtin-kulao-svip', '褲佬 SVIP', 10, '// built-in'),
         createLxSource('custom-1', 'My Source', 20, '// custom'),
       ],
       {
@@ -270,7 +272,7 @@ describe('PlaybackDiagnostics', () => {
     await player.playNow(lxTrack)
     await flushPromises()
 
-    expect(attemptLabels(wrapper)).toEqual(['LX / Synthetic Pinned Source', 'LX / My Source'])
+    expect(attemptLabels(wrapper)).toEqual(['LX / 褲佬 SVIP', 'LX / My Source'])
 
     wrapper.unmount()
   })
@@ -367,7 +369,7 @@ describe('PlaybackDiagnostics', () => {
     })
     const trackWithChksz: Track = {
       ...track,
-      sources: [{ provider: 'chksz', externalId: '3334421408' }],
+      sources: [{ provider: 'chksz', externalId: '9000000003' }],
     }
     const wrapper = mount(PlaybackDiagnostics, { props: { player } })
 
@@ -389,10 +391,10 @@ describe('PlaybackDiagnostics', () => {
     const attempts = await collectLxAttempts(
       [
         createLxSource(
-          'synthetic-pinned-source',
-          'Synthetic Pinned Source',
+          'builtin-kulao-svip',
+          '褲佬 SVIP',
           10,
-          `/* ${SENTINEL_LX_SCRIPT_BODY} */\n// @name Synthetic Pinned Source`,
+          `/* ${SENTINEL_LX_SCRIPT_BODY} */\n// @name 褲佬 SVIP`,
         ),
       ],
       {
@@ -408,7 +410,7 @@ describe('PlaybackDiagnostics', () => {
 
     expect(JSON.stringify(attempts)).not.toContain(SENTINEL_LX_SCRIPT_BODY)
     const diagnostics = wrapper.get('[data-playback-diagnostics]').text()
-    expect(diagnostics).toContain('LX / Synthetic Pinned Source')
+    expect(diagnostics).toContain('LX / 褲佬 SVIP')
     expect(diagnostics).not.toContain(SENTINEL_LX_SCRIPT_BODY)
 
     wrapper.unmount()
@@ -442,4 +444,13 @@ describe('PlaybackDiagnostics', () => {
 
     wrapper.unmount()
   })
+})
+
+
+it('shows source attempts without debug-log export controls on the playback panel', () => {
+ const player=createPlaybackStore()
+ const wrapper=mount(PlaybackDiagnostics,{props:{player}})
+ expect(wrapper.find('[data-debug-log-export]').exists()).toBe(false)
+ expect(wrapper.find('[data-debug-log-clear]').exists()).toBe(false)
+ wrapper.unmount();player.dispose()
 })

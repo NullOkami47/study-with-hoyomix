@@ -1,18 +1,24 @@
 import { describe, it, expect, vi } from 'vitest'
-import type { Track } from './types'
-
-// Original metadata-only fixture, independent of the public empty catalogue.
-const seed: Track[] = ['one', 'two', 'three'].map((id, index): Track => ({
-  id: `synthetic-${id}`, title: `Tiny synthetic ${id}`, aliases: {},
-  games: [(['genshin', 'hsr', 'zzz'] as const)[index]], relationIds: [],
-  tabs: ['focus'], workGroupId: `synthetic-work-${id}`,
-  needsClassification: false, vocalStatus: 'instrumental',
-  sources: [{ provider: 'r2', externalId: `synthetic/${id}.ogg` }],
-}))
 import { loadRemoteCatalog } from './remoteCatalog'
 import { createCatalogFilterState } from './filterState'
 import { parseCatalog } from './schema'
 import { nextTick } from 'vue'
+import type { Track } from './types'
+
+// Test data stays separate from the intentionally empty public production catalogue.
+const seed: Track[] = (['genshin', 'hsr', 'zzz'] as const).map((game, index) => ({
+  id: `fixture-${game}`,
+  title: index === 0 ? 'Tiny test one' : `Test ${index + 1}`,
+  aliases: {},
+  games: [game],
+  relationIds: index === 0 ? ['place:fixture-one'] : [],
+  tabs: ['focus'],
+  workGroupId: `fixture-group-${index}`,
+  needsClassification: false,
+  vocalStatus: 'instrumental',
+  sources: [{ provider: 'lx', externalId: `fixture-stale-${index}` }],
+}))
+
 describe('published remote catalogue', () => {
   it('fetches only the same-origin endpoint and strictly parses the payload', async () => {
     const fetcher = vi.fn(async () => Response.json({ revision: '1', tracks: seed }))
@@ -75,76 +81,40 @@ describe('published remote catalogue', () => {
     expect(state.filteredTracks.value[0].sources).toEqual(tracks[0].sources)
   })
 
-  it('loads Jellyfin sources from /api/catalogue and ensures they supersede stale R2-only data in player', async () => {
-    const staleStaticTracks = parseCatalog(seed)
-    // Verify stale static fixture only has r2
-    expect(staleStaticTracks.every((t) => t.sources.every((s) => s.provider === 'r2'))).toBe(true)
-
-    // Remote D1 catalogue response with Jellyfin primary and ChKSz fallback
-    const remoteTracksPayload = [
-      {
-        ...seed[0],
-        sources: [
-          {
-            provider: 'jellyfin',
-            externalId: '11111111111111111111111111111111',
-            metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' },
-          },
-          { provider: 'chksz', externalId: '101', metadata: {} },
-        ],
-      },
-      {
-        ...seed[1],
-        sources: [
-          {
-            provider: 'jellyfin',
-            externalId: '22222222222222222222222222222222',
-            metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' },
-          },
-          { provider: 'chksz', externalId: '102', metadata: {} },
-        ],
-      },
-      {
-        ...seed[2],
-        sources: [
-          {
-            provider: 'jellyfin',
-            externalId: '33333333333333333333333333333333',
-            metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' },
-          },
-          { provider: 'chksz', externalId: '103', metadata: {} },
-        ],
-      },
-    ]
-
+  it('replaces stale mappings with published GD and LX sources without changing track identity', async () => {
+    const staleTracks = parseCatalog(seed)
+    const original = JSON.stringify(staleTracks)
+    const remoteTracksPayload = seed.map((track, index) => ({
+      ...track,
+      sources: [
+        { provider: 'gd-studio', externalId: `fixture-gd-${index}`, metadata: { quality: 'standard' } },
+        { provider: 'lx', externalId: `fixture-lx-${index}`, metadata: {} },
+      ],
+    }))
     const fetcher = vi.fn(async () => Response.json({ revision: '3', tracks: remoteTracksPayload }))
     const loaded = await loadRemoteCatalog(fetcher)
 
     expect(loaded.revision).toBe('3')
     expect(loaded.tracks).toHaveLength(3)
-    // Preserves existing track metadata
-    expect(loaded.tracks.map((t) => t.id)).toEqual(staleStaticTracks.map((t) => t.id))
-    expect(loaded.tracks.map((t) => t.title)).toEqual(staleStaticTracks.map((t) => t.title))
-    expect(loaded.tracks.map((t) => t.games)).toEqual(staleStaticTracks.map((t) => t.games))
-    expect(loaded.tracks.map((t) => t.workGroupId)).toEqual(staleStaticTracks.map((t) => t.workGroupId))
-
-    // Jellyfin sources are present and R2 is absent
-    for (const track of loaded.tracks) {
-      const providers = track.sources.map((s) => s.provider)
-      expect(providers).toContain('jellyfin')
-      expect(providers).toContain('chksz')
-      expect(providers).not.toContain('r2')
+    expect(loaded.tracks).toEqual(remoteTracksPayload)
+    for (const [index, track] of loaded.tracks.entries()) {
+      expect({ ...track, sources: staleTracks[index].sources }).toEqual(staleTracks[index])
+      expect(track.sources.map((source) => source.provider)).toEqual(['gd-studio', 'lx'])
+      expect(track.sources.map((source) => source.externalId)).not.toContain(
+        staleTracks[index].sources[0].externalId,
+      )
     }
 
-    // Now verify filter state replacement
-    const state = createCatalogFilterState(staleStaticTracks)
+    const state = createCatalogFilterState(staleTracks, {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+    })
     state.replaceTracks(loaded.tracks)
     await nextTick()
 
-    // The active tracks in filter state are now the remote tracks with Jellyfin
-    const activeFirstTrack = state.filteredTracks.value[0]
-    expect(activeFirstTrack.sources.some((s) => s.provider === 'jellyfin')).toBe(true)
-    expect(activeFirstTrack.sources.some((s) => s.provider === 'r2')).toBe(false)
+    expect(state.filteredTracks.value).toEqual(loaded.tracks)
+    expect(JSON.stringify(staleTracks)).toBe(original)
   })
 
   it('fails closed when catalogue fetch returns non-200, allowing caller to handle explicitly rather than silently pretending stale data is current', async () => {

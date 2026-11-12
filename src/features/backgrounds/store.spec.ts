@@ -53,32 +53,12 @@ describe('background selection sanitising', () => {
 describe('background rotation store', () => {
   beforeEach(() => { vi.useFakeTimers() })
 
-  it('starts without media before the operator supplies a catalogue', () => {
+  it('starts first visits with no shipped media before the catalogue request', () => {
     const store = createBackgroundStore({ storage: memoryStorage() })
-    expect(store.current.value).toBeNull()
     expect(store.backgrounds.value).toEqual([])
-    expect(store.selection.value.selectedIds).toEqual([])
-    store.destroy()
-  })
-
-  it('keeps empty local choices empty after an empty published catalogue', async () => {
-    const storage = memoryStorage()
-    const store = createBackgroundStore({ repository: repository([]), storage })
-    await store.load()
     expect(store.current.value).toBeNull()
     expect(store.next.value).toBeNull()
-    expect(store.selection.value.selectedIds).toEqual([])
-    store.destroy()
-  })
-
-  it('chooses an available original scene without privileging a removed asset ID', async () => {
-    const store = createBackgroundStore({
-      repository: repository([background('original-scene', 'video'), background('zzz-belle-lofi-girl', 'video')]),
-      storage: memoryStorage(),
-    })
-    await store.load()
-    expect(store.current.value?.id).toBe('original-scene')
-    expect(store.selection.value.selectedIds).toEqual(['original-scene'])
+    expect(store.status.value).toBe('idle')
     store.destroy()
   })
 

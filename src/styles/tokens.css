@@ -124,56 +124,6 @@
   --radius-control: 0.375rem;
 }
 
-/*
- * Studio CSS fallback. Dark translucent liquid glass substrate paired with a subtle specular
- * top highlight and enriched backdrop saturation. This avoids milky/grey washes while matching
- * the depth and refractive tone of the WebGL studio glass shader.
- * --studio-glass-gray-strength is the 0..1 preference fraction, set on the
- * workspace root alongside --studio-glass-blur.
- */
-[data-theme="studio"] .surface-glass,
-[data-theme="studio"] .focus-bar,
-[data-theme="studio"] [data-advanced-filters] {
-  background:
-    linear-gradient(180deg, rgb(255 255 255 / 8%) 0%, rgb(255 255 255 / 2%) 100%),
-    rgb(10 14 26 / calc(48% + var(--studio-glass-gray-strength, 0.26) * 16%)) !important;
-  -webkit-backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
-  backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
-  border: 1px solid rgb(255 255 255 / 18%) !important;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 18%), 0 16px 40px rgb(0 0 0 / 36%) !important;
-}
-
-/* Nested settings cards maintain dark translucent contrast instead of additive grey wash. */
-[data-theme="studio"] .settings-sheet__section {
-  background: rgb(255 255 255 / 4%) !important;
-  border: 1px solid rgb(255 255 255 / 12%) !important;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 8%), 0 4px 16px rgb(0 0 0 / 25%) !important;
-}
-
-/* Only surfaces that the shader actually rendered may drop their CSS fallback.
-   The foreground modal retains a dark translucent glass substrate, border and elevation
-   so underlying resting workspace furniture and scene daylight do not bleed through uncontrolled,
-   while remaining translucent enough for WebGL specular glares and refraction to shine through. */
-[data-theme="studio"][data-studio-glass="active"] [data-studio-glass-rendered="true"] {
-  background: transparent !important;
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
-  border-color: transparent !important;
-  box-shadow: none !important;
-}
-/* The filter popover's own card was a second page on top of its shader shape. */
-[data-theme="studio"][data-studio-glass="active"] .focus-bar__advanced-popover:has([data-studio-glass-rendered="true"]) {
-  background: transparent !important;
-  background-color: transparent !important;
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
-  box-shadow: none !important;
-  border: 0 !important;
-}
-[data-theme="studio"][data-studio-glass="active"] .focus-bar__advanced-popover:has([data-studio-glass-rendered="true"])::before {
-  content: none;
-}
-
 /* Equal, ellipsising columns keep all three games reachable when the bar spans the
    whole viewport, because each 1fr column resolves against the space actually there.
    The rule stops at the width where the bar becomes intrinsic: past that point a 1fr
@@ -276,28 +226,6 @@
 @supports not (backdrop-filter: blur(1px)) {
   .liquid-shell { background-color: rgb(29 31 40 / 91%); }
   .liquid-popover { background-color: rgb(24 26 35 / 94%); }
-}
-/* Studio keeps its selected blur and shader-backed modal substrate. The optical
-   Liquid Glass recipe above remains the standard/cinematic fallback. */
-[data-theme="studio"] .liquid-shell:not([data-studio-glass-rendered="true"]),
-[data-theme="studio"] .liquid-popover:not([data-studio-glass-rendered="true"]) {
-  -webkit-backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
-  backdrop-filter: blur(var(--studio-glass-blur, 20px)) saturate(1.28) contrast(1.04) !important;
-}
-/* The shader samples the rim. Leaving this stroke on top of it redraws a flat border. */
-[data-theme="studio"][data-studio-glass="active"] [data-studio-glass-rendered="true"]::before {
-  content: none;
-}
-/* CSS fallback only, and quieter than the shader: cool on one side, warm on the other. */
-[data-theme="studio"] .liquid-shell:not([data-studio-glass-rendered="true"])::before,
-[data-theme="studio"] .liquid-popover:not([data-studio-glass-rendered="true"])::before {
-  background: linear-gradient(128deg, rgb(186 220 255 / 22%), rgb(255 255 255 / 5%) 46%, rgb(255 186 170 / 18%));
-  opacity: var(--studio-edge-strength, 0.68);
-}
-/* The plate canvas owns its rounded alpha. Clipping that bitmap to the same
-   curve throws the antialiased fringe away and leaves a stair-stepped corner. */
-[data-theme="studio"][data-studio-glass="active"] .overlay-sheet:has([data-studio-glass-canvas]) {
-  overflow: visible;
 }
 @media (prefers-reduced-motion: reduce) {
   :root { --liquid-motion: 0ms; }

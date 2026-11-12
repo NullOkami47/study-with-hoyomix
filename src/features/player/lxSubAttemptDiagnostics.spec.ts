@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Track } from '../catalog/types'
 import type { LxSourceRecord } from './lx/types'
+import type { LxGlobalSourceRepository } from './lx/globalSourceRepository'
 import type { ProviderAttempt } from './providers/types'
 import { createPlaybackStore } from './store'
 import { createRuntimeProviderRepository } from './runtimeConfig'
@@ -65,7 +66,7 @@ const lxTrack: Track = {
   workGroupId: 'work-lx-sub',
   vocalStatus: 'instrumental',
   needsClassification: false,
-  sources: [{ provider: 'lx', externalId: 'wy:2100334024' }],
+  sources: [{ provider: 'lx', externalId: 'wy:9000000001' }],
 }
 
 function lxSource(id: string, name: string, priority: number, script: string): LxSourceRecord {
@@ -82,8 +83,16 @@ function lxSource(id: string, name: string, priority: number, script: string): L
   }
 }
 
-const BUILTIN = lxSource('synthetic-pinned-source', 'Synthetic Pinned Source', 1, '// builtin script')
+const BUILTIN = lxSource('builtin-kulao-svip', '褲佬 SVIP', 1, '// builtin script')
 const USER_SOURCE = lxSource('user-mine', 'My Source', 2, '// user script')
+const MANAGED_KULAO = lxSource('global:builtin-kulao-svip', '褲佬 SVIP', 1, '// managed script')
+const globalSourceRepository: LxGlobalSourceRepository = {
+  managesBundledSource: true,
+  list: async () => [MANAGED_KULAO],
+  revision: () => 1,
+  pendingApproval: () => [],
+  invalidate: () => undefined,
+}
 
 const lxSubAttempts = (attempts: readonly ProviderAttempt[]): ProviderAttempt[] =>
   attempts.filter((attempt) => attempt.providerId === 'lx' && attempt.sourceName !== undefined)
@@ -91,10 +100,11 @@ const lxSubAttempts = (attempts: readonly ProviderAttempt[]): ProviderAttempt[] 
 describe('LX sub-source attempts in playback diagnostics', () => {
   beforeEach(() => {
     lxMock.list.mockReset().mockResolvedValue([BUILTIN, USER_SOURCE])
-    // The built-in source fails to load (a timeout), the user source loads but cannot produce
+    // The legacy local copy remains stored but is suppressed by the authoritative registry.
+    // The administrator-published source times out, while the user source loads but cannot produce
     // a playable URL: both must surface as distinct sub-attempt lines.
     lxMock.loadSource.mockReset().mockImplementation(async (script: string) => {
-      if (script === BUILTIN.script) throw new Error('LX source load timed out')
+      if (script === MANAGED_KULAO.script) throw new Error('LX source load timed out')
       return { initedMeta: undefined }
     })
     lxMock.callMusicUrl.mockReset().mockRejectedValue(new Error('upstream refused'))
@@ -105,7 +115,7 @@ describe('LX sub-source attempts in playback diagnostics', () => {
     const fetchImpl = vi.fn().mockResolvedValue(configResponse([
       { id: 'lx', available: true, enabled: true, automaticEligible: true, priority: 10 },
     ]))
-    const repository = createRuntimeProviderRepository({ fetch: fetchImpl, now: () => 1_000 })
+    const repository = createRuntimeProviderRepository({ fetch: fetchImpl, now: () => 1_000, globalSourceRepository })
     const store = createPlaybackStore({ loadRegistry: repository.load })
 
     await store.playNow(lxTrack)
@@ -117,7 +127,7 @@ describe('LX sub-source attempts in playback diagnostics', () => {
     // ...and each of its sub-source attempts must appear as an additional entry.
     expect(lxSubAttempts(store.attempts.value)).toEqual([
       expect.objectContaining({
-        providerId: 'lx', sourceId: BUILTIN.id, sourceName: 'Synthetic Pinned Source', ok: false, code: 'timeout',
+        providerId: 'lx', sourceId: MANAGED_KULAO.id, sourceName: '褲佬 SVIP', ok: false, code: 'timeout',
       }),
       expect.objectContaining({
         providerId: 'lx', sourceId: USER_SOURCE.id, sourceName: 'My Source', ok: false, code: 'unavailable',
@@ -131,7 +141,7 @@ describe('LX sub-source attempts in playback diagnostics', () => {
     ]))
     // A frozen clock keeps the second load inside the five-second TTL, so the cached registry —
     // and therefore the cached LX provider instance — is reused.
-    const repository = createRuntimeProviderRepository({ fetch: fetchImpl, now: () => 1_000 })
+    const repository = createRuntimeProviderRepository({ fetch: fetchImpl, now: () => 1_000, globalSourceRepository })
     const store = createPlaybackStore({ loadRegistry: repository.load })
 
     await store.playNow(lxTrack)
@@ -141,27 +151,26 @@ describe('LX sub-source attempts in playback diagnostics', () => {
 
     expect(fetchImpl).toHaveBeenCalledTimes(1)
     expect(lxSubAttempts(store.attempts.value)).toEqual([
-      expect.objectContaining({ sourceName: 'Synthetic Pinned Source', ok: false, code: 'timeout' }),
+      expect.objectContaining({ sourceName: '褲佬 SVIP', ok: false, code: 'timeout' }),
       expect.objectContaining({ sourceName: 'My Source', ok: false, code: 'unavailable' }),
     ])
   })
 
-  it('keeps delivering sub-attempts when an unrelated sink-less load runs mid-resolution', async () => {
+  it('keeps delivering sub-attempts when an unrelated config load runs mid-resolution', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(configResponse([
       { id: 'lx', available: true, enabled: true, automaticEligible: true, priority: 10 },
     ]))
-    const repository = createRuntimeProviderRepository({ fetch: fetchImpl, now: () => 1_000 })
+    const repository = createRuntimeProviderRepository({ fetch: fetchImpl, now: () => 1_000, globalSourceRepository })
     const store = createPlaybackStore({ loadRegistry: repository.load })
 
-    // The repository holds one LX provider instance and relays its sub-attempts through a
-    // single mutable sink, so a load that supplies no sink must not clear the sink the
-    // in-flight resolution installed. `states()` is exactly such a load: the Control Centre's
-    // settings sheet calls it whenever it mounts, which can happen while playback is resolving.
+    // The repository reuses its LX provider, while the resolver owns this invocation's
+    // sub-attempt context. An unrelated `states()` load must not affect that context: the
+    // Control Centre's settings sheet can request state while playback is still resolving.
     let releaseSourceLoad: () => void = () => undefined
     const sourceLoadGate = new Promise<void>((resolve) => { releaseSourceLoad = resolve })
     lxMock.loadSource.mockImplementation(async (script: string) => {
       await sourceLoadGate
-      if (script === BUILTIN.script) throw new Error('LX source load timed out')
+      if (script === MANAGED_KULAO.script) throw new Error('LX source load timed out')
       return { initedMeta: undefined }
     })
 
@@ -171,7 +180,7 @@ describe('LX sub-source attempts in playback diagnostics', () => {
     await resolving
 
     expect(lxSubAttempts(store.attempts.value)).toEqual([
-      expect.objectContaining({ sourceId: BUILTIN.id, ok: false, code: 'timeout' }),
+      expect.objectContaining({ sourceId: MANAGED_KULAO.id, ok: false, code: 'timeout' }),
       expect.objectContaining({ sourceId: USER_SOURCE.id, ok: false, code: 'unavailable' }),
     ])
   })

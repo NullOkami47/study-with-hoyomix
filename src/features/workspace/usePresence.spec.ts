@@ -75,3 +75,52 @@ it('drops stale aggregates immediately when the browser reports offline, then re
   expect(MockSocket.instances).toHaveLength(2)
   wrapper.unmount()
 })
+
+// M-07: the server issues the signed visitor cookie; the client handles rejected upgrades.
+it('bootstraps without proposing a client-chosen visitor ID', async () => {
+  const wrapper = render(); await settle()
+  const fetchMock = vi.mocked(fetch)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  const [url, init] = fetchMock.mock.calls[0]
+  expect(url).toBe('/api/presence/visitor')
+  expect(init).toEqual({ method: 'POST', credentials: 'same-origin' })
+  expect(localStorage.getItem('hoyomix-presence-visitor')).toBeNull()
+  wrapper.unmount()
+})
+it('re-bootstraps once immediately after a rejected upgrade (401 visitor_invalid), then backs off', async () => {
+  const wrapper = render(); await settle()
+  const fetchMock = vi.mocked(fetch)
+  // Handshake rejected before open: one immediate re-bootstrap and reconnect.
+  MockSocket.instances[0].onclose!(); await settle()
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(MockSocket.instances).toHaveLength(2)
+  // Rejected again (for example 429 connection_limit): no further immediate attempt.
+  MockSocket.instances[1].onclose!(); await settle()
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  await vi.advanceTimersByTimeAsync(1600); await settle()
+  expect(MockSocket.instances).toHaveLength(3)
+  MockSocket.instances[2].onclose!(); await settle()
+  await vi.advanceTimersByTimeAsync(1600); await settle()
+  expect(MockSocket.instances).toHaveLength(3)
+  await vi.advanceTimersByTimeAsync(1000); await settle()
+  expect(MockSocket.instances).toHaveLength(4)
+  wrapper.unmount()
+  expect(vi.getTimerCount()).toBe(0)
+})
+it('treats 503 presence_unavailable as unavailable and retries only with backoff', async () => {
+  const fetchMock = vi.mocked(fetch)
+  fetchMock.mockResolvedValue({ ok: false, status: 503 } as Response)
+  const wrapper = render(); await settle()
+  expect(MockSocket.instances).toHaveLength(0)
+  expect(wrapper.text()).toBe('unavailable false')
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  await vi.advanceTimersByTimeAsync(900); await settle()
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  await vi.advanceTimersByTimeAsync(700); await settle()
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  // The next attempt is at least 2 s after the previous one: no tight loop.
+  await vi.advanceTimersByTimeAsync(1300); await settle()
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  wrapper.unmount()
+  expect(vi.getTimerCount()).toBe(0)
+})

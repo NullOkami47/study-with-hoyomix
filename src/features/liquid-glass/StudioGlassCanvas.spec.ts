@@ -1034,3 +1034,96 @@ describe('StudioGlassCanvas', () => {
     wrapper.unmount()
   })
 })
+
+// Explicit opt-out protects callers during migration to the native SVG backdrop engine.
+describe('StudioGlassCanvas renderer ownership', () => {
+  it('allocates no GPU, observers or listeners while explicitly disabled', async () => {
+    const addDocumentListener = vi.spyOn(document, 'addEventListener')
+    const addWindowListener = vi.spyOn(window, 'addEventListener')
+    const wrapper = mount(StudioGlassCanvas, { props: { lowPower: false, enabled: false } })
+    await flushPromises()
+    expect(mocks.instances).toHaveLength(0)
+    expect(mocks.resizeObservers).toHaveLength(0)
+    expect(mocks.mutationObservers).toHaveLength(0)
+    expect(mocks.motionListeners.size).toBe(0)
+    expect(addDocumentListener.mock.calls.some(([name]) => name === 'visibilitychange')).toBe(false)
+    expect(addWindowListener.mock.calls.some(([name]) => String(name) === 'scroll')).toBe(false)
+    expect(wrapper.find('canvas').exists()).toBe(false)
+    expect(document.documentElement.dataset.studioGlass).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('fully releases the old renderer on opt-out and can opt back in once', async () => {
+    const wrapper = mount(StudioGlassCanvas, { props: { lowPower: false } })
+    await flushPromises()
+    const first = mocks.instances[0]
+    const oldObservers = [...mocks.resizeObservers, ...mocks.mutationObservers]
+    window.dispatchEvent(new Event('scroll'))
+    const staleFrame = vi.mocked(requestAnimationFrame).mock.calls.at(-1)?.[0]
+    const framesBefore = first.render.mock.calls.length
+    await wrapper.setProps({ enabled: false })
+    await flushPromises()
+    expect(first.dispose).toHaveBeenCalledTimes(1)
+    expect(first.gl.deleteTexture).toHaveBeenCalledTimes(1)
+    expect(oldObservers.every(observer => observer.disconnect.mock.calls.length === 1)).toBe(true)
+    expect(mocks.motionListeners.size).toBe(0)
+    expect(wrapper.find('canvas').exists()).toBe(false)
+    expect(document.documentElement.dataset.studioGlass).toBeUndefined()
+    expect(document.querySelector('[data-studio-glass-rendered]')).toBeNull()
+    staleFrame?.(500)
+    window.dispatchEvent(new Event('scroll'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(first.render).toHaveBeenCalledTimes(framesBefore)
+    await wrapper.setProps({ enabled: true })
+    await flushPromises()
+    expect(mocks.instances).toHaveLength(2)
+    expect(document.documentElement.dataset.studioGlass).toBe('active')
+    wrapper.unmount()
+    expect(mocks.instances[1].dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not erase another active renderer marker when mounted disabled', async () => {
+    document.documentElement.dataset.studioGlass = 'active'
+    const wrapper = mount(StudioGlassCanvas, { props: { lowPower: false, enabled: false } })
+    await flushPromises()
+    expect(document.documentElement.dataset.studioGlass).toBe('active')
+    wrapper.unmount()
+    expect(document.documentElement.dataset.studioGlass).toBe('active')
+  })
+})
+
+// The renderer reads image sources only. A Studio migration must not commandeer
+// SceneBackdrop's independent video/audio lifecycle, including its standby slot.
+describe('StudioGlassCanvas media boundary', () => {
+  it('never controls either live video slot while enabling and disabling', async () => {
+    document.body.insertAdjacentHTML('afterbegin', '<div data-scene-backdrop><video src="/active.mp4"></video><video src="/standby.mp4"></video></div>')
+    const videos = [...document.querySelectorAll('video')]
+    const controls = videos.flatMap(video => [vi.spyOn(video, 'play'), vi.spyOn(video, 'pause'), vi.spyOn(video, 'load')])
+    const wrapper = mount(StudioGlassCanvas, { props: { lowPower: false, enabled: false } })
+    await flushPromises()
+    await wrapper.setProps({ enabled: true })
+    await flushPromises()
+    await wrapper.setProps({ enabled: false })
+    await flushPromises()
+    wrapper.unmount()
+    expect(mocks.instances).toHaveLength(0)
+    expect(controls.every(control => control.mock.calls.length === 0)).toBe(true)
+    expect(videos.map(video => video.getAttribute('src'))).toEqual(['/active.mp4', '/standby.mp4'])
+    expect(document.querySelectorAll('video')).toHaveLength(2)
+  })
+
+  it('ignores an obsolete RAF even after a new renderer has been enabled', async () => {
+    const wrapper = mount(StudioGlassCanvas, { props: { lowPower: false } })
+    await flushPromises()
+    window.dispatchEvent(new Event('scroll'))
+    const oldFrame = vi.mocked(requestAnimationFrame).mock.calls.at(-1)![0]
+    await wrapper.setProps({ enabled: false })
+    await wrapper.setProps({ enabled: true })
+    await flushPromises()
+    const current = mocks.instances.at(-1)!
+    const renders = current.render.mock.calls.length
+    oldFrame(500)
+    expect(current.render).toHaveBeenCalledTimes(renders)
+    wrapper.unmount()
+  })
+})

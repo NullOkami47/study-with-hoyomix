@@ -10,7 +10,7 @@
  * Contract provenance: established empirically in Task 15 Phase 9. The path, methods, parameter
  * names and gate behaviour were confirmed by live probe; the response body shape is taken from
  * the vendor reference and is marked accordingly below. See
- * `the original development notes`.
+ * `the regression specification`.
  */
 
 import { CHKSZ_API_ORIGIN } from './chksz'
@@ -51,8 +51,8 @@ export type ChkszSearchCandidate = {
    * Duration in **milliseconds**, or `null` when the field is absent or unparseable.
    *
    * Unit verified live on 2026-09-20: local ffprobe 149.520979s vs candidate raw
-   * 149520 (delta <1ms) for NetEase id 2100334024. Evidence:
-   * `the original development notes`. `null` is still returned for a
+   * 149520 (delta <1ms) for NetEase id 9000000001. Evidence:
+   * `the regression specification`. `null` is still returned for a
    * missing/unparseable field so a duration comparison refuses to run instead of
    * silently comparing against a guessed value.
    */

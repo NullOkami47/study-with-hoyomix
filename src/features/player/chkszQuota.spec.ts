@@ -12,12 +12,12 @@ import { createRuntimeProviderRepository } from './runtimeConfig'
  */
 
 const USER_KEY = 'chksz_quota_test_key'
-const EXTERNAL_ID = '3334421408'
+const EXTERNAL_ID = '9000000003'
 const MEDIA_URL = 'https://m801.music.126.net/20260913/abc/xyz.mp3'
 
 const track = (id = EXTERNAL_ID, provider = 'chksz'): Track => ({
-  id: 'zzz-tiny-giant',
-  title: 'Tiny Giant',
+  id: 'demo-zzz-study',
+  title: 'Demo ZZZ Study',
   aliases: {},
   games: ['zzz'],
   relationIds: [],
@@ -133,7 +133,7 @@ describe('ChKSz quota safety — no speculative consumption', () => {
 
   it('issues zero ChKSz requests when a track is inspected or a queue is hydrated', () => {
     const fetchImpl = recordingFetch()
-    const queue = [track(), track('2100334024'), track('2155423468')]
+    const queue = [track(), track('9000000001'), track('9000000002')]
 
     // Hydration reads mapping metadata only; nothing resolves until playback asks.
     const hydrated = queue.flatMap((entry) => entry.sources.map((source) => source.provider))

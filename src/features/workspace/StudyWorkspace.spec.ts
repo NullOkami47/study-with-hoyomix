@@ -14,6 +14,7 @@ import { createRuntimeProviderRepository } from '../player/runtimeConfig'
 import type { ProviderPreferencesStore } from '../player/providerPreferences'
 import { getDefaultPlaybackQualityPreferencesStore } from '../player/qualityPreferences'
 import type { PlaybackStore } from '../player/store'
+import { getDefaultLocalLibraryRepository } from '../library/localRepository'
 import {
   POMODORO_STORAGE_KEY,
   PomodoroFocusQueueCapacityError,
@@ -241,6 +242,55 @@ function closeControlCentre(wrapper: ReturnType<typeof mount>): Promise<void> {
 }
 
 describe('StudyWorkspace', () => {
+  it('records same-track Jellyfin recovery once while a deliberate replay records a new listening session', async () => {
+    const recent = vi.spyOn(getDefaultLocalLibraryRepository(), 'recordRecent').mockResolvedValue(true)
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const mediaLoad = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const mapped: Track = { ...controlledCatalogue[0], sources: [
+      { provider: 'lx', externalId: 'external' }, { provider: 'jellyfin', externalId: 'own' },
+    ] }
+    catalogMocks.tracks = [mapped]
+    runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry(['lx', 'jellyfin'].map((id, priority) => ({
+      provider: { id, resolve: vi.fn(async () => ({ kind: 'audio' as const, url: `https://media.invalid/${id}.ogg`, mimeType: 'audio/ogg' })) },
+      enabled: true, priority, timeoutMs: 100,
+    }))))
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    try {
+      const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+      await player.playNow(mapped)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(1)
+      expect(await player.requestJellyfinFallback('lx', player.playbackGeneration.value, 102)).toBe(true)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(1)
+      await player.playNow(mapped)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(2)
+      const generation = player.playbackGeneration.value
+      const session = player.listeningSessionId.value
+      player.reportMediaState('ended', generation)
+      player.pause()
+      await player.play()
+      player.reportMediaState('playing', generation)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(3)
+      expect(player.listeningSessionId.value).toBe(session + 1)
+      expect(player.playbackGeneration.value).toBe(generation)
+      player.setRepeatMode('one')
+      player.reportMediaState('ended', generation)
+      await player.play()
+      player.reportMediaState('playing', generation)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(4)
+      expect(player.listeningSessionId.value).toBe(session + 2)
+    } finally {
+      wrapper.unmount()
+      recent.mockRestore(); mediaPlay.mockRestore(); mediaLoad.mockRestore()
+    }
+  })
   it('does not publish a delayed anonymous Focus list after the authenticated scope has loaded', async () => {
     let finish!: (values: FocusSessionRecord[]) => void
     const pending = new Promise<FocusSessionRecord[]>(resolve => { finish = resolve })
@@ -643,27 +693,26 @@ describe('StudyWorkspace', () => {
     wrapper.unmount()
   })
 
-  it('bridges the glass gray preference to both the WebGL canvas and the CSS fallback', async () => {
+  it('keeps the glass gray preference without a second workspace compositor', async () => {
     const preferences = usePreferences()
     preferences.setVisualStyle('studio')
     preferences.setStudioGlassGray(40)
     const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
     await nextTick()
 
-    // One preference, two render paths: the shader prop and the custom property the
-    // backdrop-filter fallback reads must never drift apart.
+    // The workspace retains its material preferences; AppShell owns the sole optical engine.
     const root = wrapper.get('main[data-workspace="cinematic"]').element as HTMLElement
     expect(root.style.getPropertyValue('--studio-glass-gray-strength')).toBe('0.4')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('glassGray')).toBe(40)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
 
     preferences.setStudioGlassGray(75)
     await nextTick()
     expect(root.style.getPropertyValue('--studio-glass-gray-strength')).toBe('0.75')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('glassGray')).toBe(75)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
     wrapper.unmount()
   })
 
-  it('bridges the edge dispersion preference to the shader and the CSS fallback', async () => {
+  it('keeps the edge preference without a second workspace compositor', async () => {
     const preferences = usePreferences()
     preferences.setVisualStyle('studio')
     preferences.setStudioEdge(40)
@@ -672,12 +721,12 @@ describe('StudyWorkspace', () => {
 
     const root = wrapper.get('main[data-workspace="cinematic"]').element as HTMLElement
     expect(root.style.getPropertyValue('--studio-edge-strength')).toBe('0.4')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('edge')).toBe(40)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
 
     preferences.setStudioEdge(0)
     await nextTick()
     expect(root.style.getPropertyValue('--studio-edge-strength')).toBe('0')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('edge')).toBe(0)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
     wrapper.unmount()
   })
 
@@ -794,6 +843,21 @@ describe('StudyWorkspace', () => {
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
     expect(wrapper.getComponent(PlayerBar).props('mediaSuspended')).toBe(false)
     expect(wrapper.get('[data-focus-pomodoro-start]').element).toBe(document.activeElement)
+  })
+
+  it('updates today statistics across local midnight while a persisted summary remains open', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-05T08:00:00.000Z'))
+    seedPendingFocusCompletion(Date.now())
+    const wrapper = mount(StudyWorkspace, { attachTo: document.body, global: { stubs: workspaceStubs } })
+    await flushPromises()
+    expect(wrapper.get('[data-focus-summary-today-actual]').text()).toBe('1m')
+    expect(wrapper.get('[data-focus-summary-today-completed]').text()).toBe('1')
+    vi.setSystemTime(new Date('2026-11-06T08:00:00.000Z'))
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+    expect(wrapper.get('[data-focus-summary-today-actual]').text()).toBe('0s')
+    expect(wrapper.get('[data-focus-summary-today-completed]').text()).toBe('0')
   })
 
   it('returns Summary focus to the live Pomodoro control when completion replaces Settings', async () => {
@@ -1057,7 +1121,7 @@ describe('StudyWorkspace', () => {
       global: { stubs: workspaceStubs },
     })
 
-    // A fresh load keeps the unfinished chat out of the resting scene.
+    // A fresh load keeps chat out of the resting scene.
     expect(wrapper.find('[data-floating-chat]').exists()).toBe(false)
 
     await openSection(wrapper, 'chat')
@@ -1075,7 +1139,8 @@ describe('StudyWorkspace', () => {
     expect(wrapper.find('[data-control-centre-open-chat]').exists()).toBe(false)
     // One chat surface: the hub offers an action on the floating window rather than
     // mounting a second live chat inside itself.
-    expect(wrapper.findAll('[data-chat-availability]')).toHaveLength(2)
+    expect(wrapper.findAll('[data-chat-panel]')).toHaveLength(1)
+    expect(wrapper.find('[data-control-centre-panel] [data-chat-panel]').exists()).toBe(false)
 
     // Focus lands on the window itself rather than on a control inside it, so the user
     // arrives at the top of the window and tabs in from there.
@@ -1229,5 +1294,49 @@ describe('StudyWorkspace', () => {
 
     expect(wrapper.get('main').attributes('data-catalogue-status')).toBe('fallback')
     wrapper.unmount()
+  })
+})
+
+// Wave A verify-first check (P95-09). A pass on 8309e3a refutes the finding.
+describe('StudyWorkspace verify first (Wave A)', () => {
+  it.each(['Jellyfin recovery', 'media renewal'] as const)('P95-09: keeps the Library open across a same-session %s', async (change) => {
+    const recent = vi.spyOn(getDefaultLocalLibraryRepository(), 'recordRecent').mockResolvedValue(true)
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const mediaLoad = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const mapped: Track = { ...controlledCatalogue[0], sources: [
+      { provider: 'lx', externalId: 'external' }, { provider: 'jellyfin', externalId: 'own' },
+    ] }
+    catalogMocks.tracks = [mapped]
+    let urls = 0
+    runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry(['lx', 'jellyfin'].map((id, priority) => ({
+      provider: { id, resolve: vi.fn(async () => ({ kind: 'audio' as const, url: `https://media.invalid/${id}-${++urls}.ogg`, mimeType: 'audio/ogg' })) },
+      enabled: true, priority, timeoutMs: 100,
+    }))))
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    try {
+      const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+      await player.playNow(mapped)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await openSection(wrapper, 'library')
+      expect(wrapper.find('[data-control-centre-panel] [data-library-sheet]').exists()).toBe(true)
+      const session = player.listeningSessionId.value
+      const generation = player.playbackGeneration.value
+
+      if (change === 'Jellyfin recovery') {
+        await player.requestJellyfinFallback('lx', generation, 102)
+        expect(player.activeProviderId.value).toBe('jellyfin')
+      } else {
+        expect(await player.renewMedia('lx', generation)).toBe(true)
+        expect(player.activeProviderId.value).toBe('lx')
+      }
+      await nextTick()
+      // Both are a new playback generation within the same listening session.
+      expect(player.playbackGeneration.value).toBeGreaterThan(generation)
+      expect(player.listeningSessionId.value).toBe(session)
+      expect(wrapper.find('[data-overlay-sheet="control-centre"]').exists()).toBe(true)
+    } finally {
+      wrapper.unmount()
+      recent.mockRestore(); mediaPlay.mockRestore(); mediaLoad.mockRestore()
+    }
   })
 })

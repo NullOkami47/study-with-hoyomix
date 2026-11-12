@@ -20,46 +20,50 @@ const gameIds = (query: string) => searchCatalogue(index, query).games.map((hit)
 
 describe('searchCatalogue — tracks', () => {
   it('finds a track by its canonical title', () => {
-    expect(trackIds('Fontaine Daydream')).toContain('genshin-fontaine-daydream')
+    expect(trackIds('Demo Fontaine Daydream')).toContain('demo-fontaine-daydream')
   })
 
   it('finds a track by a partial title', () => {
     expect(trackIds('fontaine')).toEqual([
-      'genshin-fontaine-daydream',
-      'genshin-fontaine-nightfall',
+      'demo-fontaine-daydream',
+      'demo-fontaine-nightfall',
     ])
   })
 
   it('finds a track by the album it belongs to', () => {
-    const hits = searchCatalogue(index, 'belleau').tracks
+    const hits = searchCatalogue(index, 'fountain').tracks
     expect(hits.map((hit) => hit.track.id)).toEqual([
-      'genshin-fontaine-daydream',
-      'genshin-fontaine-nightfall',
+      'demo-fontaine-daydream',
+      'demo-fontaine-nightfall',
     ])
     for (const hit of hits) expect(hit.rank).toBe(SEARCH_RANK.album)
   })
 
   it('finds a track by the game it belongs to, ranked below a name match', () => {
-    const hits = searchCatalogue(index, 'genshin').tracks
-    const vaguelette = hits.find((hit) => hit.track.id === 'genshin-la-vaguelette')!
+    const hits = searchCatalogue(index, '原神').tracks
+    const vaguelette = hits.find((hit) => hit.track.id === 'demo-genshin-study')!
     expect(vaguelette.rank).toBe(SEARCH_RANK.game)
 
     // A track whose own name matches must outrank one matched only through its game.
     const liyue = searchCatalogue(index, 'liyue').tracks
-    expect(liyue[0].track.id).toBe('genshin-liyue')
+    expect(liyue[0].track.id).toBe('demo-liyue')
     expect(liyue[0].rank).toBe(SEARCH_RANK.exact)
   })
 
   it('ranks an exact name above a prefix, and a prefix above a substring', () => {
-    const ranks = searchCatalogue(index, 'fontaine').tracks.map((hit) => hit.rank)
+    const rankingIndex = buildCatalogueIndex([
+      { ...libraryFixtureTracks()[0], id: 'fixture-prefix', title: 'Fontaine demo' },
+      { ...libraryFixtureTracks()[1], id: 'fixture-contains', title: 'Night over Fontaine' },
+    ])
+    const ranks = searchCatalogue(rankingIndex, 'fontaine').tracks.map((hit) => hit.rank)
     expect(ranks).toEqual([SEARCH_RANK.prefix, SEARCH_RANK.contains])
   })
 })
 
 describe('searchCatalogue — albums and games', () => {
   it('finds an album by title', () => {
-    expect(albumTitles('belleau')).toEqual([FONTAINE_ALBUM])
-    expect(albumTitles('jade moon')).toEqual([LIYUE_ALBUM])
+    expect(albumTitles('fountain')).toEqual([FONTAINE_ALBUM])
+    expect(albumTitles('demo moon')).toEqual([LIYUE_ALBUM])
     expect(albumTitles('inside')).toEqual([INSIDE_ALBUM])
   })
 
@@ -106,38 +110,39 @@ describe('searchCatalogue — normalisation', () => {
   })
 
   it('tolerates punctuation differences', () => {
-    const expected = ['genshin-moon-in-ones-cup']
-    expect(trackIds("Moon in One's Cup")).toEqual(expected)
+    const expected = ['demo-moon-in-ones-cup']
+    expect(trackIds("Demo Moon in One's Cup")).toEqual(expected)
     expect(trackIds('moon in ones cup')).toEqual(expected)
     expect(trackIds('moon-in-ones-cup')).toEqual(expected)
   })
 
   it('strips diacritics', () => {
-    expect(trackIds('vaguelette')).toEqual(['genshin-la-vaguelette'])
+    const cafeIndex = buildCatalogueIndex([{ ...libraryFixtureTracks()[0], title: 'Café Study' }])
+    expect(searchCatalogue(cafeIndex, 'cafe').tracks.map((hit) => hit.track.id)).toEqual(['demo-fontaine-daydream'])
   })
 })
 
 describe('searchCatalogue — multilingual Han search', () => {
   it('finds a Simplified-stored title from a Traditional query', () => {
-    // The catalogue stores 轻涟 under zh-CN; the user is on a zh-Hant interface and types 輕漣.
-    expect(trackIds('輕漣')).toEqual(['genshin-la-vaguelette'])
-    expect(searchCatalogue(index, '輕漣').tracks[0].rank).toBe(SEARCH_RANK.exact)
+    // The catalogue stores 示范练习 under zh-CN; the user is on a zh-Hant interface and types 示範練習.
+    expect(trackIds('示範練習')).toEqual(['demo-genshin-study'])
+    expect(searchCatalogue(index, '示範練習').tracks[0].rank).toBe(SEARCH_RANK.exact)
   })
 
   it('finds a Traditional-stored title from a Simplified query', () => {
-    // The fixture stores 輕漣 under zh-TW as well, so this exercises the reverse direction.
-    expect(trackIds('轻涟')).toEqual(['genshin-la-vaguelette'])
+    // The fixture stores 示範練習 under zh-TW as well, so this exercises the reverse direction.
+    expect(trackIds('示范练习')).toEqual(['demo-genshin-study'])
   })
 
   it('finds a Han-titled album and its tracks from either script', () => {
     expect(albumTitles('极限委托')).toEqual([HAN_ALBUM])
     expect(albumTitles('極限委託')).toEqual([HAN_ALBUM])
-    expect(trackIds('極限委託')).toEqual(['zzz-tiny-giant'])
+    expect(trackIds('極限委託')).toEqual(['demo-zzz-study'])
   })
 
   it('finds a track by its Han alias', () => {
-    expect(trackIds('微小的巨人')).toEqual(['zzz-tiny-giant'])
-    expect(trackIds('使一颗心免于哀伤')).toEqual(['hsr-hope'])
+    expect(trackIds('示范巨人')).toEqual(['demo-zzz-study'])
+    expect(trackIds('示范星轨练习')).toEqual(['demo-hsr-hope'])
   })
 })
 
@@ -178,7 +183,7 @@ describe('searchCatalogue — determinism and purity', () => {
   it('does not mutate the index', () => {
     const before = index.tracks.map((track) => track.id)
     searchCatalogue(index, 'genshin')
-    searchCatalogue(index, '輕漣')
+    searchCatalogue(index, '示範練習')
     expect(index.tracks.map((track) => track.id)).toEqual(before)
   })
 })
@@ -205,7 +210,7 @@ describe('searchCatalogue — cost at full catalogue size', () => {
       workGroupId: 'work-bulk',
       needsClassification: false,
       vocalStatus: 'instrumental',
-      sources: [{ provider: 'jellyfin', externalId: `bulk-${position}` }],
+      sources: [{ provider: 'lx', externalId: `bulk-${position}` }],
       album: `Bulk Album ${position % 40}`,
     }))
 
@@ -213,7 +218,7 @@ describe('searchCatalogue — cost at full catalogue size', () => {
     const bulkIndex = buildCatalogueIndex(bulk)
     const buildMs = performance.now() - buildStarted
 
-    const queries = ['fontaine', 'genshin', '批量曲目', 'bulk', 'a', 'zzz', '輕漣', 'bulk album 7']
+    const queries = ['fontaine', 'genshin', '批量曲目', 'bulk', 'a', 'zzz', '示範練習', 'bulk album 7']
     const searchStarted = performance.now()
     for (let iteration = 0; iteration < 50; iteration += 1) {
       searchCatalogue(bulkIndex, queries[iteration % queries.length])

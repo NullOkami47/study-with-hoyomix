@@ -219,6 +219,7 @@ onBeforeUnmount(() => {
   <section
     ref="root"
     class="focus-bar liquid-shell"
+    data-glass-hero="focus"
     :aria-label="text('workspace.focusBar')"
     @keydown="onKeydown"
     @click="onBarClick"
@@ -395,7 +396,7 @@ onBeforeUnmount(() => {
 .focus-bar__owner-dot { background: var(--colour-accent-strong); box-shadow: 0 0 0 1px var(--liquid-edge-light); }
 .focus-bar__timer { display: flex; flex: 0 1 auto; align-items: center; gap: 0.25rem; min-width: 0; padding-inline: 0.375rem; }
 .focus-bar__timer > output,
-[data-sleep-trigger] { flex: 0 0 auto; min-width: 3.25rem; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+.focus-bar__timer > [data-sleep-trigger] { flex: 0 0 auto; min-width: 3.25rem; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
 .focus-bar__toolbar .focus-bar__phase { display: flex; gap: 0.25rem; align-items: center; justify-content: center; font-size: 0.8125rem; font-weight: 650; line-height: 1.25; }
 .focus-bar__phase svg { flex: 0 0 auto; }
 .focus-bar__toolbar .focus-bar__icon-button { display: grid; flex: 0 0 44px; width: 44px; padding: 0; place-items: center; }

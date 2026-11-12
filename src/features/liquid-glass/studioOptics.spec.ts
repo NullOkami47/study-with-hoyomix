@@ -90,17 +90,17 @@ describe('studio capsule radius', () => {
   })
 })
 
-describe('studio CSS fallback rim', () => {
-  const css = readFileSync(resolve(process.cwd(), 'src/styles/tokens.css'), 'utf8')
-
-  it('suppresses the flat geometric stroke only while the shader owns the surface', () => {
-    expect(css).toContain('[data-studio-glass-rendered="true"]::before')
-    expect(css).toContain('content: none')
+describe('Studio native rim material', () => {
+  const css = readFileSync(resolve(process.cwd(), 'src/styles/glass.css'), 'utf8')
+  it('keeps a directional neutral rim without the old rainbow or GPU substrate', () => {
+    expect(css).toContain('linear-gradient(155deg,')
+    expect(css).toContain('var(--lgm-rim-lead)')
+    expect(css).toContain('var(--lgm-rim-trail)')
+    expect(css).not.toContain('data-studio-glass-rendered')
   })
-
-  it('keeps a restrained cool-to-warm rim for the CSS fallback', () => {
-    expect(css).toContain('rgb(186 220 255 / 22%)')
-    expect(css).toContain('rgb(255 186 170 / 18%)')
-    expect(css).not.toContain('rainbow')
+  it('feathers the optical centre without layering another backdrop filter', () => {
+    expect(css).toContain('[data-studio-glass-ready="true"]::after')
+    expect(css).toContain('mask-composite: intersect')
+    expect(css).toContain('--studio-native-blur: min(')
   })
 })

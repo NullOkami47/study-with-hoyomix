@@ -5,7 +5,7 @@ import { createExactMediaUrlValidator } from '../providers/resolverMediaUrl'
 
 // F3 — bounded GD Studio failure observability.
 //
-// The previous GD incident (see docs/verification/2026-09-16-gd-studio-502-investigation.md)
+// A provider failure
 // could not be localised from the returned HTTP status alone, because materially different
 // adapter branches collapsed onto the same externally visible `unavailable` / HTTP 502.
 //
@@ -14,9 +14,9 @@ import { createExactMediaUrlValidator } from '../providers/resolverMediaUrl'
 // anything about the unreproduced original incident, and do not claim it was root-caused.
 
 const GD_STUDIO_ORIGIN = 'https://music-api.gdstudio.xyz'
-const EXTERNAL_ID = 'netease:2100334024'
-const EXTERNAL_ID_WITH_BR = 'netease:2100334024:320'
-const MEDIA_URL = 'https://m701.music.126.net/audio/2100334024.mp3?token=ephemeral'
+const EXTERNAL_ID = 'netease:9000000001'
+const EXTERNAL_ID_WITH_BR = 'netease:9000000001:320'
+const MEDIA_URL = 'https://m701.music.126.net/audio/9000000001.mp3?token=ephemeral'
 
 const validResponse = (overrides: Record<string, unknown> = {}) => ({
   url: MEDIA_URL,

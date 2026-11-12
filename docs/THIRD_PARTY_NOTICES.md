@@ -87,3 +87,6 @@ source distribution at https://registry.npmjs.org/mediabunny/-/mediabunny-1.61.1
 Recipients may obtain and modify that source under MPL-2.0. No additional
 restriction is imposed on the MPL-covered portions. The application source is
 GPL-3.0; dependency portions retain their applicable original licence notices.
+## Acorn
+
+The global source parser uses the unmodified npm package `acorn` version `8.15.0`, declared as MIT in the lockfile. Its upstream project is `acornjs/acorn`. The complete licence and contributor notice from the integrity-verified 8.15.0 npm package is retained in [acorn-8.15.0.txt](licenses/acorn-8.15.0.txt).

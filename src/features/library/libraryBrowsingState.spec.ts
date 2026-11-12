@@ -21,7 +21,7 @@ function memoryStorage(initial?: string): SafeStorage & { value: () => string | 
   }
 }
 
-const ALBUM = 'genshin:Genshin Impact - Fountain of Belleau (Original Game Soundtrack)'
+const ALBUM = 'genshin:Genshin Impact - Demo Fountain (Original Game Soundtrack)'
 
 describe('library browsing state', () => {
   it('starts on All Tracks with nothing open', () => {

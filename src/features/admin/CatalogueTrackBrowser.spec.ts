@@ -28,8 +28,8 @@ const detailOf = (value: AdminCatalogueTrack): AdminCatalogueTrackDetail => ({
   sources: [
     {
       sourceRowId: `src-${value.id}`,
-      provider: 'jellyfin',
-      externalId: 'a'.repeat(32),
+      provider: 'lx',
+      externalId: 'fixture-admin-source',
       sourceType: 'stream',
       sourceStatus: 'active',
       rightsStatus: 'owner-authorised',
@@ -78,24 +78,24 @@ function setup(tracks: AdminCatalogueTrack[]) {
 describe('CatalogueTrackBrowser', () => {
   it('loads the catalogue once and filters client-side without refetching', async () => {
     const { wrapper, list } = setup([
-      track('genshin-la-vaguelette', { title: 'La vaguelette' }),
-      track('hsr-hope-is-the-thing-with-feathers', { title: 'Hope Is the Thing With Feathers', games: ['hsr'] }),
-      track('zzz-tiny-giant', { title: 'Tiny Giant', games: ['zzz'] }),
+      track('demo-genshin-study', { title: 'Demo Genshin Study' }),
+      track('demo-hsr-study', { title: 'Demo HSR Study', games: ['hsr'] }),
+      track('demo-zzz-study', { title: 'Demo ZZZ Study', games: ['zzz'] }),
     ])
     await flushPromises()
     expect(list).toHaveBeenCalledTimes(1)
     expect(wrapper.findAll('[data-catalogue-track-row]')).toHaveLength(3)
 
     const search = wrapper.get('[data-catalogue-track-search]')
-    await search.setValue('vaguelette')
+    await search.setValue('genshin study')
     await flushPromises()
     expect(wrapper.findAll('[data-catalogue-track-row]')).toHaveLength(1)
     expect(wrapper.get('[data-catalogue-track-row]').attributes('data-catalogue-track-row')).toBe(
-      'genshin-la-vaguelette',
+      'demo-genshin-study',
     )
 
     // Typing is pure client-side: the index is never re-fetched.
-    await search.setValue('hope')
+    await search.setValue('hsr study')
     await flushPromises()
     await search.setValue('')
     await flushPromises()
@@ -131,20 +131,20 @@ describe('CatalogueTrackBrowser', () => {
   })
 
   it('shows the current catalogue state for the selected track', async () => {
-    const { wrapper, get } = setup([track('zzz-tiny-giant', { title: 'Tiny Giant', tabs: ['chill'] })])
+    const { wrapper, get } = setup([track('demo-zzz-study', { title: 'Demo ZZZ Study', tabs: ['chill'] })])
     await flushPromises()
     await wrapper.get('[data-catalogue-track-row]').trigger('click')
     await flushPromises()
-    expect(get).toHaveBeenCalledWith('zzz-tiny-giant')
+    expect(get).toHaveBeenCalledWith('demo-zzz-study')
     const detail = wrapper.get('[data-catalogue-track-detail]')
-    expect(detail.text()).toContain('Tiny Giant')
-    expect(detail.text()).toContain('zzz-tiny-giant')
+    expect(detail.text()).toContain('Demo ZZZ Study')
+    expect(detail.text()).toContain('demo-zzz-study')
     expect(detail.text()).toContain('chill')
-    expect(detail.text()).toContain('jellyfin')
+    expect(detail.text()).toContain('lx')
   })
 
   it('saves only the changed fields against the loaded revision', async () => {
-    const { wrapper, update } = setup([track('zzz-tiny-giant')])
+    const { wrapper, update } = setup([track('demo-zzz-study')])
     await flushPromises()
     await wrapper.get('[data-catalogue-track-row]').trigger('click')
     await flushPromises()
@@ -155,12 +155,12 @@ describe('CatalogueTrackBrowser', () => {
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
-    expect(update).toHaveBeenCalledWith('zzz-tiny-giant', { title: 'Renamed' }, 7)
+    expect(update).toHaveBeenCalledWith('demo-zzz-study', { title: 'Renamed' }, 7)
     expect(wrapper.find('[data-catalogue-track-saved]').exists()).toBe(true)
   })
 
   it('lets a focus track keep a vocal status — the two dimensions are independent', async () => {
-    const { wrapper, update } = setup([track('zzz-tiny-giant')])
+    const { wrapper, update } = setup([track('demo-zzz-study')])
     await flushPromises()
     await wrapper.get('[data-catalogue-track-row]').trigger('click')
     await flushPromises()
@@ -171,12 +171,12 @@ describe('CatalogueTrackBrowser', () => {
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
-    expect(update).toHaveBeenCalledWith('zzz-tiny-giant', { vocal_status: 'vocal' }, 7)
+    expect(update).toHaveBeenCalledWith('demo-zzz-study', { vocal_status: 'vocal' }, 7)
     expect(wrapper.find('[data-catalogue-track-save-error]').exists()).toBe(false)
   })
 
   it('surfaces a rejected save instead of silently failing', async () => {
-    const { wrapper, repo } = setup([track('zzz-tiny-giant')])
+    const { wrapper, repo } = setup([track('demo-zzz-study')])
     vi.spyOn(repo, 'updateCatalogueTrack').mockRejectedValue(new Error('admin_409'))
     await flushPromises()
     await wrapper.get('[data-catalogue-track-row]').trigger('click')

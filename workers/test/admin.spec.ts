@@ -10,8 +10,7 @@ import type { D1PreparedStatement, D1WriteValue } from '../env'
 
 const ORIGIN = 'https://study.example'
 const NOW = 1_787_030_400_000
-// Synthetic Jellyfin user context. Jellyfin 12 requires explicit user context on the item
-// metadata route, so this is part of a complete Jellyfin configuration.
+// Legacy credentials are used only to prove retired Jellyfin cannot be reactivated.
 const JELLYFIN_USER_ID = '8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f'
 
 type TestDatabase = Awaited<ReturnType<Miniflare['getD1Database']>>
@@ -133,7 +132,7 @@ describe('Admin operations', () => {
     expect(JSON.stringify(body)).not.toMatch(/secret|access[_-]?token|refresh[_-]?token|rawIp|temporaryUrl/i)
   })
 
-  it('exposes exactly [chksz, lx, jellyfin] in priority order with default priorities 10, 20, 30', async () => {
+  it('exposes exactly [chksz, lx, jellyfin, gd-studio, vkeys] with default priorities 10, 20, 30, 40, 50', async () => {
     await database.prepare('DELETE FROM provider_health').run()
     const cookie = await authenticatedCookie('admin')
     const adminHandler = createAdminHandler(env, { now: () => NOW })
@@ -142,43 +141,65 @@ describe('Admin operations', () => {
     const overviewRes = await adminHandler.fetch(request('/api/admin/overview', cookie))
     expect(overviewRes.status).toBe(200)
     const overviewBody = await overviewRes.json() as { providers: Array<{ key: string; priority: number; deploymentAvailable: boolean }> }
-    expect(overviewBody.providers.map((p) => p.key)).toEqual(['chksz', 'lx', 'jellyfin'])
-    expect(overviewBody.providers.map((p) => p.priority)).toEqual([10, 20, 30])
+    expect(overviewBody.providers.map((p) => p.key)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
+    expect(overviewBody.providers.map((p) => p.priority)).toEqual([10, 20, 30, 40, 50])
     expect(overviewBody.providers.find((p) => p.key === 'chksz')?.deploymentAvailable).toBe(true)
+    expect(overviewBody.providers.find((p) => p.key === 'lx')?.deploymentAvailable).toBe(true)
+    expect(overviewBody.providers.find((p) => p.key === 'jellyfin')?.deploymentAvailable).toBe(false)
+    expect(overviewBody.providers.find((p) => p.key === 'vkeys')).toMatchObject({
+      adminEnabled: false,
+      deploymentAvailable: false,
+      effectiveEnabled: false,
+      priority: 50,
+    })
+
+    const configRes = await providerHandler.fetch(request('/api/providers/config'))
+    expect(configRes.status).toBe(200)
+    const configBody = await configRes.json() as { providers: Array<{ id: string; priority: number; available: boolean }> }
+    expect(configBody.providers.map((p) => p.id)).toEqual(['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'])
+    expect(configBody.providers.map((p) => p.priority)).toEqual([10, 20, 30, 40, 50])
+    expect(configBody.providers.find((p) => p.id === 'chksz')?.available).toBe(true)
+    expect(configBody.providers.find((p) => p.id === 'lx')?.available).toBe(true)
+    expect(configBody.providers.find((p) => p.id === 'jellyfin')?.available).toBe(false)
+    expect(configBody.providers.find((p) => p.id === 'vkeys')).toMatchObject({
+      available: false,
+      enabled: false,
+      priority: 50,
+    })
+  })
+
+  it('makes Vkeys deployment-available without auth secrets while keeping it admin-disabled by default', async () => {
+    await database.prepare('DELETE FROM provider_health').run()
+    const cookie = await authenticatedCookie('admin')
+    const vkeysEnv = { DB: database, PUBLIC_ORIGIN: ORIGIN, VKEYS_ENABLED: 'true' }
+    const adminHandler = createAdminHandler({ ...env, ...vkeysEnv }, { now: () => NOW })
+    const providerHandler = createProviderHandler({ ...env, ...vkeysEnv }, { now: () => NOW })
+
+    const overviewRes = await adminHandler.fetch(request('/api/admin/overview', cookie))
+    expect(overviewRes.status).toBe(200)
+    const overviewBody = await overviewRes.json() as { providers: Array<{ key: string; deploymentAvailable: boolean }> }
+    expect(overviewBody.providers.find((p) => p.key === 'vkeys')).toMatchObject({
+      adminEnabled: false,
+      deploymentAvailable: true,
+      effectiveEnabled: false,
+      priority: 50,
+    })
     expect(overviewBody.providers.find((p) => p.key === 'lx')?.deploymentAvailable).toBe(true)
     expect(overviewBody.providers.find((p) => p.key === 'jellyfin')?.deploymentAvailable).toBe(false)
 
     const configRes = await providerHandler.fetch(request('/api/providers/config'))
     expect(configRes.status).toBe(200)
-    const configBody = await configRes.json() as { providers: Array<{ id: string; priority: number; available: boolean }> }
-    expect(configBody.providers.map((p) => p.id)).toEqual(['chksz', 'lx', 'jellyfin'])
-    expect(configBody.providers.map((p) => p.priority)).toEqual([10, 20, 30])
-    expect(configBody.providers.find((p) => p.id === 'chksz')?.available).toBe(true)
+    const configBody = await configRes.json() as { providers: Array<{ id: string; available: boolean }> }
+    expect(configBody.providers.find((p) => p.id === 'vkeys')).toMatchObject({
+      available: true,
+      enabled: false,
+      priority: 50,
+    })
     expect(configBody.providers.find((p) => p.id === 'lx')?.available).toBe(true)
     expect(configBody.providers.find((p) => p.id === 'jellyfin')?.available).toBe(false)
-  })
-
-  it('reflects deployment configuration for Jellyfin availability while LX remains client-available', async () => {
-    await database.prepare('DELETE FROM provider_health').run()
-    const cookie = await authenticatedCookie('admin')
-    const jellyfinEnv = {
-      ...env,
-      JELLYFIN_BASE_URL: 'https://jellyfin.example',
-      JELLYFIN_API_TOKEN: 'valid-token',
-      JELLYFIN_USER_ID,
-    }
-    const adminHandler = createAdminHandler(jellyfinEnv, { now: () => NOW })
-    const providerHandler = createProviderHandler(jellyfinEnv, { now: () => NOW })
-
-    const overviewRes = await adminHandler.fetch(request('/api/admin/overview', cookie))
-    const overviewBody = await overviewRes.json() as { providers: Array<{ key: string; deploymentAvailable: boolean }> }
-    expect(overviewBody.providers.find((p) => p.key === 'jellyfin')?.deploymentAvailable).toBe(true)
-    expect(overviewBody.providers.find((p) => p.key === 'lx')?.deploymentAvailable).toBe(true)
-
-    const configRes = await providerHandler.fetch(request('/api/providers/config'))
-    const configBody = await configRes.json() as { providers: Array<{ id: string; available: boolean }> }
-    expect(configBody.providers.find((p) => p.id === 'jellyfin')?.available).toBe(true)
-    expect(configBody.providers.find((p) => p.id === 'lx')?.available).toBe(true)
+    expect(JSON.stringify({ overviewBody, configBody })).not.toMatch(/secret|token|jellyfin\.example/i)
+    expect(await readProviderState('vkeys')).toBeNull()
+    expect(await readAuditRows()).toHaveLength(0)
   })
 
   describe('PUT /api/admin/providers/order', () => {
@@ -195,27 +216,29 @@ describe('Admin operations', () => {
       },
     )
 
-    it('updates priorities to 10, 20, 30 and records audit event provider.order.update for valid order', async () => {
+    it('updates priorities to 10, 20, 30, 40, 50 and records audit event provider.order.update for valid order', async () => {
       await database.prepare('DELETE FROM provider_health').run()
       const cookie = await authenticatedCookie('owner')
       const handler = createAdminHandler(env, { now: () => NOW })
 
-      const res = await handler.fetch(orderRequest({ providerIds: ['jellyfin', 'chksz', 'lx'] }, cookie))
+      const res = await handler.fetch(orderRequest({ providerIds: ['vkeys', 'chksz', 'lx', 'jellyfin', 'gd-studio'] }, cookie))
       expect(res.status).toBe(200)
       const body = await res.json() as { providers: Array<{ key: string; priority: number }> }
-      expect(body.providers.map((p) => p.key)).toEqual(['jellyfin', 'chksz', 'lx'])
-      expect(body.providers.map((p) => p.priority)).toEqual([10, 20, 30])
+      expect(body.providers.map((p) => p.key)).toEqual(['vkeys', 'chksz', 'lx', 'jellyfin', 'gd-studio'])
+      expect(body.providers.map((p) => p.priority)).toEqual([10, 20, 30, 40, 50])
 
       const rows = await database.prepare(`
         SELECT provider_key AS providerKey, priority
         FROM provider_health
-        WHERE provider_key IN ('chksz', 'lx', 'jellyfin')
+        WHERE provider_key IN ('chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys')
         ORDER BY priority ASC
       `).all<{ providerKey: string; priority: number }>()
       expect(rows.results).toEqual([
-        { providerKey: 'jellyfin', priority: 10 },
+        { providerKey: 'vkeys', priority: 10 },
         { providerKey: 'chksz', priority: 20 },
         { providerKey: 'lx', priority: 30 },
+        { providerKey: 'jellyfin', priority: 40 },
+        { providerKey: 'gd-studio', priority: 50 },
       ])
 
       const audits = await database.prepare(`
@@ -227,19 +250,19 @@ describe('Admin operations', () => {
       expect(audits.results[0]).toEqual({
         action: 'provider.order.update',
         targetKey: 'providers',
-        detailJson: JSON.stringify({ providerIds: ['jellyfin', 'chksz', 'lx'] }),
+        detailJson: JSON.stringify({ providerIds: ['vkeys', 'chksz', 'lx', 'jellyfin', 'gd-studio'] }),
       })
 
       const overviewRes = await handler.fetch(request('/api/admin/overview', cookie))
       const overviewBody = await overviewRes.json() as { providers: Array<{ key: string; priority: number }> }
-      expect(overviewBody.providers.map((p) => p.key)).toEqual(['jellyfin', 'chksz', 'lx'])
-      expect(overviewBody.providers.map((p) => p.priority)).toEqual([10, 20, 30])
+      expect(overviewBody.providers.map((p) => p.key)).toEqual(['vkeys', 'chksz', 'lx', 'jellyfin', 'gd-studio'])
+      expect(overviewBody.providers.map((p) => p.priority)).toEqual([10, 20, 30, 40, 50])
 
       const providerHandler = createProviderHandler(env, { now: () => NOW })
       const configRes = await providerHandler.fetch(request('/api/providers/config'))
       const configBody = await configRes.json() as { providers: Array<{ id: string; priority: number }> }
-      expect(configBody.providers.map((p) => p.id)).toEqual(['jellyfin', 'chksz', 'lx'])
-      expect(configBody.providers.map((p) => p.priority)).toEqual([10, 20, 30])
+      expect(configBody.providers.map((p) => p.id)).toEqual(['vkeys', 'chksz', 'lx', 'jellyfin', 'gd-studio'])
+      expect(configBody.providers.map((p) => p.priority)).toEqual([10, 20, 30, 40, 50])
     })
 
     it('rejects invalid orders with HTTP 400', async () => {
@@ -254,22 +277,27 @@ describe('Admin operations', () => {
         { providerIds: 'chksz,lx,jellyfin' },
         { providerIds: 123 },
         { providerIds: [] },
-        { providerIds: ['chksz', 'lx', 'jellyfin', 'chksz'] },
+        { providerIds: ['chksz', 'lx', 'jellyfin', 'gd-studio'] },
+        { providerIds: ['chksz', 'lx', 'jellyfin', 'gd-studio', 'chksz'] },
+        { providerIds: ['chksz', 'lx', 'jellyfin', 'gd-studio', 'meting'] },
+        { providerIds: ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys', 'meting'] },
         {},
-        { other: ['chksz', 'lx', 'jellyfin'] },
+        { other: ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'] },
       ]
 
       for (const body of invalidBodies) {
         const res = await handler.fetch(orderRequest(body, cookie))
         expect(res.status, `Expected 400 for ${JSON.stringify(body)}`).toBe(400)
+        expect(await res.json()).toEqual({ error: 'invalid_provider_order' })
       }
+      expect(await readAuditRows()).toHaveLength(0)
     })
 
     it('rejects non-admin roles and invalid mutation origins', async () => {
       const user = await authenticatedCookie('user')
       const admin = await authenticatedCookie('admin')
       const handler = createAdminHandler(env, { now: () => NOW })
-      const validPayload = { providerIds: ['chksz', 'lx', 'jellyfin'] }
+      const validPayload = { providerIds: ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys'] }
 
       expect((await handler.fetch(orderRequest(validPayload, user))).status).toBe(403)
       expect((await handler.fetch(request('/api/admin/providers/order', undefined, {
@@ -411,36 +439,37 @@ describe('Admin operations', () => {
     expect(row?.detailJson).not.toMatch(/secret|token|ip|url/i)
   })
 
-  it('handles an operator-configured Jellyfin provider without exposing its origin or token', async () => {
+  it('enables and reprioritises deployment-available Vkeys without exposing auth secrets', async () => {
     const cookie = await authenticatedCookie('owner')
-    const response = await createAdminHandler({
-      ...env,
-      JELLYFIN_BASE_URL: 'https://jellyfin.example',
-      JELLYFIN_API_TOKEN: 'JELLYFIN_SECRET_TOKEN',
-      JELLYFIN_USER_ID,
-    }, { now: () => NOW }).fetch(request('/api/admin/providers/jellyfin', cookie, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json', origin: ORIGIN },
-      body: JSON.stringify({ enabled: true, priority: 7 }),
-    }))
+    const response = await createAdminHandler(vkeysAvailableEnv(), { now: () => NOW })
+      .fetch(providerPatch('vkeys', { enabled: true, priority: 7 }, cookie))
     const body = await response.json()
 
     expect(response.status).toBe(200)
     expect(body).toMatchObject({
       provider: {
-        key: 'jellyfin',
+        key: 'vkeys',
         adminEnabled: true,
         deploymentAvailable: true,
         effectiveEnabled: true,
         priority: 7,
       },
     })
-    expect(JSON.stringify(body)).not.toContain('JELLYFIN_SECRET_TOKEN')
+    expect(await database.prepare(
+      'SELECT enabled, priority FROM provider_health WHERE provider_key = ?',
+    ).bind('vkeys').first()).toEqual({ enabled: 1, priority: 7 })
+    const audits = await readAuditRows()
+    expect(audits).toEqual([{
+      action: 'provider.update',
+      targetKey: 'provider:vkeys',
+      detailJson: JSON.stringify({ enabled: true, priority: 7 }),
+    }])
+    expect(JSON.stringify({ body, audits })).not.toMatch(/secret|token|url/i)
   })
 
   const seedProviders = async (enabledKeys: string[] = []) => {
-    const keys = ['chksz', 'lx', 'jellyfin']
-    await database.batch(keys.map((key) => database.prepare(`
+    const keys = ['chksz', 'lx', 'jellyfin', 'gd-studio', 'vkeys']
+    await database.batch(keys.map((key, index) => database.prepare(`
       INSERT INTO provider_health (provider_key, enabled, priority, status, updated_at)
       VALUES (?, ?, ?, 'unknown', ?)
       ON CONFLICT(provider_key) DO UPDATE SET
@@ -448,14 +477,16 @@ describe('Admin operations', () => {
         priority = excluded.priority,
         status = excluded.status,
         updated_at = excluded.updated_at
-    `).bind(key, enabledKeys.includes(key) ? 1 : 0, key === 'chksz' ? 10 : key === 'lx' ? 20 : 30, NOW)))
+    `).bind(key, enabledKeys.includes(key) ? 1 : 0, (index + 1) * 10, NOW)))
   }
 
-  const jellyfinAvailableEnv = () => ({
+  const vkeysAvailableEnv = () => ({ ...env, VKEYS_ENABLED: 'true' })
+
+  const retiredJellyfinEnv = () => ({
     ...env,
     JELLYFIN_BASE_URL: 'https://jellyfin.example',
-    JELLYFIN_API_TOKEN: 'valid-token',
-    JELLYFIN_USER_ID: JELLYFIN_USER_ID,
+    JELLYFIN_API_TOKEN: 'JELLYFIN_SECRET_TOKEN',
+    JELLYFIN_USER_ID,
   })
 
   const providerPatch = (key: string, body: unknown, cookie = 'owner-cookie') => request(
@@ -529,26 +560,27 @@ describe('Admin operations', () => {
   })
 
   it.each([
-    { label: 'ChKSz', key: 'chksz', enabledKeys: ['chksz', 'lx'], otherKey: 'lx', otherPriority: 20, jellyfinAvailable: false },
-    { label: 'LX', key: 'lx', enabledKeys: ['chksz', 'lx'], otherKey: 'chksz', otherPriority: 10, jellyfinAvailable: false },
-    { label: 'Jellyfin', key: 'jellyfin', enabledKeys: ['jellyfin', 'lx'], otherKey: 'lx', otherPriority: 20, jellyfinAvailable: true },
+    { label: 'ChKSz', key: 'chksz', priority: 10, enabledKeys: ['chksz', 'lx'], otherKey: 'lx', otherPriority: 20, vkeysAvailable: false },
+    { label: 'LX', key: 'lx', priority: 20, enabledKeys: ['chksz', 'lx'], otherKey: 'chksz', otherPriority: 10, vkeysAvailable: false },
+    { label: 'Vkeys', key: 'vkeys', priority: 50, enabledKeys: ['vkeys', 'lx'], otherKey: 'lx', otherPriority: 20, vkeysAvailable: true },
   ] as const)('propagates a successful $label disable through persisted and public provider state', async ({
     key,
+    priority,
     enabledKeys,
     otherKey,
     otherPriority,
-    jellyfinAvailable,
+    vkeysAvailable,
   }) => {
     const owner = await authenticatedCookie('owner')
     await seedProviders([...enabledKeys])
-    const routeEnv = jellyfinAvailable ? jellyfinAvailableEnv() : env
+    const routeEnv = vkeysAvailable ? vkeysAvailableEnv() : env
     const response = await createAdminHandler(routeEnv, { now: () => NOW })
       .fetch(providerPatch(key, { enabled: false }, owner))
 
     expect(response.status).toBe(200)
     expect(await database.prepare(
       'SELECT enabled, priority FROM provider_health WHERE provider_key = ?',
-    ).bind(key).first()).toEqual({ enabled: 0, priority: key === 'chksz' ? 10 : key === 'lx' ? 20 : 30 })
+    ).bind(key).first()).toEqual({ enabled: 0, priority })
     expect(await database.prepare(
       'SELECT enabled, priority FROM provider_health WHERE provider_key = ?',
     ).bind(otherKey).first()).toEqual({ enabled: 1, priority: otherPriority })
@@ -564,7 +596,7 @@ describe('Admin operations', () => {
       id: key,
       available: true,
       enabled: false,
-      priority: key === 'chksz' ? 10 : key === 'lx' ? 20 : 30,
+      priority,
     })
     expect(config.providers.find((provider) => provider.id === otherKey)).toMatchObject({
       id: otherKey,
@@ -640,27 +672,55 @@ describe('Admin operations', () => {
     expect(await readAuditRows()).toHaveLength(0)
   })
 
-  it('counts an effective configured Jellyfin row as last-provider protection', async () => {
+  it('counts enabled, deployment-available Vkeys and protects it as the last effective provider', async () => {
     const owner = await authenticatedCookie('owner')
-    await seedProviders(['chksz', 'jellyfin'])
-    const response = await createAdminHandler(jellyfinAvailableEnv(), { now: () => NOW })
-      .fetch(providerPatch('chksz', { enabled: false }, owner))
+    await seedProviders(['chksz', 'vkeys'])
+    const handler = createAdminHandler(vkeysAvailableEnv(), { now: () => NOW })
+    const response = await handler.fetch(providerPatch('chksz', { enabled: false }, owner))
 
     expect(response.status).toBe(200)
     expect(await readProviderState('chksz')).toEqual({ enabled: 0 })
-    expect(await readProviderState('jellyfin')).toEqual({ enabled: 1 })
+    expect(await readProviderState('vkeys')).toEqual({ enabled: 1 })
+    const audits = await readAuditRows()
+    expect(audits).toEqual([{
+      action: 'provider.update',
+      targetKey: 'provider:chksz',
+      detailJson: JSON.stringify({ enabled: false, priority: 10 }),
+    }])
+
+    const lastProviderResponse = await handler.fetch(providerPatch('vkeys', { enabled: false }, owner))
+    expect(lastProviderResponse.status).toBe(400)
+    expect(await lastProviderResponse.json()).toEqual({ error: 'global_playback_shutdown_confirmation_required' })
+    expect(await readProviderState('vkeys')).toEqual({ enabled: 1 })
+    expect(await readAuditRows()).toEqual(audits)
   })
 
-  it('does not count an invalid configured Jellyfin row as last-provider protection', async () => {
+  it.each([
+    { label: 'deployment-disabled', enabledKeys: ['chksz', 'vkeys'], vkeysEnabled: 'false', adminEnabled: 1 },
+    { label: 'admin-disabled', enabledKeys: ['chksz'], vkeysEnabled: 'true', adminEnabled: 0 },
+  ])('does not count $label Vkeys as last-provider protection', async ({ enabledKeys, vkeysEnabled, adminEnabled }) => {
     const owner = await authenticatedCookie('owner')
-    await seedProviders(['chksz', 'jellyfin'])
-    const response = await createAdminHandler({
-      ...env,
-      JELLYFIN_BASE_URL: 'https://jellyfin.internal',
-    }, { now: () => NOW }).fetch(providerPatch('chksz', { enabled: false }, owner))
+    await seedProviders(enabledKeys)
+    const response = await createAdminHandler({ ...env, VKEYS_ENABLED: vkeysEnabled }, { now: () => NOW })
+      .fetch(providerPatch('chksz', { enabled: false }, owner))
 
     expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: 'global_playback_shutdown_confirmation_required' })
     expect(await readProviderState('chksz')).toEqual({ enabled: 1 })
+    expect(await readProviderState('vkeys')).toEqual({ enabled: adminEnabled })
+    expect(await readAuditRows()).toHaveLength(0)
+  })
+
+  it('does not count retired Jellyfin with complete legacy credentials as last-provider protection', async () => {
+    const owner = await authenticatedCookie('owner')
+    await seedProviders(['chksz', 'jellyfin'])
+    const response = await createAdminHandler(retiredJellyfinEnv(), { now: () => NOW })
+      .fetch(providerPatch('chksz', { enabled: false }, owner))
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: 'global_playback_shutdown_confirmation_required' })
+    expect(await readProviderState('chksz')).toEqual({ enabled: 1 })
+    expect(await readProviderState('jellyfin')).toEqual({ enabled: 1 })
     expect(await readAuditRows()).toHaveLength(0)
   })
 
@@ -679,49 +739,102 @@ describe('Admin operations', () => {
     expect((await readAuditRows())[0]).toMatchObject({ action: 'provider.disable_all' })
   })
 
-  it('rejects enabling an unavailable provider without changing state or audit', async () => {
+  it('rejects enabling Vkeys without the exact deployment opt-in without changing state or audit', async () => {
     const owner = await authenticatedCookie('owner')
     await seedProviders([])
-    const response = await createAdminHandler(env, { now: () => NOW })
-      .fetch(providerPatch('jellyfin', { enabled: true }, owner))
+    for (const flag of [undefined, 'false', 'TRUE', '1']) {
+      const response = await createAdminHandler({ ...env, VKEYS_ENABLED: flag }, { now: () => NOW })
+        .fetch(providerPatch('vkeys', { enabled: true }, owner))
 
-    expect(response.status).toBe(409)
-    expect(await response.json()).toEqual({ error: 'provider_unavailable' })
-    expect(await readProviderState('jellyfin')).toEqual({ enabled: 0 })
-    expect(await readAuditRows()).toHaveLength(0)
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({ error: 'provider_unavailable' })
+      expect(await readProviderState('vkeys')).toEqual({ enabled: 0 })
+      expect(await readAuditRows()).toHaveLength(0)
+    }
   })
 
-  it('enables Jellyfin once its complete operator configuration validates', async () => {
+  it('enables deployment-available Vkeys only after an explicit admin mutation and publishes the persisted state', async () => {
     const owner = await authenticatedCookie('owner')
-    const handler = createAdminHandler(jellyfinAvailableEnv(), { now: () => NOW })
+    await seedProviders([])
+    const routeEnv = vkeysAvailableEnv()
+    const handler = createAdminHandler(routeEnv, { now: () => NOW })
+    const overviewResponse = await handler.fetch(request('/api/admin/overview', owner))
+    expect(overviewResponse.status).toBe(200)
+    const overview = await overviewResponse.json() as { providers: Array<{ key: string }> }
+    expect(overview.providers.find(({ key }) => key === 'vkeys')).toMatchObject({
+      adminEnabled: false,
+      deploymentAvailable: true,
+      effectiveEnabled: false,
+      priority: 50,
+    })
+    expect(await readProviderState('vkeys')).toEqual({ enabled: 0 })
+    expect(await readAuditRows()).toHaveLength(0)
 
-    const response = await handler.fetch(providerPatch('jellyfin', { enabled: true }, owner))
+    const response = await handler.fetch(providerPatch('vkeys', { enabled: true }, owner))
 
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({
       provider: {
-        key: 'jellyfin',
+        key: 'vkeys',
         adminEnabled: true,
         deploymentAvailable: true,
         effectiveEnabled: true,
+        priority: 50,
       },
     })
-    expect(JSON.stringify(await readAuditRows())).not.toMatch(/valid-token/)
+    expect(await readProviderState('vkeys')).toEqual({ enabled: 1 })
+    const configResponse = await createProviderHandler(routeEnv, { now: () => NOW })
+      .fetch(request('/api/providers/config'))
+    expect(configResponse.status).toBe(200)
+    const config = await configResponse.json() as { providers: Array<{ id: string }> }
+    expect(config.providers.find(({ id }) => id === 'vkeys')).toMatchObject({
+      available: true,
+      enabled: true,
+      priority: 50,
+    })
+    const audits = await readAuditRows()
+    expect(audits).toEqual([{
+      action: 'provider.update',
+      targetKey: 'provider:vkeys',
+      detailJson: JSON.stringify({ enabled: true, priority: 50 }),
+    }])
+    expect(JSON.stringify({ overview, config, audits })).not.toMatch(/secret|token|url/i)
   })
 
-  it('refuses to enable Jellyfin when only part of its configuration is present', async () => {
+  it('refuses to reactivate retired Jellyfin with missing, partial, or complete legacy credentials', async () => {
     const owner = await authenticatedCookie('owner')
-    for (const partialEnv of [
+    await seedProviders([])
+    for (const legacyEnv of [
+      env,
       { ...env, JELLYFIN_BASE_URL: 'https://jellyfin.example' },
-      { ...env, JELLYFIN_API_TOKEN: 'token' },
-      // Jellyfin 12 cannot resolve a metadata lookup without user context, so a deployment
-      // holding only the base URL and token is still incomplete.
-      { ...env, JELLYFIN_BASE_URL: 'https://jellyfin.example', JELLYFIN_API_TOKEN: 'token' },
+      { ...env, JELLYFIN_API_TOKEN: 'JELLYFIN_SECRET_TOKEN' },
+      { ...env, JELLYFIN_BASE_URL: 'https://jellyfin.example', JELLYFIN_API_TOKEN: 'JELLYFIN_SECRET_TOKEN' },
+      retiredJellyfinEnv(),
     ]) {
-      const handler = createAdminHandler(partialEnv, { now: () => NOW })
+      const handler = createAdminHandler(legacyEnv, { now: () => NOW })
       const response = await handler.fetch(providerPatch('jellyfin', { enabled: true }, owner))
       expect(response.status).toBe(409)
       expect(await response.json()).toEqual({ error: 'provider_unavailable' })
+      expect(await readProviderState('jellyfin')).toEqual({ enabled: 0 })
+      expect(await readAuditRows()).toHaveLength(0)
+
+      const overviewResponse = await handler.fetch(request('/api/admin/overview', owner))
+      expect(overviewResponse.status).toBe(200)
+      const overview = await overviewResponse.json() as { providers: Array<{ key: string }> }
+      expect(overview.providers.find(({ key }) => key === 'jellyfin')).toMatchObject({
+        adminEnabled: false,
+        deploymentAvailable: false,
+        effectiveEnabled: false,
+      })
+      const configResponse = await createProviderHandler(legacyEnv, { now: () => NOW })
+        .fetch(request('/api/providers/config'))
+      expect(configResponse.status).toBe(200)
+      const config = await configResponse.json() as { providers: Array<{ id: string }> }
+      expect(config.providers.find(({ id }) => id === 'jellyfin')).toMatchObject({
+        available: false,
+        enabled: false,
+      })
+      expect(JSON.stringify({ overview, config })).not.toMatch(/secret|token|jellyfin\.example/i)
     }
   })
 

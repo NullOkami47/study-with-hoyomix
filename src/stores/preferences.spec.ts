@@ -1,12 +1,22 @@
 
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { timeBudget } from '../../scripts/ci-runner-budget.mjs'
 import { PREFERENCES_STORAGE_KEY } from './preferences'
 
+// One controller per test. afterEach aborts it, so a loop abandoned by a timeout
+// stops at its next iteration instead of writing localStorage into the next test.
+let currentTest = new AbortController()
+
 beforeEach(() => {
+  currentTest = new AbortController()
   vi.restoreAllMocks()
   vi.resetModules()
   window.localStorage.clear()
+})
+
+afterEach(() => {
+  currentTest.abort()
 })
 
 describe('preferences', () => {
@@ -95,7 +105,14 @@ describe('preferences', () => {
     expect(usePreferences().studioEdge.value).toBe(40)
   })
 
+  // Both bounds tests re-import the module graph seven times (resetModules discards Vue
+  // as well), so their cost scales with machine load rather than with the assertions. On a
+  // shared runner under the full suite the 5s default expired mid-loop; the abandoned loop
+  // then kept writing localStorage into the next test and made it read a default. The loops
+  // now stop once afterEach aborts the test, and the raised budget applies only on the
+  // self-hosted runner (CI_RUNNER_PROFILE, P95-06), so a genuine hang elsewhere fails fast.
   it('gives the glass gray tint a tasteful default and rejects out-of-range stored values', async () => {
+    const { signal } = currentTest
     const fresh = await import('./preferences')
     // A first visit, and an install that predates the preference, both land on the
     // shared default rather than on a colourless glass.
@@ -104,6 +121,7 @@ describe('preferences', () => {
     expect(fresh.DEFAULT_STUDIO_GLASS_GRAY).toBeLessThanOrEqual(30)
 
     for (const rejected of [140, -5, 26.5, '26', null, {}]) {
+      if (signal.aborted) return
       vi.resetModules()
       window.localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify({ studioGlassGray: rejected }))
       const { usePreferences, DEFAULT_STUDIO_GLASS_GRAY } = await import('./preferences')
@@ -112,20 +130,23 @@ describe('preferences', () => {
 
     // The documented bounds themselves must survive a round trip.
     for (const accepted of [0, 100]) {
+      if (signal.aborted) return
       vi.resetModules()
       window.localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify({ studioGlassGray: accepted }))
       const { usePreferences } = await import('./preferences')
       expect(usePreferences().studioGlassGray.value).toBe(accepted)
     }
-  })
+  }, timeBudget('preferencesModuleReload'))
 
   it('gives edge dispersion a visible default and rejects out-of-range stored values', async () => {
+    const { signal } = currentTest
     const fresh = await import('./preferences')
     expect(fresh.usePreferences().studioEdge.value).toBe(fresh.DEFAULT_STUDIO_EDGE)
     expect(fresh.DEFAULT_STUDIO_EDGE).toBeGreaterThanOrEqual(64)
     expect(fresh.DEFAULT_STUDIO_EDGE).toBeLessThanOrEqual(72)
 
     for (const rejected of [140, -5, 68.5, '68', null, {}]) {
+      if (signal.aborted) return
       vi.resetModules()
       window.localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify({ studioEdge: rejected }))
       const { usePreferences, DEFAULT_STUDIO_EDGE } = await import('./preferences')
@@ -133,12 +154,13 @@ describe('preferences', () => {
     }
 
     for (const accepted of [0, 100]) {
+      if (signal.aborted) return
       vi.resetModules()
       window.localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify({ studioEdge: accepted }))
       const { usePreferences } = await import('./preferences')
       expect(usePreferences().studioEdge.value).toBe(accepted)
     }
-  })
+  }, timeBudget('preferencesModuleReload'))
 
   it('keeps a chosen glass gray tint across a fresh module load', async () => {
     const first = await import('./preferences')

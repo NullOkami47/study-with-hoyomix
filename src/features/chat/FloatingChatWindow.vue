@@ -2,15 +2,19 @@
 /**
  * A floating window: it owns where it is, how big it is, and the gestures that change
  * either. It owns nothing about chat. Messages, presence, transport and moderation
- * belong to whatever is slotted into its body, so the community-chat work that lands
- * later replaces the slot content without touching a line of the drag or resize code.
+ * belong to whatever is slotted into its body.
  *
  * Gestures are Pointer Events throughout. One implementation then covers mouse, pen and
  * touch, and `setPointerCapture` keeps a drag attached to the window even when the
  * pointer outruns it -- which it will, because clamping deliberately stops the window
  * before the cursor stops.
+ *
+ * Phones get the same movable, resizable window as desktop, opening at 300x380 as in
+ * StudyWithMiku (https://github.com/shshouse/StudyWithMiku, GPL-3.0). They remember their
+ * own layout, and follow the visual viewport so the on-screen keyboard cannot hide the
+ * composer.
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { GripHorizontal, X } from 'lucide-vue-next'
 
 import { translate, type TranslationKey } from '../../i18n'
@@ -18,15 +22,16 @@ import { usePreferences } from '../../stores/preferences'
 import { safeLocalStorage } from '../../utils/safeStorage'
 import {
   CHAT_LAYOUT_STORAGE_KEY,
-  CHAT_SAFE_MARGIN,
+  CHAT_NARROW_LAYOUT_STORAGE_KEY,
   DEFAULT_CHAT_HEIGHT,
   DEFAULT_CHAT_WIDTH,
+  DEFAULT_NARROW_CHAT_HEIGHT,
+  DEFAULT_NARROW_CHAT_WIDTH,
   clampChatLayout,
   defaultChatLayout,
+  defaultNarrowChatLayout,
   parseChatLayout,
   reconcileChatLayout,
-  resolveChatSheetLayout,
-  resolveChatLayout,
   serialiseChatLayout,
   type ChatLayout,
   type Rect,
@@ -36,7 +41,7 @@ import {
 const props = withDefaults(defineProps<{
   /** Blocks interaction while a modal owns the screen above the window. */
   inert?: boolean
-    /**
+  /**
    * The first region is the whole Player card. Further regions are hard protected controls
    * and transient surfaces, so the window may yield artwork but never a control.
    */
@@ -47,119 +52,76 @@ const props = withDefaults(defineProps<{
    * the header cannot be grabbed and the close button cannot be pressed.
    */
   obstructedTop?: () => number
-  /** Allow the narrow sheet's body to shrink while retaining its measured header. */
-  constrainToAvailableSpace?: boolean
-}>(), { inert: false, reserved: undefined, obstructedTop: undefined, constrainToAvailableSpace: false })
+}>(), { inert: false, reserved: undefined, obstructedTop: undefined })
 const emit = defineEmits<{ (event: 'close'): void }>()
 
 const { locale } = usePreferences()
 const text = (key: TranslationKey): string => translate(locale.value, key)
 const titleId = 'floating-chat-title'
 const root = ref<HTMLElement>()
-/**
- * Matches the 47.99rem breakpoint the workspace uses for "narrow". Below it the window
- * is a sheet rather than a movable object: a drag on a small touch screen competes with
- * the browser's own scroll and pull-to-refresh gestures, and loses often enough that
- * offering it would be worse than not having it. Resize is withheld for the same
- * reason. Everything else -- read, close, reopen -- is unchanged, so nothing is behind
- * a gesture the user cannot perform.
- */
+/** Matches the 47.99rem breakpoint the workspace uses for "narrow". */
 const NARROW_VIEWPORT = 767
 
-// Resolved during setup rather than on mount, so the first painted frame is already the
-// remembered layout. Deferring it to onMounted would show the window at a placeholder
-// position for one frame and then move it, which reads as a glitch on every load.
-function initialLayout(): ChatLayout {
-  if (typeof window === 'undefined') {
-    return { x: 0, y: 0, width: DEFAULT_CHAT_WIDTH, height: DEFAULT_CHAT_HEIGHT }
-  }
-  const raw = safeLocalStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)
-  /**
-   * Opening on a phone must not cost the layout chosen on a monitor. CSS places the sheet,
-   * so this value is not what the user sees while narrow -- it is only what the window
-   * returns to, and clamping it here against a 375px viewport would discard exactly that.
-   * It is reconciled on the way back to a wide viewport, by applyViewport, where the
-   * viewport it is being fitted to is the one it will actually be shown in.
-   */
-  if (window.innerWidth <= NARROW_VIEWPORT) {
-    const stored = parseChatLayout(raw)
-    if (stored) return stored
-  }
-  return resolveChatLayout(raw, viewport(), props.reserved?.())
-}
+const isNarrow = (): boolean => typeof window !== 'undefined' && window.innerWidth <= NARROW_VIEWPORT
+const narrow = ref(isNarrow())
+const storageKey = (): string => narrow.value ? CHAT_NARROW_LAYOUT_STORAGE_KEY : CHAT_LAYOUT_STORAGE_KEY
+
+/** The visual viewport's offset inside the layout viewport, which moves when a keyboard opens. */
+const viewportLeft = ref(0)
+const viewportTop = ref(0)
 
 function viewport(): Viewport {
+  // On a phone the keyboard shrinks the visual viewport, not the layout viewport; fitting the
+  // window to the visual one keeps its header and composer above the keyboard.
+  const visual = narrow.value ? window.visualViewport : undefined
   return {
-    width: window.innerWidth,
-    height: window.innerHeight,
+    width: visual?.width ?? window.innerWidth,
+    height: visual?.height ?? window.innerHeight,
     top: props.obstructedTop?.(),
   }
 }
 
+function storedLayout(): ChatLayout | undefined {
+  return parseChatLayout(safeLocalStorage.getItem(storageKey()))
+}
+
+function derivedLayout(): ChatLayout {
+  const stored = storedLayout()
+  if (stored) return reconcileChatLayout(stored, viewport(), props.reserved?.(), true)
+  return narrow.value
+    ? defaultNarrowChatLayout(viewport(), props.reserved?.())
+    : defaultChatLayout(viewport(), props.reserved?.())
+}
+
+// Resolved during setup rather than on mount, so the first painted frame is already the
+// remembered layout instead of a placeholder that then jumps.
+function initialLayout(): ChatLayout {
+  if (typeof window === 'undefined') {
+    return { x: 0, y: 0, width: DEFAULT_CHAT_WIDTH, height: DEFAULT_CHAT_HEIGHT }
+  }
+  return derivedLayout()
+}
+
 const layout = ref<ChatLayout>(initialLayout())
-/**
- * Whether the layout came from the user or storage. Preserve it whenever safe; a viewport
- * or Player change may cause only the smallest move needed to protect interaction controls.
- */const userPlaced = ref(
-  typeof window === 'undefined'
-    ? false
-    : safeLocalStorage.getItem(CHAT_LAYOUT_STORAGE_KEY) !== null,
-)
+/** Whether this mode's layout came from the user or storage, rather than being derived. */
+const userPlaced = ref(typeof window === 'undefined' ? false : storedLayout() !== undefined)
 const dragging = ref(false)
 const resizing = ref(false)
-/**
- * How much of the bottom of the viewport the sheet must leave clear, in pixels.
- *
- * The sheet spans the width, so the player is directly beneath it rather than beside it,
- * and the player is not one size: it is a compact strip until media plays and considerably
- * taller once an official embed appears inside it. A constant offset would therefore be
- * correct only while nothing was playing, and would put the sheet over the transport
- * exactly when the user has something to pause.
- *
- * Held as a value rather than read during render: it is a layout measurement, and taking
- * one inside a computed would tie painting to measuring. It is refreshed on the events
- * that can change it -- mount, viewport resize, and the workspace telling us the player
- * has been renegotiated -- which is the same set the derived desktop placement uses.
- */
-const sheetBlockEnd = ref(CHAT_SAFE_MARGIN)
-const sheetAvailableHeight = ref<number>()
-const narrow = ref(typeof window === 'undefined' ? false : window.innerWidth <= NARROW_VIEWPORT)
-const gestureable = computed(() => !narrow.value && !props.inert)
-/**
- * The window box, or nothing at all on a narrow screen.
- *
- * A sheet is not a window whose gestures have been taken away. Clamping desktop
- * coordinates into a 375px viewport produces an arbitrary inset position and a size
- * inherited from whatever the user last dragged on a monitor -- neither of which is a
- * decision about a phone. So the geometry is handed to CSS there, which can express
- * "across the width, above the player, bounded height" directly, and cannot be in two
- * minds about it the way an inline style competing with a stylesheet would be.
- */
-const style = computed(() => (narrow.value ? {
-  '--chat-sheet-block-end': `${sheetBlockEnd.value}px`,
-  '--chat-sheet-available-block-size': sheetAvailableHeight.value === undefined ? undefined : `${sheetAvailableHeight.value}px`,
-} : {
-  transform: `translate(${layout.value.x}px, ${layout.value.y}px)`,
+const gestureable = computed(() => !props.inert)
+
+const style = computed(() => ({
+  transform: `translate(${layout.value.x + viewportLeft.value}px, ${layout.value.y + viewportTop.value}px)`,
   width: `${layout.value.width}px`,
   height: `${layout.value.height}px`,
 }))
 
-/**
- * Keep the narrow sheet above playback controls. If the whole Player card leaves too little
- * room for a usable body, yield its non-interactive area while retaining the control rows.
- */
-function measureSheetBand(): void {
-  if (!narrow.value) return
-  const regions = props.reserved?.()
-  const headerHeight = root.value?.querySelector<HTMLElement>('[data-floating-chat-handle]')?.getBoundingClientRect().height ?? 0
-  const border = root.value ? getComputedStyle(root.value) : undefined
-  const headerBoxHeight = headerHeight + (parseFloat(border?.borderTopWidth ?? '0') || 0) + (parseFloat(border?.borderBottomWidth ?? '0') || 0)
-  const geometry = resolveChatSheetLayout(viewport(), regions, headerBoxHeight)
-  sheetBlockEnd.value = geometry.blockEnd
-  sheetAvailableHeight.value = props.constrainToAvailableSpace ? geometry.availableHeight : undefined
+function syncVisualViewport(): void {
+  viewportLeft.value = narrow.value ? window.visualViewport?.offsetLeft ?? 0 : 0
+  viewportTop.value = narrow.value ? window.visualViewport?.offsetTop ?? 0 : 0
 }
+
 function persist(): void {
-  safeLocalStorage.setItem(CHAT_LAYOUT_STORAGE_KEY, serialiseChatLayout(layout.value))
+  safeLocalStorage.setItem(storageKey(), serialiseChatLayout(layout.value))
 }
 
 function sameLayout(first: ChatLayout, second: ChatLayout): boolean {
@@ -167,23 +129,36 @@ function sameLayout(first: ChatLayout, second: ChatLayout): boolean {
     && first.width === second.width && first.height === second.height
 }
 
-function setReconciledLayout(next: ChatLayout): void {
+function setLayout(next: ChatLayout, remember: boolean): void {
   if (sameLayout(layout.value, next)) return
   layout.value = next
-  // A safety move caused by player growth or a viewport resize becomes the new remembered
-  // placement. Narrow sheets never call this path, so they cannot overwrite desktop geometry.
-  if (userPlaced.value) persist()
+  if (remember && userPlaced.value) persist()
 }
 
+/**
+ * Fits the window to the viewport in front of the user. On desktop a safety move becomes the
+ * remembered placement, as before. On a phone it does not: the viewport shrinks every time the
+ * keyboard opens, and remembering that squeezed size would lose the size the user chose. The
+ * phone window is re-derived from its stored layout instead, so it grows back on its own.
+ */
 function applyViewport(): void {
-  narrow.value = window.innerWidth <= NARROW_VIEWPORT
-  measureSheetBand()
-  // CSS owns the sheet geometry. Leave the remembered desktop placement intact while narrow.
-  if (narrow.value) return
-  setReconciledLayout(userPlaced.value
+  const wasNarrow = narrow.value
+  narrow.value = isNarrow()
+  syncVisualViewport()
+  if (narrow.value !== wasNarrow) {
+    userPlaced.value = storedLayout() !== undefined
+    layout.value = derivedLayout()
+    return
+  }
+  if (narrow.value) {
+    setLayout(derivedLayout(), false)
+    return
+  }
+  setLayout(userPlaced.value
     ? reconcileChatLayout(layout.value, viewport(), props.reserved?.(), true)
-    : defaultChatLayout(viewport(), props.reserved?.()))
+    : defaultChatLayout(viewport(), props.reserved?.()), true)
 }
+
 /**
  * A drag begins on the header and nowhere else, and not on a control inside it. Testing
  * for the nearest interactive ancestor rather than for the header itself is what lets
@@ -195,10 +170,27 @@ function isGestureTarget(event: PointerEvent): boolean {
   return !target.closest('button, a, input, select, textarea, [contenteditable="true"]')
 }
 
+/**
+ * What a finished gesture stores. A resize stores the size the user dragged to. A move on a
+ * phone stores only the new position: while the keyboard or a landscape turn squeezes the
+ * window, its displayed size is a temporary clamp, and saving it would stop the window from
+ * growing back to the size the user chose.
+ */
+function rememberedLayout(kind: 'move' | 'resize'): ChatLayout {
+  if (kind === 'resize' || !narrow.value) return layout.value
+  const stored = storedLayout()
+  return {
+    ...layout.value,
+    width: stored?.width ?? Math.max(layout.value.width, DEFAULT_NARROW_CHAT_WIDTH),
+    height: stored?.height ?? Math.max(layout.value.height, DEFAULT_NARROW_CHAT_HEIGHT),
+  }
+}
+
 function track(
   event: PointerEvent,
   onMove: (deltaX: number, deltaY: number) => void,
   active: typeof dragging,
+  kind: 'move' | 'resize',
 ): void {
   const originX = event.clientX
   const originY = event.clientY
@@ -210,8 +202,7 @@ function track(
   try {
     handle.setPointerCapture(event.pointerId)
   } catch {
-    // Capture is an optimisation, not a requirement: the listeners below are on the
-    // handle either way, and a browser that refuses capture still delivers them.
+    // Capture is an optimisation: the listeners below are on the handle either way.
   }
 
   const move = (moveEvent: PointerEvent): void => {
@@ -231,9 +222,8 @@ function track(
     active.value = false
     // The gesture is what makes this layout the user's, so nothing may re-derive it after.
     userPlaced.value = true
-    // One write per gesture rather than one per frame: the intermediate positions of a
-    // drag are not layouts the user chose.
-    persist()
+    // One write per gesture rather than one per frame.
+    safeLocalStorage.setItem(storageKey(), serialiseChatLayout(rememberedLayout(kind)))
   }
   handle.addEventListener('pointermove', move)
   handle.addEventListener('pointerup', finish)
@@ -253,7 +243,7 @@ function onHeaderPointerDown(event: PointerEvent): void {
       props.reserved?.(),
       true,
     )
-  }, dragging)
+  }, dragging, 'move')
 }
 
 function onResizePointerDown(event: PointerEvent): void {
@@ -269,24 +259,34 @@ function onResizePointerDown(event: PointerEvent): void {
       props.reserved?.(),
       true,
     )
-  }, resizing)
+  }, resizing, 'resize')
+}
+
+function onKeydown(event: KeyboardEvent): void {
+  // On a phone there is no pointer to reach the close button quickly with an external
+  // keyboard, so Escape closes the window; the workspace returns focus to its opener.
+  if (event.key !== 'Escape' || event.defaultPrevented || !narrow.value || props.inert) return
+  event.preventDefault()
+  event.stopPropagation()
+  emit('close')
 }
 
 /** Called by the workspace when the window is reopened, so it lands somewhere valid. */
 function reconcile(): void {
   applyViewport()
-  // Nothing is reconciled while narrow, so there is nothing to write. Persisting anyway
-  // would be the one path that could still commit a sheet-shaped layout over the user's
-  // remembered desktop one.
   if (userPlaced.value && !narrow.value) persist()
 }
 
 /** Reconcile against live Player geometry without discarding a user-chosen placement. */
 function renegotiate(): void {
-  if (narrow.value) { measureSheetBand(); return }
-  setReconciledLayout(userPlaced.value
+  syncVisualViewport()
+  if (narrow.value) {
+    setLayout(derivedLayout(), false)
+    return
+  }
+  setLayout(userPlaced.value
     ? reconcileChatLayout(layout.value, viewport(), props.reserved?.(), true)
-    : defaultChatLayout(viewport(), props.reserved?.()))
+    : defaultChatLayout(viewport(), props.reserved?.()), true)
 }
 function focusWindow(): void {
   root.value?.focus()
@@ -305,20 +305,23 @@ onMounted(() => {
   // collapse or viewport change can reconcile chat against their live rectangles.
   renegotiate()
   window.addEventListener('resize', applyViewport)
+  window.visualViewport?.addEventListener('resize', applyViewport)
+  window.visualViewport?.addEventListener('scroll', syncVisualViewport)
 })
 
-onBeforeUnmount(() => window.removeEventListener('resize', applyViewport))
-
-watch(() => props.constrainToAvailableSpace, renegotiate, { flush: 'post' })
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', applyViewport)
+  window.visualViewport?.removeEventListener('resize', applyViewport)
+  window.visualViewport?.removeEventListener('scroll', syncVisualViewport)
+})
 
 defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
 </script>
 
 <template>
   <!--
-    A labelled section, which computes to a landmark region. Deliberately not
-    role="dialog": when explicitly opened, this non-modal window traps no focus and blocks
-    nothing, so announcing it as a dialog would describe behaviour it does not have.
+    A non-modal landmark on every screen size: music and the workspace stay usable around it.
+    A higher workspace modal temporarily makes it inert.
   -->
   <section
     ref="root"
@@ -332,6 +335,7 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
     :aria-hidden="props.inert ? 'true' : undefined"
     tabindex="-1"
     :style="style"
+    @keydown="onKeydown"
   >
     <header
       class="chat-window__header"
@@ -357,10 +361,9 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
     </div>
 
     <!--
-      A resize handle is a pointer affordance. It carries no tabindex and no role,
-      because a focusable control that only responds to a drag would promise a keyboard
-      interaction it cannot honour. The window remains fully usable without it: reading,
-      closing and reopening never require a resize.
+      A resize handle is a pointer affordance. It carries no tabindex and no role, because a
+      focusable control that only responds to a drag would promise a keyboard interaction it
+      cannot honour. Reading, closing and reopening never require a resize.
     -->
     <span
       v-if="gestureable"
@@ -375,22 +378,19 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
 
 <style scoped>
 .chat-window {
-  /* Fixed, so the window is positioned against the viewport its layout was clamped to.
-     Inside the workspace's transformed zones the same coordinates would be relative to
-     a box that is itself inset, and the clamp would be measuring the wrong rectangle. */
+  /* Fixed, so the window is positioned against the viewport its layout was clamped to. */
   position: fixed;
   top: 0;
   left: 0;
   z-index: var(--layer-workspace-chat-window);
   display: flex;
   flex-direction: column;
-  /* The body scrolls; the window does not grow past the size the user chose. Without
-     min-height: 0 here a flex child's auto minimum would let the content push the
-     window taller than its own height. */
+  /* The body scrolls; the window does not grow past the size the user chose. */
   min-height: 0;
   overflow: hidden;
   color: var(--colour-text-primary);
-  border-radius: var(--radius-surface);
+  border: 0;
+  border-radius: var(--liquid-radius-popover);
 }
 
 .chat-window--active {
@@ -403,37 +403,13 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
   flex: 0 0 auto;
   gap: 0.5rem;
   align-items: center;
-  padding: 0.5rem 0.5rem 0.5rem 0.75rem;
-  border-block-end: var(--glass-border);
+  padding: 0.375rem 0.375rem 0.375rem 0.75rem;
+  border-block-end: 1px solid var(--liquid-separator);
   cursor: grab;
-  /* A drag must not paint a text selection across the title. */
+  /* A drag must not paint a text selection or start a page scroll. */
   user-select: none;
   touch-action: none;
 }
-
-/*
- * The narrow-screen sheet.
- *
- * Not a window clamped small: it spans the width the way every other surface does at this
- * size, sits on the bottom edge above the player, and is bounded so it can never grow into
- * the top bar. Its own body scrolls, so a long conversation lengthens the scroll rather
- * than the sheet. Geometry lives here in full -- the component writes no box at this width,
- * so there is nothing for an inline style to disagree with.
- */
-.chat-window[data-chat-narrow="true"] {
-  /* Bottom-anchored, so the header and its close button are the part nearest the thumb. */
-  top: auto;
-  right: var(--workspace-edge-inset);
-  bottom: var(--chat-sheet-block-end, var(--workspace-edge-inset));
-  left: var(--workspace-edge-inset);
-  width: auto;
-  /* Bounded rather than sized: enough of the viewport to be a real reading surface, never
-     so much that it reaches the top bar, and never taller than the room left above the
-     player. 3rem covers the wrapped two-row bar this width produces. */
-  height: auto;
-  max-height: min(60dvh, calc(100dvh - var(--chat-sheet-block-end, 0px) - 3rem), var(--chat-sheet-available-block-size, 100dvh));
-}
-.chat-window[data-chat-narrow="true"] .chat-window__header { cursor: default; touch-action: auto; }
 .chat-window--active .chat-window__header { cursor: grabbing; }
 .chat-window__grip { flex: 0 0 auto; color: var(--colour-text-muted); }
 .chat-window__header h2 {
@@ -449,27 +425,30 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
 .chat-window__close {
   display: grid;
   flex: 0 0 auto;
-  width: 2.25rem;
-  height: 2.25rem;
+  width: 2.75rem;
+  height: 2.75rem;
   padding: 0;
   place-items: center;
   color: var(--colour-text-primary);
-  background: var(--colour-surface-opaque);
-  border: var(--glass-border);
+  background: transparent;
+  border: 0;
   border-radius: 50%;
   cursor: pointer;
   transition: transform var(--motion-duration) ease, filter var(--motion-duration) ease;
 }
 
+.chat-window__close:hover { background: rgb(255 255 255 / 9%); }
 .chat-window__close:hover,
 .chat-window__close:focus-visible { filter: var(--control-hover-filter); }
 .chat-window__close:active { transform: scale(0.94); filter: var(--control-active-filter); }
 
 .chat-window__body {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
-  padding: 0.875rem 1rem 1rem;
-  overflow: auto;
+  padding: 0.75rem 0.875rem 0.875rem;
+  overflow: hidden;
   overscroll-behavior: contain;
 }
 
@@ -480,19 +459,30 @@ defineExpose({ reconcile, renegotiate, focusWindow, windowElement })
   width: 1.25rem;
   height: 1.25rem;
   cursor: nwse-resize;
-  /* Two hairlines rather than a glyph: visible as an affordance, quiet enough that it
-     does not read as a control competing with the close button. */
+  /* Two hairlines rather than a glyph: visible, but quieter than the close button. */
   background:
     linear-gradient(135deg, transparent 46%, var(--colour-text-muted) 46%, var(--colour-text-muted) 54%, transparent 54%),
     linear-gradient(135deg, transparent 70%, var(--colour-text-muted) 70%, var(--colour-text-muted) 78%, transparent 78%);
   touch-action: none;
 }
 
+/* A fingertip needs a 44px target; the hairlines stay in the corner, the hit area grows. */
+@media (pointer: coarse) {
+  .chat-window__resize {
+    width: 2.75rem;
+    height: 2.75rem;
+    background-size: 1.25rem 1.25rem;
+    background-position: right bottom;
+    background-repeat: no-repeat;
+  }
+}
+
+@media (max-height: 450px) {
+  .chat-window__header { padding-block: 0.25rem; }
+  .chat-window__body { padding-block: 0.25rem; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .chat-window__close { transition-duration: 0ms; }
 }
-.chat-window { border: 0; border-radius: var(--liquid-radius-popover); }
-.chat-window__header { border-color: var(--liquid-separator); }
-.chat-window__close { width: 2.75rem; height: 2.75rem; border: 0; background: transparent; }
-.chat-window__close:hover { background: rgb(255 255 255 / 9%); }
 </style>

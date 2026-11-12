@@ -7,9 +7,7 @@
  * The three exact UI locales are supported, plus safe generic zh fallback.
  * Other locale tags are not directly selected and are reported for review.
  *
- * Task 15 found exactly this: `data/catalog/staging_aliases.csv` uses `zh-CN` and `fr-FR`, neither
- * of which is a `Locale`. The workbook's own `Instructions` sheet says aliases should use
- * "a valid locale such as en, zh-Hant, or zh-Hans", so the CSV and the contract disagree.
+ * Locale aliases must match the languages the UI can actually select.
  *
  * Silent invisibility is the failure mode worth guarding against: nothing errors, the data is
  * present, and the user simply sees English. A structural validator cannot catch it because

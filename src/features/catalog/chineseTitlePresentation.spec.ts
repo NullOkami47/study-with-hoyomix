@@ -17,8 +17,8 @@ describe('contextual Chinese title presentation', () => {
   it.each([
     ['zh-Hans', 'zh-Hant', '晨曦酒庄', '晨曦酒莊'],
     ['zh-Hant', 'zh-Hans', '晨曦酒莊', '晨曦酒庄'],
-    ['zh-Hans', 'zh-Hant', '轻涟', '輕漣'],
-    ['zh-Hans', 'zh-Hant', '使一颗心免于哀伤', '使一顆心免於哀傷'],
+    ['zh-Hans', 'zh-Hant', '示范练习', '示範練習'],
+    ['zh-Hans', 'zh-Hant', '示范星轨练习', '示範星軌練習'],
     ['zh-Hans', 'zh-Hant', '极限委托', '極限委託'],
     ['zh-Hans', 'zh-Hant', '里面的钟声', '裏面的鐘聲'],
   ] as const)('converts %s to %s: %s', (source, target, value, expected) => {
@@ -58,7 +58,7 @@ describe('contextual Chinese title presentation', () => {
     const candidates = deriveLxCandidates(track)
     expect(resolveDisplayTitle(track, 'zh-Hant')).toBe('晨曦酒莊')
     expect(resolveDisplayTitle(track, 'zh-Hans')).toBe('晨曦酒庄')
-    expect(normaliseSearchText('輕漣')).toBe(normaliseSearchText('轻涟'))
+    expect(normaliseSearchText('示範練習')).toBe(normaliseSearchText('示范练习'))
     expect(normaliseSearchText(Object.values(track.aliases).flat().join(' '))).toBe(search)
     expect(deriveLxCandidates(track)).toEqual(candidates)
     expect(JSON.stringify(track)).toBe(snapshot)

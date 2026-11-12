@@ -96,10 +96,10 @@ This repository is a curated source distribution. The hosted app can run a diffe
 | **Liquid Glass Workspace** | Study over a dual-slot crossfade video/poster backdrop (`1080p30` default, optional `1440p30` companion with automatic frame-drop fallback) rendered beneath a multi-pass WebGPU / WebGL2 optical refraction shader (`StudioGlassCanvas`, `LiquidGlassCanvas`) with resilient CSS fallback |
 | **Durable Timers & Focus Logs** | Run monotonic-clock Pomodoro cycles (`focus`, `short-break`, `long-break`) with an optional break pause-lease for the player, configure a durable sleep timer (`15` / `30` / `45` / `60` / `90` min or custom), and review daily streaks in `StudyCalendar` |
 | **Catalogue & Smart Queue** | Filter tracks by game (`genshin`, `hsr`, `zzz`), listening mode (`sleep`, `focus`, `chill`), and relation (`place`, `character`, `npc`, `faction`, `event`), search titles/aliases across Simplified & Traditional Chinese via `opencc-js`, and reorder a virtualised non-modal queue |
-| **Multi-Provider Playback** | Resolve tracks across Worker-governed and client providers (`r2`, `jellyfin`, `youtube`, `chksz`, `meting`, `gd-studio`, `huanyin`, `qijie`, `piped`, `invidious`, `lx`, `lx-user`) with automatic fallback, MediaSession controls, and live latency/error diagnostics |
+| **Multi-Provider Playback** | Resolve eligible tracks through the server-approved LX, GD Studio and ChKSz registry, with personal LX imports kept separate. Vkeys is an optional provider and remains disabled by default. Playback retains source fallback, MediaSession controls and diagnostics; legacy adapter files do not imply an active provider, and Jellyfin remains retired. |
 | **QuickJS Custom Source Sandbox** | Import LX Music-compatible JavaScript sources and execute them inside an isolated Web Worker + `quickjs-emscripten-core` WebAssembly runtime (`src/features/player/lx/runtime/`) with strict memory, stack, timeout, and payload ceilings |
 | **Local-First Library & OAuth Sync** | Persist favourites, custom playlists, recent playback history (opt-in, capped at 100 entries), and preferences in native `IndexedDB` / `localStorage`, or sign in with **Google**, **GitHub**, and **LINUX DO** to sync across devices via Cloudflare D1 |
-| **Realtime Presence & Admin Console** | See live online listener counts and chat via the `OnlineCounter` Cloudflare Durable Object, and manage catalogue revisions, Google Sheets imports, R2 background transcoding (`mediabunny` + WebCodecs), notices, and provider health in `AdminShell` |
+| **Realtime Presence & Admin Console** | See live listener counts through `OnlinePresence` and community chat through the separate `ChatRoom` Durable Object. Manage catalogue revisions, Google Sheets imports, R2 background transcoding (`mediabunny` + WebCodecs), notices and provider health in `AdminShell`. |
 
 <a id="implemented"></a>
 <a id="en-implemented"></a>
@@ -124,7 +124,7 @@ This repository is a curated source distribution. The hosted app can run a diffe
 
 ## New functions and structure
 
-The changes below are implemented in the development release line. Some are already part of earlier hosted releases. The remaining integration is **awaiting final verification**, and the combined source is awaiting a **reviewed public-source update**. This public checkout still contains the earlier application source edition. This section documents the new work without implying that it is already deployed or available from a fresh clone. The existing features above describe the public edition.
+This source tree includes the development release work described below, with empty catalogue defaults and synthetic test inputs. The combined release is **awaiting final verification**. Publication and production activation require their own review and approval. Features that depend on configured providers, qualified catalogue data or optional automation remain subject to those requirements.
 
 | Area | New behaviour in the release candidate |
 | :--- | :--- |
@@ -138,7 +138,7 @@ The changes below are implemented in the development release line. Some are alre
 | **Catalogue discovery and review** | Adds deterministic discovery for Genshin Impact, Honkai: Star Rail and Zenless Zone Zero, an Admin discovery inbox, source/identity checks, classification suggestions and a Google Sheets staging/review flow. Canonical track identity remains separate from provider IDs; candidates without a qualified playable source remain candidates rather than silently entering the catalogue. Focus eligibility is independent of whether a track has vocals. |
 | **Optional catalogue automation** | Adds durable row/cycle/staging records for a bounded discover → classify → stage → publish round trip. Automatic processing and automatic publication are separate opt-ins, both **off by default**. Publication rechecks source identity, reviewed changes, catalogue revision and write-budget evidence; uncertain outcomes require reconciliation. No personal AI account or external schedule is implicitly connected. |
 
-The new work is organised around these boundaries. Paths in this table describe the **candidate structure** and will become navigable after the reviewed source update:
+The new work is organised around the following module boundaries in this candidate source tree:
 
 | Module or directory | Responsibility |
 | :--- | :--- |
@@ -147,7 +147,7 @@ The new work is organised around these boundaries. Paths in this table describe 
 | `src/features/player/providers/vkeys.ts` and `workers/providers/vkeys*.ts` | Client adapter plus server-side identity, media and response-policy checks for the optional provider. |
 | `workers/lx/` and `src/features/player/lx/globalSourceRepository.ts` | Shared source registry, immutable snapshots, client cache and network-origin approval. |
 | `workers/chat/`, `workers/presence.ts` and `src/features/chat/` | Chat routing/protocol, persistence, retention/moderation, presence and responsive views. |
-| `tools/catalog-sync/catalog_sync/discovery.py` | Deterministic discovery inputs and candidate generation. |
+| `workers/catalogue/discovery/scanner.ts` | Bounded official-feed discovery and validated candidate manifests. |
 | `src/features/admin/CatalogueDiscovery.vue` | Review inbox, classification and staging controls. |
 | `workers/catalogue/discovery/` | Candidate storage, source qualification, Sheets reconciliation, staging and optional automation/publication. |
 | `migrations/0029_community_chat.sql`–`0031_lx_global_sources.sql` | Chat sending/retention records and the shared LX source registry. |
@@ -179,7 +179,7 @@ Release qualification still includes complete source-bound CI and physical-devic
 | **Custom Source Sandbox** | Web Worker + QuickJS WebAssembly (`quickjs-emscripten-core` & `@jitl/quickjs-wasmfile-release-asyncify` `0.32.0`) |
 | **Search & Localisation** | Trilingual i18n (`en`, `zh-Hans`, `zh-Hant`), `opencc-js` 1.4.2 + precomputed CJK Han-folding (`src/features/catalog/hanFold.ts`) |
 | **Local Persistence** | Native browser `IndexedDB` (`src/features/library/localRepository.ts`, `src/features/focus/localRepository.ts`), `localStorage` (`src/utils/safeStorage.ts`), PWA (`vite-plugin-pwa`) |
-| **Edge Backend & Storage** | Cloudflare Workers (`workers/index.ts`), Durable Objects (`workers/online-counter.js`), Cloudflare D1 (SQLite), Cloudflare R2 |
+| **Edge Backend & Storage** | Cloudflare Workers (`workers/index.ts`), separate presence/chat Durable Objects (`workers/presence.ts`, `workers/chat/ChatRoom.ts`), Cloudflare D1 (SQLite) and Cloudflare R2 |
 | **Authentication & Security** | OAuth 2.0 / OIDC (Google, GitHub, LINUX DO), HMAC-SHA256 Session Cookies & Media Tickets, Strict Origin / CSRF / SSRF Guards |
 | **Testing & Tooling** | Vitest, `@vue/test-utils`, `fake-indexeddb`, `jsdom`, Miniflare, Wrangler 4 |
 
@@ -210,10 +210,24 @@ Common verification and build scripts:
 npm run typecheck     # Generate build info and run vue-tsc + tsc type checking
 npm test              # Run frontend unit and component tests via Vitest
 npm run test:workers  # Run Cloudflare Worker + D1 integration tests via Miniflare/Vitest
+npm run test:lx-policy-native # Run bounded LX publication/revocation regressions on Node 22
 npm run build         # Decode PWA icons, generate build info, and build production bundle into dist/
 npm run preview       # Preview the built frontend locally
 npm run verify        # Run typecheck, frontend tests, Worker tests, and production build
 ```
+
+Production and staging builds require explicit response-policy inputs in the build process environment. Set `RESPONSE_POLICY_PUBLIC_ORIGIN` to your HTTPS site origin, `RESPONSE_POLICY_R2_BASE_URL` to your authorised HTTPS media base URL, and `LX_ALLOWED_ORIGINS` to the origins your enabled LX sources require (or an empty string). Missing or invalid release inputs fail the build; local operator files are not read automatically.
+
+For compilation checks without live services, use non-resolving fixture origins:
+
+```powershell
+$env:RESPONSE_POLICY_PUBLIC_ORIGIN = 'https://public-ci.example.invalid'
+$env:RESPONSE_POLICY_R2_BASE_URL = 'https://media.public-ci.example.invalid/'
+$env:LX_ALLOWED_ORIGINS = ''
+npm run build
+```
+
+Public CI uses these inputs only for its build step. This verifies compilation and response-policy generation; it does not deploy a usable media service or establish production configuration. Replace the fixture values with your own reviewed settings before a real deployment.
 
 #### 3. Local Sign-In Button Preview (`HOYOMIX_DEV_AUTH_PREVIEW`)
 
@@ -299,7 +313,7 @@ study-with-hoyomix/
 ├── docs/
 │   ├── licenses/                 # MIT, Apache-2.0 & runtime dependency licence texts
 │   └── THIRD_PARTY_NOTICES.md    # Upstream & third-party attribution notices
-├── migrations/                   # Cloudflare D1 SQLite migrations (0001–0028)
+├── migrations/                   # D1 schema, chat/LX and discovery ledgers through 0033
 ├── public/                       # PWA manifests, robots.txt, SVG icon & title cache helper
 ├── scripts/
 │   ├── pwa-icons/                # Base64-encoded 192px & 512px PNG icon sources
@@ -338,14 +352,15 @@ study-with-hoyomix/
 │   ├── admin/                    # Role-gated admin API routes & authorization
 │   ├── auth/                     # Google, GitHub & LINUX DO OAuth/OIDC flows & session signing
 │   ├── backgrounds/              # R2 background media & MP4 bitstream validation routes
-│   ├── catalogue/                # D1 catalogue staging, diffing, publication & Google Sheets import
+│   ├── catalogue/                # Catalogue discovery/review, Sheets, staging & guarded publication
 │   ├── focus/                    # Focus session sync routes
 │   ├── library/                  # Cloud library sync routes
+│   ├── lx/                       # Owner-managed source registry, snapshots & public source policy
 │   ├── providers/                # Server-side audio provider config, SSRF guards & routes
 │   ├── test/                     # Miniflare Worker + D1 security & integration test suites
 │   ├── index.ts                  # Main Cloudflare Worker fetch & scheduled handler
-│   ├── online-counter.js         # OnlineCounter Durable Object (WebSocket presence & chat)
-│   └── presence.ts               # Presence routing helpers
+│   ├── chat/                     # ChatRoom protocol, storage, moderation & retention
+│   └── presence.ts               # OnlinePresence Durable Object and presence routing
 ├── BUILDING.txt                  # Local development and Worker setup instructions
 ├── LICENSE                       # GNU General Public License v3.0
 ├── NOTICE                        # Source, modification & copyright notices

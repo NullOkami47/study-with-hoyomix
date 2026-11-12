@@ -11,6 +11,7 @@ import {
   createFocusSessionRepository,
 } from './localRepository'
 import type { FocusSessionRecord } from './types'
+import { createMonotonicClock } from '../timers/clock'
 import {
   createPomodoroStore,
   POMODORO_STORAGE_KEY,
@@ -141,6 +142,88 @@ function createFailNextWriteFactory(): {
 }
 
 describe('pomodoro focus recorder', () => {
+  it.each(['completed', 'interrupted'] as const)('records a %s session from a fractional browser clock and survives reload', async status => {
+    const epoch = Date.parse('2026-11-05T08:00:00.000Z')
+    let monotonic = 100.25
+    const clock = createMonotonicClock({ wallNow: () => epoch, monotonicNow: () => monotonic })
+    const storage = memoryStorage(), indexedDB = new IDBFactory()
+    const repository = createFocusSessionRepository({ indexedDB, databaseName: 'fractional-clock' })
+    const onError = vi.fn()
+    const recorder = createPomodoroFocusRecorder({ repository, storage, now: clock.now, onError })
+    const store = createPomodoroStore({ autoTick: false, focusMinutes: 1, storage, clock,
+      onFocusSessionFinalized: recorder.onFinalized })
+    monotonic = 100.75
+    store.start()
+    monotonic += status === 'completed' ? 60_000 : 2_100.375
+    if (status === 'completed') store.tick()
+    else store.reset()
+    await vi.waitFor(async () => expect(await repository.list()).toHaveLength(1))
+    expect(onError).not.toHaveBeenCalled()
+    const records = await repository.list()
+    expect(records[0]).toMatchObject({ status, startedAt: '2026-11-05T08:00:00.000Z',
+      endedAt: status === 'completed' ? '2026-11-05T08:01:00.000Z' : '2026-11-05T08:00:02.100Z',
+      actualFocusSeconds: status === 'completed' ? 60 : 2 })
+    store.destroy(); recorder.destroy()
+    const reloaded = createFocusSessionRepository({ indexedDB, databaseName: 'fractional-clock' })
+    expect(await reloaded.list()).toEqual(records)
+    expect(readPendingFinalizations(storage)).toEqual([])
+    expect(readOutbox(storage)).toEqual([])
+  })
+
+  it('recovers a legacy fractional pending handoff once without weakening duration validation', async () => {
+    const storage = memoryStorage(), repository = realRepository()
+    const seed = createPomodoroStore({ autoTick: false, clock: { now: () => 0 }, storage })
+    seed.start(); seed.destroy()
+    const snapshot = JSON.parse(storage.getItem(POMODORO_STORAGE_KEY)!)
+    const event = focusEvent({ run: { ...focusEvent().run, startedAt: 0.5 }, endedAt: 60_000.5 })
+    snapshot.phase = 'break'; snapshot.status = 'idle'; snapshot.focusRun = null
+    snapshot.pendingFocusFinalizations = [event, { ...event, run: { ...event.run, id: '11111111-1111-4111-8111-111111111111' }, actualFocusSeconds: 59.5 }]
+    storage.setItem(POMODORO_STORAGE_KEY, JSON.stringify(snapshot))
+    const recorder = createPomodoroFocusRecorder({ repository, storage, now: () => 61_000 })
+    const recovered = createPomodoroStore({ autoTick: false, clock: { now: () => 61_000 }, storage,
+      onFocusSessionFinalized: recorder.onFinalized })
+    await vi.waitFor(async () => expect(await repository.list()).toEqual([focusRecord()]))
+    expect(readPendingFinalizations(storage)).toEqual([])
+    recovered.destroy(); recorder.destroy()
+  })
+
+  it('does not recover a fractional handoff whose end precedes its raw start', async () => {
+    const storage = memoryStorage(), repository = realRepository()
+    const seed = createPomodoroStore({ autoTick: false, clock: { now: () => 0 }, storage })
+    seed.start(); seed.destroy()
+    const snapshot = JSON.parse(storage.getItem(POMODORO_STORAGE_KEY)!)
+    snapshot.phase = 'break'; snapshot.status = 'idle'; snapshot.focusRun = null
+    snapshot.pendingFocusFinalizations = [focusEvent({
+      run: { ...focusEvent().run, startedAt: 0.9 }, endedAt: 0.1,
+    })]
+    storage.setItem(POMODORO_STORAGE_KEY, JSON.stringify(snapshot))
+    const onFinalized = vi.fn(() => true)
+    const recovered = createPomodoroStore({ autoTick: false, storage, clock: { now: () => 1 }, onFocusSessionFinalized: onFinalized })
+    expect(onFinalized).not.toHaveBeenCalled()
+    expect(await repository.list()).toEqual([])
+    recovered.destroy()
+  })
+
+  it('resumes a legacy fractional active run with its identity intact', async () => {
+    const storage = memoryStorage(), repository = realRepository()
+    let now = 0
+    const seed = createPomodoroStore({ autoTick: false, focusMinutes: 1, clock: { now: () => now }, storage })
+    seed.start(); seed.destroy()
+    const snapshot = JSON.parse(storage.getItem(POMODORO_STORAGE_KEY)!)
+    const id = snapshot.focusRun.id
+    snapshot.focusRun.startedAt = 0.5; snapshot.deadline = 60_000.5
+    storage.setItem(POMODORO_STORAGE_KEY, JSON.stringify(snapshot))
+    now = 10_000
+    const recorder = createPomodoroFocusRecorder({ repository, storage, now: () => now })
+    const recovered = createPomodoroStore({ autoTick: false, clock: { now: () => now }, storage,
+      onFocusSessionFinalized: recorder.onFinalized })
+    now = 60_001; recovered.tick()
+    await vi.waitFor(async () => expect(await repository.list()).toHaveLength(1))
+    expect((await repository.list())[0]).toMatchObject({ id, startedAt: '1970-01-01T00:00:00.000Z',
+      actualFocusSeconds: 60, status: 'completed' })
+    recovered.destroy(); recorder.destroy()
+  })
+
   it('validates and writes a canonical Focus outbox row synchronously before asynchronous recording', async () => {
     const storage = memoryStorage()
     const repository = realRepository()

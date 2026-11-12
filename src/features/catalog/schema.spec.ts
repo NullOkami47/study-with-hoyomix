@@ -36,7 +36,10 @@ describe('parseCatalog', () => {
       readFileSync(resolve(process.cwd(), 'src/features/catalog/catalog.sample.json'), 'utf8'),
     ) as unknown
 
+    expect(sampleCatalog).toEqual([])
     expect(parseCatalog(sampleCatalog)).toEqual([])
+    const synthetic = Array.from({ length: 4 }, (_, index) => validTrack({ id: `fixture-schema-${index}` }))
+    expect(parseCatalog(synthetic)).toEqual(synthetic)
   })
 
   it('accepts valid multi-game and multi-tab tracks with empty relations', () => {
@@ -79,7 +82,7 @@ describe('parseCatalog', () => {
       { provider: 'r2', externalId: 'authorised/track.ogg' },
       { provider: 'piped', externalId: 'lm3t3myPspk' },
       { provider: 'invidious', externalId: 'lm3t3myPspk' },
-      { provider: 'chksz', externalId: '3334421408' },
+      { provider: 'chksz', externalId: '9000000003' },
     ]
 
     expect(parseCatalog([validTrack({ sources })])[0]?.sources).toEqual(sources)
@@ -179,10 +182,10 @@ describe('parseCatalog', () => {
 
   it('accepts an album as optional display metadata and trims it', () => {
     const [track] = parseCatalog([
-      validTrack({ album: '  Genshin Impact - Fountain of Belleau (Original Game Soundtrack)  ' }),
+      validTrack({ album: '  Genshin Impact - Demo Fountain (Original Game Soundtrack)  ' }),
     ])
 
-    expect(track.album).toBe('Genshin Impact - Fountain of Belleau (Original Game Soundtrack)')
+    expect(track.album).toBe('Genshin Impact - Demo Fountain (Original Game Soundtrack)')
   })
 
   it.each([

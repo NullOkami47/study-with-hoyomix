@@ -75,9 +75,9 @@ describe('migrateLegacyDisabledProviderIds', () => {
     expect(migrateLegacyDisabledProviderIds(['jellyfin'])).toEqual(['jellyfin'])
   })
 
-  it('drops obsolete IDs completely (r2, meting, piped, invidious, gd-studio, qijie, etc.)', () => {
+  it('drops obsolete IDs completely (r2, meting, piped, invidious, qijie, etc.)', () => {
     expect(migrateLegacyDisabledProviderIds([
-      'r2', 'meting', 'piped', 'invidious', 'gd-studio', 'qijie', 'youtube', 'unknown',
+      'r2', 'meting', 'piped', 'invidious', 'qijie', 'youtube', 'unknown',
     ])).toEqual([])
   })
 
@@ -257,11 +257,11 @@ describe('browser provider preference store', () => {
 
     const store = createProviderPreferencesStore({ storage })
 
-    expect([...store.disabledProviderIds()]).toEqual(['chksz'])
+    expect([...store.disabledProviderIds()]).toEqual(['chksz', 'gd-studio'])
   })
 
   it.each([
-    'r2', 'meting', 'piped', 'invidious', 'lx-huibq', 'lx-ikun', 'youtube', 'qijie', 'gd-studio', 'lx-unknown', '',
+    'r2', 'meting', 'piped', 'invidious', 'lx-huibq', 'lx-ikun', 'youtube', 'qijie', 'lx-unknown', '',
   ])('refuses to disable the non-toggleable ID %s', (id) => {
     const store = createProviderPreferencesStore({ storage })
 
@@ -440,6 +440,8 @@ describe('browser provider preference store', () => {
       'chksz',
       'lx',
       'jellyfin',
+      'gd-studio',
+      'vkeys',
     ])
   })
 
@@ -644,4 +646,13 @@ it('merges first-login anonymous choices once while retaining the V2 local envel
   await store.setSignedIn(true, 'account-a')
   expect([...store.disabledProviderIds()]).toEqual([])
   expect(writes).toBe(1)
+})
+
+
+it('preserves the independent GD Studio exclusion across legacy preference migration', () => {
+  expect(migrateLegacyDisabledProviderIds(['gd-studio', 'lx-ikun', 'unknown'])).toEqual(['gd-studio'])
+})
+
+it('persists and migrates Vkeys disablement independently', () => {
+  expect(migrateLegacyDisabledProviderIds(['vkeys'])).toEqual(['vkeys'])
 })

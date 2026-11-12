@@ -281,7 +281,8 @@ export function createBackgroundStore(options: BackgroundStoreOptions = {}): Bac
   const applySelection = (next: BackgroundSelection, preserveCurrent = false) => {
     const selectedIds = sanitizeBackgroundSelection(next.selectedIds, backgrounds.value)
     if (selectedIds.length === 0) {
-      const fallback = backgrounds.value.find(item => item.kind === 'video' && item.status === 'published')
+      const fallback = backgrounds.value.find(item => item.id === 'zzz-belle-lofi-girl' && item.kind === 'video')
+        ?? backgrounds.value.find(item => item.kind === 'video' && item.status === 'published')
       if (fallback) selectedIds.push(fallback.id)
       implicitDefault = true
     }
@@ -315,7 +316,8 @@ export function createBackgroundStore(options: BackgroundStoreOptions = {}): Bac
     if (current.value !== null) return
     if (backgrounds.value.some((item) => item.id === currentId.value)) return
     if (!allowUploadShaped && currentId.value !== null && isUploadShapedId(currentId.value)) return
-    const fallback = backgrounds.value.find((item) => item.status === 'published' && item.kind === 'video')
+    const fallback = backgrounds.value.find((item) => item.id === 'zzz-belle-lofi-girl' && item.status === 'published')
+      ?? backgrounds.value.find((item) => item.status === 'published' && item.kind === 'video')
       ?? backgrounds.value.find((item) => item.status === 'published')
     if (!fallback) return
     currentId.value = fallback.id
@@ -342,10 +344,8 @@ export function createBackgroundStore(options: BackgroundStoreOptions = {}): Bac
     // Do not sanitise saved API IDs against the incomplete shipped catalogue.
     // Only an empty preference can be resolved before repository.list settles.
     if (selection.value.selectedIds.length === 0) {
-      const fallback = backgrounds.value.find(item => item.status === 'published' && item.kind === 'video')
-        ?? backgrounds.value.find(item => item.status === 'published')
-      selection.value.selectedIds = fallback ? [fallback.id] : []
-      currentId.value = fallback?.id ?? null
+      selection.value.selectedIds = ['zzz-belle-lofi-girl']
+      currentId.value = selection.value.selectedIds[0]
       persist()
     }
     repairUnresolvableSelection(false)

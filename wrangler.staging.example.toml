@@ -1,0 +1,34 @@
+# Operator template only. Fill your own resource identifiers before any remote use.
+name = "replace-with-your-worker-name"
+main = "workers/index.ts"
+compatibility_date = "2025-12-01"
+
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "study-with-hoyomix"
+database_id = "replace-with-your-database-id"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "PRESENCE"
+class_name = "OnlinePresence"
+
+[[migrations]]
+tag = "presence-v1"
+new_sqlite_classes = ["OnlinePresence"]
+
+[[durable_objects.bindings]]
+name = "CHAT"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "community-chat-v1"
+new_sqlite_classes = ["ChatRoom"]
+
+[vars]
+PUBLIC_ORIGIN = "https://example.invalid"

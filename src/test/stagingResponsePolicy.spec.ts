@@ -11,24 +11,30 @@ it('caches shipped background media while keeping documents revalidated', () => 
   expect(headers).toMatch(/^\/\*\n(?: {2}.+\n)* {2}Cache-Control: no-cache$/m)
 })
 
-it('builds staging CSP from its own config rather than a production config', () => {
+it('builds staging CSP only from explicit inputs and ignores local operator files', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'staging-policy-'))
-  const restore = { ...process.env }
-  delete process.env.R2_BASE_URL
-  delete process.env.R2_ALLOWED_HOSTNAMES
   const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root)
   try {
-    fs.writeFileSync(path.join(root, 'wrangler.remote.toml'), '[vars]\nR2_BASE_URL="https://production.example.com/"\nR2_ALLOWED_HOSTNAMES="production.example.com"\n')
-    fs.writeFileSync(path.join(root, 'wrangler.staging.toml'), '[vars]\nR2_BASE_URL="https://staging.example.com/"\nR2_ALLOWED_HOSTNAMES="staging.example.com"\n')
-    const policy = buildContentSecurityPolicy(readDefaultResponsePolicyEnvironment('staging'))
+    fs.writeFileSync(path.join(root, 'wrangler.remote.toml'), '[vars]\nR2_BASE_URL="https://production.example.com/"\n')
+    fs.writeFileSync(path.join(root, 'wrangler.staging.toml'), '[vars]\nR2_BASE_URL="https://untrusted-file.example.com/"\n')
+    const inputs = {
+      RESPONSE_POLICY_PUBLIC_ORIGIN: 'https://staging-app.example.com',
+      RESPONSE_POLICY_R2_BASE_URL: 'https://staging.example.com/',
+      LX_ALLOWED_ORIGINS: '',
+    }
+    const policy = buildContentSecurityPolicy(readDefaultResponsePolicyEnvironment('staging', inputs))
     expect(policy).toContain("media-src 'self' https://staging.example.com")
     expect(policy).toContain("connect-src 'self' https://staging.example.com")
     expect(policy).not.toContain('production.example.com')
+    expect(policy).not.toContain('untrusted-file.example.com')
     fs.unlinkSync(path.join(root, 'wrangler.staging.toml'))
-    expect(buildContentSecurityPolicy(readDefaultResponsePolicyEnvironment('staging'))).not.toContain('production.example.com')
+    expect(buildContentSecurityPolicy(readDefaultResponsePolicyEnvironment('staging', inputs))).toBe(policy)
+    expect(() => readDefaultResponsePolicyEnvironment('staging', {})).toThrow(/RESPONSE_POLICY_PUBLIC_ORIGIN/)
+    expect(() => readDefaultResponsePolicyEnvironment('staging', {
+      RESPONSE_POLICY_PUBLIC_ORIGIN: inputs.RESPONSE_POLICY_PUBLIC_ORIGIN,
+    })).toThrow(/RESPONSE_POLICY_R2_BASE_URL/)
   } finally {
     cwd.mockRestore()
-    process.env = restore
     fs.rmSync(root, { recursive: true, force: true })
   }
 })

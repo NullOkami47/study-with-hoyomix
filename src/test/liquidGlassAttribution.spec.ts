@@ -45,3 +45,4 @@ describe('Liquid Glass attribution', () => {
     expect(content).not.toContain(upstreamRevision)
   })
 })
+

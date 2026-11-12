@@ -8,6 +8,7 @@ import * as path from 'node:path'
 import { readR2PublicConfig } from './workers/providers/config'
 import { CHKSZ_API_ORIGIN, CHKSZ_MEDIA_HOST_SUFFIX } from './src/shared/chksz'
 import { createPublicNoticesPlugin } from './scripts/public-notices'
+import { LX_ALLOW_ALL_HTTPS, LxAllowedOriginsError, parseLxAllowedOrigins, type LxCspSources } from './src/shared/lxCspPolicy'
 
 export interface AnalyticsEnvironment {
   VITE_ANALYTICS_ID?: string
@@ -76,6 +77,8 @@ export interface ResponsePolicyEnvironment extends AnalyticsEnvironment {
   R2_BASE_URL?: string
   R2_ALLOWED_HOSTNAMES?: string
   PUBLIC_ORIGIN?: string
+  /** Comma-separated LX origins (H-01, D1 = B); read and passed through here, may be empty. */
+  LX_ALLOWED_ORIGINS?: string
 }
 
 function presenceWebSocketOrigin(rawOrigin?: string): string | null {
@@ -97,7 +100,21 @@ const YOUTUBE_IFRAME_ORIGIN = 'https://www.youtube.com'
 const CHKSZ_API_CSP_ORIGIN = CHKSZ_API_ORIGIN
 const CHKSZ_MEDIA_CSP_ORIGIN = `https://*${CHKSZ_MEDIA_HOST_SUFFIX}`
 
-export function buildContentSecurityPolicy(environment: ResponsePolicyEnvironment): string {
+const present = (values: (string | null)[]): string[] => values.filter((value): value is string => value !== null)
+
+/** Appends the validated LX origins (H-01, D1 = B) without repeating an entry already listed. */
+// The `https:` scheme-source makes every specific HTTPS host redundant, so it replaces them.
+const withLxOrigins = (values: string[], lxOrigins: readonly string[]): string[] =>
+  lxOrigins.includes(LX_ALLOW_ALL_HTTPS)
+    ? [...values, LX_ALLOW_ALL_HTTPS]
+    : [...values, ...lxOrigins.filter((origin) => !values.includes(origin))]
+
+/**
+ * The exact `connect-src` and `media-src` source lists `buildContentSecurityPolicy` emits. The
+ * client receives this as `__HOYOMIX_LX_CSP__`, so its LX check cannot drift from `_headers`.
+ * Throws `LxAllowedOriginsError` (naming the variable, never the value) on an invalid LX entry.
+ */
+export function lxCspSourcesFor(environment: ResponsePolicyEnvironment): LxCspSources {
   const analytics = analyticsScript(environment)
   const analyticsOrigin = analytics ? analytics.url.origin : null
   // Reuses the Worker's own validation, so a malformed deployment value yields no entry rather than
@@ -106,6 +123,27 @@ export function buildContentSecurityPolicy(environment: ResponsePolicyEnvironmen
   // exactly one origin is ever contacted: not the whole R2_ALLOWED_HOSTNAMES allowlist.
   const r2 = readR2PublicConfig(environment)
   const r2Origin = r2 ? new URL(r2.baseUrl).origin : null
+  const lxOrigins = parseLxAllowedOrigins(environment.LX_ALLOWED_ORIGINS)
+  return {
+    // Every other provider resolves through /api/providers/<id>/media/..., which the Worker pins to
+    // same-origin. Meting included: it needs no browser-facing origin and no frame.
+    // ChKSz is the exception: with a user key the browser resolves and plays directly, so the API
+    // origin must be reachable and the media family must be loadable.
+    // LX custom sources run in a same-origin worker and play their returned URL directly, so only
+    // the operator-listed LX origins are added. A global `https:` is added only when the operator
+    // sets LX_ALLOWED_ORIGINS to exactly `https:` (Owner decision: allow all HTTPS), and only these
+    // two directives ever carry it.
+    media: withLxOrigins(present(["'self'", r2Origin, CHKSZ_MEDIA_CSP_ORIGIN]), lxOrigins),
+    // Some engines do not match wss: against 'self'. Permit only the configured document origin.
+    connect: withLxOrigins(present(["'self'", r2Origin, analyticsOrigin, CHKSZ_API_CSP_ORIGIN,
+      presenceWebSocketOrigin(environment.PUBLIC_ORIGIN)]), lxOrigins),
+  }
+}
+
+export function buildContentSecurityPolicy(environment: ResponsePolicyEnvironment): string {
+  const analytics = analyticsScript(environment)
+  const analyticsOrigin = analytics ? analytics.url.origin : null
+  const lx = lxCspSourcesFor(environment)
 
   const directives: [string, (string | null)[]][] = [
     ['default-src', ["'none'"]],
@@ -120,13 +158,9 @@ export function buildContentSecurityPolicy(environment: ResponsePolicyEnvironmen
     // so the application runs clean without 'unsafe-inline'.
     ['style-src', ["'self'"]],
     ['img-src', ["'self'"]],
-    // Every other provider resolves through /api/providers/<id>/media/..., which the Worker pins to
-    // same-origin. Meting included: it needs no browser-facing origin and no frame.
-    // ChKSz is the exception: with a user key the browser resolves and plays directly, so the API
-    // origin must be reachable and the media family must be loadable.
-    ['media-src', ["'self'", r2Origin, CHKSZ_MEDIA_CSP_ORIGIN]],
-    // Some engines do not match wss: against 'self'. Permit only the configured document origin.
-    ['connect-src', ["'self'", r2Origin, analyticsOrigin, CHKSZ_API_CSP_ORIGIN, presenceWebSocketOrigin(environment.PUBLIC_ORIGIN)]],
+    // See lxCspSourcesFor: the client's LX check reads these same two lists.
+    ['media-src', [...lx.media]],
+    ['connect-src', [...lx.connect]],
     ['font-src', ["'self'"]],
     ['manifest-src', ["'self'"]],
     ['worker-src', ["'self'"]],
@@ -192,71 +226,94 @@ export interface ResponsePolicyPlugin extends Plugin {
   generateBundle: (this: { emitFile: (file: { type: 'asset'; fileName: string; source: string }) => void }) => void
 }
 
-function parseConfigFileVars(filePath: string): Record<string, string> {
-  try {
-    if (!fs.existsSync(filePath)) return {}
-    const content = fs.readFileSync(filePath, 'utf8')
-    const result: Record<string, string> = {}
-    let inVars = false
-    const isToml = filePath.endsWith('.toml')
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith('#')) continue
-      if (isToml && trimmed.startsWith('[')) {
-        inVars = trimmed === '[vars]'
-        continue
-      }
-      if (!isToml || inVars || !trimmed.includes('=')) {
-        const match = trimmed.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/)
-        if (match) {
-          let val = match[2].trim()
-          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-            val = val.slice(1, -1)
-          }
-          result[match[1]] = val
-        }
-      }
-    }
-    return result
-  } catch {
-    return {}
+// Policy inputs (M-13). The CSP is derived only from these explicit process environment variables;
+// no operator file (wrangler*.toml, .dev.vars) and no sibling checkout is ever read. Worker runtime
+// names such as PUBLIC_ORIGIN and R2_BASE_URL are deliberately not consulted, so a Worker variable
+// in the build shell cannot widen the document policy.
+export const RESPONSE_POLICY_INPUTS = {
+  publicOrigin: 'RESPONSE_POLICY_PUBLIC_ORIGIN',
+  r2BaseUrl: 'RESPONSE_POLICY_R2_BASE_URL',
+  lxAllowedOrigins: 'LX_ALLOWED_ORIGINS',
+} as const
+
+// Modes whose output is deployable (`build:production` runs `vite build`, whose default mode is
+// production; `build:staging` passes --mode staging). They fail closed on a missing or non-HTTPS input.
+export const RELEASE_RESPONSE_POLICY_MODES: readonly string[] = ['production', 'staging']
+
+// Explicit defaults for every other mode (`vite dev`, Vitest, the `bundle` mode of `npm run build`
+// and the browser harnesses). The dev server is same-origin over http://localhost, which 'self'
+// already covers, so the default adds no origin. Never applied in a release mode.
+export const LOCAL_RESPONSE_POLICY_DEFAULTS: Readonly<Pick<ResponsePolicyEnvironment, 'PUBLIC_ORIGIN' | 'R2_BASE_URL' | 'LX_ALLOWED_ORIGINS'>> = {
+  PUBLIC_ORIGIN: 'http://localhost:3000',
+  R2_BASE_URL: undefined,
+  LX_ALLOWED_ORIGINS: '',
+}
+
+export class ResponsePolicyInputError extends Error {
+  constructor(mode: string, variable: string, problem: string) {
+    // Names the variable and the rule only; the value itself is never echoed.
+    super(`${mode} build: ${variable} ${problem}. Set it explicitly in the build environment ` +
+      `(${RESPONSE_POLICY_INPUTS.publicOrigin}, ${RESPONSE_POLICY_INPUTS.r2BaseUrl} and optionally ` +
+      `${RESPONSE_POLICY_INPUTS.lxAllowedOrigins}); local operator files are never read.`)
+    this.name = 'ResponsePolicyInputError'
   }
 }
 
-export function readDefaultResponsePolicyEnvironment(mode?: string, readVars = parseConfigFileVars): ResponsePolicyEnvironment {
-  let r2BaseUrl = process.env.R2_BASE_URL
-  let r2AllowedHostnames = process.env.R2_ALLOWED_HOSTNAMES
-  let publicOrigin = process.env.PUBLIC_ORIGIN
+// The R2 allow-list is a Worker runtime bound; the CSP only ever uses the base URL's own origin, so
+// the build derives the one hostname it needs instead of taking a second input.
+function r2HostnameOf(baseUrl: string | undefined): string | undefined {
+  if (!baseUrl) return undefined
+  try { return new URL(baseUrl).hostname || undefined } catch { return undefined }
+}
 
-  const candidatePaths = mode === 'staging' ? [path.resolve(process.cwd(), 'wrangler.staging.toml')] : [
-    path.resolve(process.cwd(), 'wrangler.remote.toml'),
-    path.resolve(process.cwd(), '.dev.vars'),
-    path.resolve(process.cwd(), 'wrangler.toml'),
-  ]
-  if (!publicOrigin) {
-    for (const candidate of candidatePaths) {
-      const vars = readVars(candidate)
-      if (vars.PUBLIC_ORIGIN) { publicOrigin = vars.PUBLIC_ORIGIN; break }
+export function readDefaultResponsePolicyEnvironment(
+  mode?: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): ResponsePolicyEnvironment {
+  const value = (name: string) => env[name]?.trim() || undefined
+  const analytics = { VITE_ANALYTICS_ID: env.VITE_ANALYTICS_ID, VITE_ANALYTICS_URL: env.VITE_ANALYTICS_URL }
+  const publicOrigin = value(RESPONSE_POLICY_INPUTS.publicOrigin)
+  const r2BaseUrl = value(RESPONSE_POLICY_INPUTS.r2BaseUrl)
+  // Empty means "no LX origins" (D1 = B allows an empty list). A non-empty value is validated in
+  // every mode (H-01): an invalid entry fails the build instead of being dropped silently, so a
+  // local or harness build cannot exercise a policy a release build would refuse.
+  const lxAllowedOrigins = env[RESPONSE_POLICY_INPUTS.lxAllowedOrigins]?.trim() ?? ''
+  try {
+    parseLxAllowedOrigins(lxAllowedOrigins)
+  } catch (error) {
+    if (!(error instanceof LxAllowedOriginsError)) throw error
+    throw new ResponsePolicyInputError(mode ?? 'local', RESPONSE_POLICY_INPUTS.lxAllowedOrigins, error.problem)
+  }
+
+  if (mode === undefined || !RELEASE_RESPONSE_POLICY_MODES.includes(mode)) {
+    const r2 = r2BaseUrl ?? LOCAL_RESPONSE_POLICY_DEFAULTS.R2_BASE_URL
+    return {
+      ...analytics,
+      PUBLIC_ORIGIN: publicOrigin ?? LOCAL_RESPONSE_POLICY_DEFAULTS.PUBLIC_ORIGIN,
+      R2_BASE_URL: r2,
+      R2_ALLOWED_HOSTNAMES: r2HostnameOf(r2),
+      LX_ALLOWED_ORIGINS: lxAllowedOrigins || LOCAL_RESPONSE_POLICY_DEFAULTS.LX_ALLOWED_ORIGINS,
     }
   }
 
-  if (!r2BaseUrl) {
-    for (const p of candidatePaths) {
-      const vars = readVars(p)
-      if (vars.R2_BASE_URL) {
-        r2BaseUrl = vars.R2_BASE_URL
-        r2AllowedHostnames = r2AllowedHostnames || vars.R2_ALLOWED_HOSTNAMES
-        break
-      }
-    }
+  if (!publicOrigin) throw new ResponsePolicyInputError(mode, RESPONSE_POLICY_INPUTS.publicOrigin, 'is missing')
+  if (!presenceWebSocketOrigin(publicOrigin)) {
+    throw new ResponsePolicyInputError(mode, RESPONSE_POLICY_INPUTS.publicOrigin,
+      'must be an exact HTTPS origin (https://host, no path, credentials, query, fragment or wildcard)')
+  }
+  if (!r2BaseUrl) throw new ResponsePolicyInputError(mode, RESPONSE_POLICY_INPUTS.r2BaseUrl, 'is missing')
+  const r2AllowedHostnames = r2HostnameOf(r2BaseUrl)
+  if (!readR2PublicConfig({ R2_BASE_URL: r2BaseUrl, R2_ALLOWED_HOSTNAMES: r2AllowedHostnames })) {
+    throw new ResponsePolicyInputError(mode, RESPONSE_POLICY_INPUTS.r2BaseUrl,
+      'must be an HTTPS URL on a public hostname (no port, credentials, query or fragment)')
   }
 
   return {
-    VITE_ANALYTICS_ID: process.env.VITE_ANALYTICS_ID,
-    VITE_ANALYTICS_URL: process.env.VITE_ANALYTICS_URL,
+    ...analytics,
+    PUBLIC_ORIGIN: publicOrigin,
     R2_BASE_URL: r2BaseUrl,
     R2_ALLOWED_HOSTNAMES: r2AllowedHostnames,
-    PUBLIC_ORIGIN: publicOrigin,
+    LX_ALLOWED_ORIGINS: lxAllowedOrigins,
   }
 }
 
@@ -265,6 +322,9 @@ export function createResponsePolicyPlugin(
 ): ResponsePolicyPlugin {
   return {
     name: 'response-policy',
+    apply: 'build',
+    // Fails a release build on a missing or non-HTTPS input before any bundling work (M-13).
+    buildStart() { readEnvironment() },
     generateBundle() {
       this.emitFile({ type: 'asset', fileName: '_headers', source: buildHeadersFile(readEnvironment()) })
     },
@@ -355,7 +415,19 @@ export function cacheChineseTitleConverter({ request, url }: { request: Request;
     /^\/assets\/chinese-title-converter-[A-Za-z0-9_-]{8}\.js$/.test(url.pathname)
 }
 
+/**
+ * The `connect-src`/`media-src` lists the client's LX check mirrors (H-01). A build derives them
+ * from the same validated inputs as `_headers`, so an invalid input fails here as it would at
+ * buildStart. A release-mode dev or preview server emits no `_headers` and may lack the release
+ * inputs; it gets the base lists, the narrowest policy.
+ */
+export function lxCspDefineFor(mode: string, command: 'build' | 'serve'): LxCspSources {
+  if (command === 'serve' && RELEASE_RESPONSE_POLICY_MODES.includes(mode)) return lxCspSourcesFor({})
+  return lxCspSourcesFor(readDefaultResponsePolicyEnvironment(mode))
+}
+
 export default defineConfig(({ mode, command }) => ({
+  define: { __HOYOMIX_LX_CSP__: JSON.stringify(lxCspDefineFor(mode, command)) },
   plugins: [
     createPublicNoticesPlugin(),
     vue(),

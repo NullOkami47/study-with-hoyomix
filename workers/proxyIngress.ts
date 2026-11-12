@@ -1,20 +1,16 @@
 const PROXY_HEADER = 'x-hoyomix-proxy-secret'
 const authenticatedRequests = new WeakSet<Request>()
-
 export const isAuthenticatedProxyRequest = (request: Request): boolean => authenticatedRequests.has(request)
-
 interface ProxyEnv {
   PUBLIC_ORIGIN: string
   API_PROXY_SECRET?: string
   BACKEND_ORIGIN?: string
   PROXY_FRONTEND_ORIGIN?: string
 }
-
 const forbidden = () => new Response(JSON.stringify({ error: 'forbidden_proxy' }), {
   status: 403,
   headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
 })
-
 /** Proxy ingress is opt-in and accepts only exact HTTPS origins. */
 const configuredHttpsOrigin = (value?: string): string | null => {
   if (!value) return null
@@ -25,8 +21,10 @@ const configuredHttpsOrigin = (value?: string): string | null => {
       !parsed.search && !parsed.hash ? parsed.origin : null
   } catch { return null }
 }
-/** Only the authenticated, fixed Vercel upstream may supply the public URL context.
- * The original browser Origin remains untouched for every route's CSRF checks.
+/** Only the authenticated, configured Vercel upstream may supply the public URL context.
+ * Both origins come from env (BACKEND_ORIGIN, PROXY_FRONTEND_ORIGIN); without them a request
+ * carrying the proxy credential is refused. The original browser Origin remains untouched for
+ * every route's CSRF checks.
  */
 export const authenticateProxyIngress = async (request: Request, env: ProxyEnv): Promise<Request | Response> => {
   const supplied = request.headers.get(PROXY_HEADER)
@@ -42,7 +40,6 @@ export const authenticateProxyIngress = async (request: Request, env: ProxyEnv):
     url.origin !== backendOrigin || env.PUBLIC_ORIGIN !== frontendOrigin ||
     !url.pathname.startsWith('/api/')
   ) return forbidden()
-
   const encoder = new TextEncoder()
   const [expected, actual] = await Promise.all([
     crypto.subtle.digest('SHA-256', encoder.encode(configured)),
@@ -53,7 +50,6 @@ export const authenticateProxyIngress = async (request: Request, env: ProxyEnv):
   let difference = 0
   for (let index = 0; index < left.length; index++) difference |= left[index] ^ right[index]
   if (difference !== 0) return forbidden()
-
   const headers = new Headers(request.headers)
   headers.delete(PROXY_HEADER)
   url.protocol = 'https:'

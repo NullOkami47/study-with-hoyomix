@@ -1,6 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { webcrypto } from 'node:crypto'
+import { createHmac, webcrypto } from 'node:crypto'
 import { Log, LogLevel, Miniflare } from './miniflare-compat'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAuthHandler, type AuthEnv } from '../auth/routes'
@@ -116,6 +116,30 @@ describe('site authentication', () => {
     return { handler, begin, exchanges, providerFetch }
   }
 
+  const AUTH_ERROR_CODES = ['collision', 'provider_already_linked', 'unauthorized', 'oauth_callback_failed'] as const
+  const expectAppRedirect = async (
+    response: Response,
+    expected: ['account', 'linked'] | ['auth_error', typeof AUTH_ERROR_CODES[number]] | null = null,
+  ) => {
+    expect(response.status).toBe(302)
+    const body = await response.clone().text()
+    expect(body).toBe('')
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    const location = new URL(response.headers.get('location') ?? 'invalid:')
+    expect(`${location.origin}${location.pathname}`).toBe(`${ORIGIN}/`)
+    expect([...location.searchParams.entries()]).toEqual(expected ? [expected] : [])
+    if (location.searchParams.has('auth_error')) {
+      expect(AUTH_ERROR_CODES).toContain(location.searchParams.get('auth_error'))
+    }
+    expect(location.username).toBe('')
+    expect(location.password).toBe('')
+    expect(location.hash).toBe('')
+    const cookies = response.headers.getSetCookie()
+    expect(cookies.some((cookie) => cookie.startsWith('__Host-oauth=;') && cookie.includes('Max-Age=0'))).toBe(true)
+    const exposed = `${JSON.stringify([...response.headers])}\n${body}`
+    expect(exposed).not.toMatch(/private-|UPSTREAM_SENTINEL|temporary-provider-token|fixture-provider-token|still-live-token|google-client-secret|github-client-secret|internal\.example|upstream=private|[?&](?:code|state|access_token|refresh_token|id_token)=/i)
+  }
+
   it.each([
     ['single audience', {}],
     ['multiple audiences with matching authorised party', { aud: ['google-client-id', 'other'], azp: 'google-client-id' }],
@@ -123,7 +147,23 @@ describe('site authentication', () => {
     const fixture = await googleFixture(claims)
     const flow = await fixture.begin()
     const response = await flow.callback()
-    expect(response.status).toBe(302)
+    await expectAppRedirect(response)
+    // H-04 (Wave E): the only oauth_flows write is the callback's single-use claim, keyed by an
+    // HMAC of the state, never the state itself.
+    const claimed = await database.prepare('SELECT state_hash, provider, intent, consumed_at FROM oauth_flows').all<{
+      state_hash: string
+      provider: string
+      intent: string
+      consumed_at: number | null
+    }>()
+    expect(claimed.results).toHaveLength(1)
+    expect(claimed.results[0]).toMatchObject({ provider: 'google', intent: 'login', consumed_at: NOW })
+    expect(claimed.results[0].state_hash).toMatch(/^hmac-sha256:v1:[0-9a-f]{64}$/)
+    const state = flow.location.searchParams.get('state')!
+    expect(claimed.results[0].state_hash).not.toContain(state)
+    expect(claimed.results[0].state_hash).toBe(
+      `hmac-sha256:v1:${createHmac('sha256', env.OAUTH_STATE_SECRET).update(state).digest('hex')}`,
+    )
     expect(fixture.exchanges[0].get('redirect_uri')).toBe(`${ORIGIN}/api/auth/google/callback`)
     const verifier = fixture.exchanges[0].get('code_verifier')!
     expect(Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))).toString('base64url'))
@@ -132,6 +172,9 @@ describe('site authentication', () => {
     expect(await session.json()).toMatchObject({ user: { role: 'user' }, identities: ['google'] })
     expect((await flow.callback()).status).toBe(400)
     expect(fixture.exchanges).toHaveLength(1)
+    expect((await database.prepare('SELECT state_hash, provider, intent, consumed_at FROM oauth_flows').all()).results).toEqual(claimed.results)
+    expect(await database.prepare('SELECT COUNT(*) AS count FROM auth_identities').first('count')).toBe(1)
+    expect(await database.prepare('SELECT COUNT(*) AS count FROM sessions').first('count')).toBe(1)
     expect(await database.prepare('SELECT COUNT(*) AS count FROM users').first('count')).toBe(1)
     expect(response.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax; Path=/')
   })
@@ -146,7 +189,8 @@ describe('site authentication', () => {
     const issued = await fixture.handler.issueSession('existing-owner')
     const oldCookie = `__Host-session=${issued.token}`
     const linked = await (await fixture.begin('link', oldCookie)).callback()
-    expect(linked.status).toBe(200)
+    // M-09 (deliberate): a link callback is a navigation, so it now returns to the app instead of 200 {"ok":true}.
+    await expectAppRedirect(linked, ['account', 'linked'])
     const rotated = `__Host-session=${cookieValue(linked, '__Host-session')}`
     expect(rotated).not.toBe(oldCookie)
     expect((await fixture.handler.fetch(requestWithCookie('/api/session', oldCookie))).status).toBe(401)
@@ -174,8 +218,8 @@ describe('site authentication', () => {
     const issued = await fixture.handler.issueSession('owner')
     const cookie = `__Host-session=${issued.token}`
     const response = await (await fixture.begin('link', cookie)).callback()
-    expect(response.status).toBe(409)
-    expect(await response.json()).toEqual({ error: 'collision' })
+    // M-09 (deliberate): was 409 {"error":"collision"}; the navigation now returns to the app.
+    await expectAppRedirect(response, ['auth_error', 'collision'])
     expect((await fixture.handler.fetch(requestWithCookie('/api/session', cookie))).status).toBe(200)
     expect(await database.prepare("SELECT user_id FROM auth_identities WHERE provider='google'").first('user_id')).toBe('other')
     expect(await database.prepare('SELECT COUNT(*) AS count FROM auth_identities').first('count')).toBe(2)
@@ -203,13 +247,59 @@ describe('site authentication', () => {
     const start = await handler.fetch(new Request(`${ORIGIN}/api/auth/google/start`))
     const state = new URL(start.headers.get('location')!).searchParams.get('state')
     const response = await handler.fetch(requestWithCookie(`/api/auth/google/callback?code=private-code&state=${state}`, `__Host-oauth=${cookieValue(start, '__Host-oauth')}`))
-    expect(response.status).toBe(401)
-    expect(await response.text()).toBe('{"error":"oauth_callback_failed"}')
+    // M-09 (deliberate): was 401 {"error":"oauth_callback_failed"}; now a bodiless redirect with the fixed code.
+    await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
+    expect(await response.text()).toBe('')
     expect(JSON.stringify([...response.headers])).not.toMatch(/private-|google-client-secret/)
     for (const log of logs) expect(log).not.toHaveBeenCalled()
     expect(await database.prepare('SELECT COUNT(*) AS count FROM users').first('count')).toBe(0)
   })
 
+  // OAuth callback navigations return only fixed application outcomes (M-09).
+  describe('M-09 OAuth navigations end in a redirect (Property 11)', () => {
+    const seedOwner = () => database.batch([
+      database.prepare('INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').bind('owner', 'Owner', 'owner', NOW, NOW),
+      database.prepare('INSERT INTO auth_identities (id, user_id, provider, provider_subject, created_at) VALUES (?, ?, ?, ?, ?)').bind('github', 'owner', 'github', '777', NOW),
+    ])
+    it('redirects a completed link to /?account=linked and still rotates the session', async () => {
+      await seedOwner()
+      const fixture = await googleFixture()
+      const issued = await fixture.handler.issueSession('owner')
+      const response = await (await fixture.begin('link', `__Host-session=${issued.token}`)).callback()
+      await expectAppRedirect(response, ['account', 'linked'])
+      expect(response.headers.getSetCookie().some((cookie) => cookie.startsWith('__Host-session=') && !cookie.startsWith('__Host-session=;'))).toBe(true)
+    })
+    it('redirects a link collision to /?auth_error=collision', async () => {
+      await seedOwner()
+      await database.batch([
+        database.prepare('INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').bind('other', 'Other', 'user', NOW, NOW),
+        database.prepare('INSERT INTO auth_identities (id, user_id, provider, provider_subject, created_at) VALUES (?, ?, ?, ?, ?)').bind('google', 'other', 'google', 'google-subject', NOW),
+      ])
+      const fixture = await googleFixture()
+      const issued = await fixture.handler.issueSession('owner')
+      const response = await (await fixture.begin('link', `__Host-session=${issued.token}`)).callback()
+      await expectAppRedirect(response, ['auth_error', 'collision'])
+    })
+    it('redirects a link whose session ended mid-flow to /?auth_error=unauthorized', async () => {
+      await seedOwner()
+      const fixture = await googleFixture()
+      const issued = await fixture.handler.issueSession('owner')
+      const cookie = `__Host-session=${issued.token}`
+      const flow = await fixture.begin('link', cookie)
+      expect((await fixture.handler.fetch(requestWithCookie('/api/logout', cookie, { method: 'POST' }))).status).toBe(204)
+      await expectAppRedirect(await flow.callback(), ['auth_error', 'unauthorized'])
+    })
+    it('redirects a failed callback exchange to /?auth_error=oauth_callback_failed without provider detail', async () => {
+      const handler = createAuthHandler(env, { now: () => NOW, fetch: async () => {
+        throw new Error('private-token-and-client-secret-sentinel')
+      } })
+      const start = await handler.fetch(new Request(`${ORIGIN}/api/auth/google/start`))
+      const state = new URL(start.headers.get('location')!).searchParams.get('state')
+      const response = await handler.fetch(requestWithCookie(`/api/auth/google/callback?code=private-code&state=${state}`, `__Host-oauth=${cookieValue(start, '__Host-oauth')}`))
+      await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
+      expect(response.headers.get('location') ?? '').not.toMatch(/private-|google-client-secret|code=/)
+    })
+  })
   it('advertises only configured OAuth providers without exposing credentials', async () => {
     env.GOOGLE_CLIENT_ID = ''
     const response = await createAuthHandler(env).fetch(new Request(`${ORIGIN}/api/auth/providers`))
@@ -240,7 +330,10 @@ describe('site authentication', () => {
   })
 
   it('issues integrity-protected state, Google nonce, and S256 PKCE without offline access', async () => {
-    const handler = createAuthHandler(env, { now: () => NOW })
+    const prepare = vi.fn(database.prepare.bind(database))
+    const batch = vi.fn(database.batch.bind(database))
+    const exec = vi.fn(database.exec.bind(database))
+    const handler = createAuthHandler({ ...env, DB: { prepare, batch, exec } as unknown as AuthEnv['DB'] }, { now: () => NOW })
     const response = await handler.fetch(new Request(`${ORIGIN}/api/auth/google/start`))
 
     expect(response.status).toBe(302)
@@ -254,19 +347,56 @@ describe('site authentication', () => {
     expect(location.searchParams.has('access_type')).toBe(false)
     expect(response.headers.get('set-cookie')).toContain('__Host-oauth=')
     expect(response.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax; Path=/')
-    const persistedFlow = await database.prepare('SELECT state_hash, provider, intent, consumed_at FROM oauth_flows').first<{
-      state_hash: string
-      provider: string
-      intent: string
-      consumed_at: number | null
-    }>()
-    expect(persistedFlow).toMatchObject({ provider: 'google', intent: 'login', consumed_at: null })
-    expect(persistedFlow?.state_hash).toMatch(/^hmac-sha256:v1:[0-9a-f]{64}$/)
-    expect(persistedFlow?.state_hash).not.toContain(location.searchParams.get('state'))
+    // The sealed cookie carries the flow; login start must not even access D1 (H-04).
+    expect(prepare).not.toHaveBeenCalled()
+    expect(batch).not.toHaveBeenCalled()
+    expect(exec).not.toHaveBeenCalled()
+    const sealedFlow = cookieValue(response, '__Host-oauth')
+    expect(sealedFlow).toMatch(/^[A-Za-z0-9_-]+$/)
+    const decodedCookie = Buffer.from(sealedFlow, 'base64url').toString('utf8')
+    expect(decodedCookie).not.toContain(location.searchParams.get('state')!)
+    expect(decodedCookie).not.toContain(location.searchParams.get('nonce')!)
+    expect(await database.prepare('SELECT COUNT(*) AS count FROM oauth_flows').first('count')).toBe(0)
     const flowColumns = await database.prepare('PRAGMA table_info(oauth_flows)').all<{ name: string }>()
     expect(flowColumns.results.map(({ name }: { name: string }) => name)).not.toEqual(expect.arrayContaining([
       'state', 'nonce', 'verifier', 'code', 'access_token', 'refresh_token',
     ]))
+  })
+
+  it.each([0, 60 * 60 * 1000])('starts an account link without writing OAuth flow state (session age %sms)', async (sessionAge) => {
+    await database.prepare('INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+      .bind('link-start-user', 'Link start fixture', 'user', NOW, NOW).run()
+    const issued = await createAuthHandler(env, { now: () => NOW - sessionAge }).issueSession('link-start-user')
+    const beforeSession = await database.prepare('SELECT * FROM sessions').all()
+    const prepare = vi.fn(database.prepare.bind(database))
+    const batch = vi.fn(database.batch.bind(database))
+    const exec = vi.fn(database.exec.bind(database))
+    const handler = createAuthHandler({ ...env, DB: { prepare, batch, exec } as unknown as AuthEnv['DB'] }, { now: () => NOW })
+    const response = await handler.fetch(requestWithCookie('/api/auth/google/start?intent=link', `__Host-session=${issued.token}`))
+
+    expect(response.status).toBe(302)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    const destination = new URL(response.headers.get('location') ?? '')
+    expect(destination.origin + destination.pathname).toBe('https://accounts.google.com/o/oauth2/v2/auth')
+    expect(destination.searchParams.get('redirect_uri')).toBe(`${ORIGIN}/api/auth/google/callback`)
+    expect(destination.searchParams.get('state')).toMatch(/^[A-Za-z0-9_-]{32,}$/)
+    expect(destination.searchParams.get('nonce')).toMatch(/^[A-Za-z0-9_-]{32,}$/)
+    expect(destination.searchParams.get('code_challenge_method')).toBe('S256')
+    expect(cookieValue(response, '__Host-oauth')).toMatch(/^[A-Za-z0-9_-]+$/)
+    expect(response.headers.getSetCookie().some(cookie => cookie.startsWith('__Host-session='))).toBe(false)
+    expect(batch).not.toHaveBeenCalled()
+    expect(exec).not.toHaveBeenCalled()
+    const statements = prepare.mock.calls.map(([sql]: [string]) => sql.trim().replace(/\s+/g, ' '))
+    expect(statements[0]).toMatch(/^SELECT sessions\.id, /)
+    // H-04 forbids an OAuth flow write. Normal L-15 session activity tracking remains valid.
+    const writes = statements.filter((sql: string) => !sql.startsWith('SELECT '))
+    expect(writes).toEqual(sessionAge === 0 ? [] : [
+      'UPDATE sessions SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at <= ?)',
+    ])
+    expect(await database.prepare('SELECT COUNT(*) AS count FROM oauth_flows').first('count')).toBe(0)
+    const afterSession = await database.prepare('SELECT * FROM sessions').all()
+    expect(afterSession.results).toEqual(beforeSession.results.map((row: Record<string, unknown>) => ({ ...row, last_seen_at: NOW })))
+    expect(await database.prepare('SELECT COUNT(*) AS count FROM auth_identities').first('count')).toBe(0)
   })
 
   it('rejects a callback whose state does not match the protected flow', async () => {
@@ -315,7 +445,7 @@ describe('site authentication', () => {
       `/api/auth/google/callback?code=code&state=${location.searchParams.get('state')}`,
       `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
     ))
-    expect(response.status).toBe(401)
+    await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
     expect(await database.prepare('SELECT COUNT(*) AS count FROM users').first<number>('count')).toBe(0)
   })
 
@@ -350,7 +480,7 @@ describe('site authentication', () => {
       `/api/auth/google/callback?code=code&state=${location.searchParams.get('state')}`,
       `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
     ))
-    expect(response.status).toBe(401)
+    await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
   })
 
   it('rejects a Google token whose signed payload was tampered with', async () => {
@@ -379,7 +509,7 @@ describe('site authentication', () => {
       `/api/auth/google/callback?code=code&state=${location.searchParams.get('state')}`,
       `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
     ))
-    expect(response.status).toBe(401)
+    await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
   })
 
   it('uses the GitHub numeric id, sends the PKCE verifier, then revokes and discards the callback token', async () => {
@@ -402,7 +532,7 @@ describe('site authentication', () => {
       `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
     ))
 
-    expect(response.status).toBe(302)
+    await expectAppRedirect(response)
     expect(tokenRequestBody).toMatch(/code_verifier=[A-Za-z0-9_-]{43}/)
     const identity = await database.prepare('SELECT provider_subject FROM auth_identities').first<{ provider_subject: string }>()
     expect(identity?.provider_subject).toBe('777')
@@ -440,7 +570,7 @@ describe('site authentication', () => {
       const callback = await handler.fetch(new Request(`${redirectUri}?code=fixture&state=${location.searchParams.get('state')}`, {
         headers: { cookie: `__Host-oauth=${cookieValue(start, '__Host-oauth')}` },
       }))
-      expect(callback.status).toBe(302)
+      await expectAppRedirect(callback)
       expect(exchanges[attempt].get('redirect_uri')).toBe(redirectUri)
       const cookie = `__Host-session=${cookieValue(callback, '__Host-session')}`
       const session = await handler.fetch(new Request(`${production.publicOrigin}/api/session`, { headers: { cookie } }))
@@ -477,8 +607,8 @@ describe('site authentication', () => {
       `/api/auth/github/callback?code=code&state=${location.searchParams.get('state')}`,
       `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
     ))
-    expect(response.status).toBe(401)
-    expect(await response.clone().json()).toEqual({ error: 'oauth_callback_failed' })
+    // M-09 (deliberate): was 401 {"error":"oauth_callback_failed"}; upstream detail still must not leak.
+    await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
     const exposedResponse = `${JSON.stringify([...response.headers])}\n${await response.text()}`
     expect(exposedResponse).not.toMatch(/UPSTREAM_SENTINEL|temporary-provider-token|internal\.example|upstream=private/)
     expect(providerFetch).toHaveBeenCalledWith(
@@ -619,7 +749,7 @@ describe('site authentication', () => {
       `/api/auth/github/callback?code=code&state=${location.searchParams.get('state')}`,
       `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
     ))
-    expect(response.status).toBe(401)
+    await expectAppRedirect(response, ['auth_error', 'oauth_callback_failed'])
     expect(await database.prepare('SELECT COUNT(*) AS count FROM users').first<number>('count')).toBe(0)
     expect(await database.prepare('SELECT COUNT(*) AS count FROM auth_identities').first<number>('count')).toBe(0)
     expect(await database.prepare('SELECT COUNT(*) AS count FROM sessions').first<number>('count')).toBe(0)

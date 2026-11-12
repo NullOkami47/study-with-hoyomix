@@ -54,7 +54,7 @@ describe('translations', () => {
   })
 
   /**
-   * The three-provider Playback surface retired the legacy automatic providers. Their
+   * The canonical Playback surface retired the remaining legacy automatic providers. Their
    * labels must not linger in any catalogue: a leftover key would render as a live label
    * the moment a legacy identity reached a template again.
    */

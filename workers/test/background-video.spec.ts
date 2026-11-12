@@ -10,7 +10,7 @@ describe('byte-derived server video validation', () => {
   it('accepts actual 1080p cropped AVC within the primary playback envelope', async () => {
     expect(await inspectBackgroundVideo(fixture('valid-playback'), {maxWidth:1920,maxHeight:1080})).toMatchObject({ok:true,media:{width:1920,height:1080,fps:30}})
   })
-  it('accepts synthetic AVC output containing standard SVC prefix NALs', async () => {
+  it('accepts an actual Chromium WebCodecs AVC output containing standard prefix NALs', async () => {
     expect(await inspectBackgroundVideo(fixture('browser-avc-prefix'))).toMatchObject({ok:true,media:{width:320,height:180,fps:30,durationMs:1000}})
   })
   it.each(['over-fps','over-size','with-audio'])('rejects %s without trusting browser metadata', async name => {

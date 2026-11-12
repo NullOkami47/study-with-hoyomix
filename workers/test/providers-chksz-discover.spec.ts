@@ -6,6 +6,8 @@ import type { D1Database } from '../env'
 import type { ProviderEnv } from '../providers/config'
 import { createProviderHandler } from '../providers/routes'
 import { discoverChkszTrack } from '../providers/chkszDiscoveryService'
+import { issueSession } from '../auth/session'
+import { computeCanonicalMetadataFingerprint, isChkszDenied, RUNTIME_DENYLIST } from '../../src/shared/chkszDiscovery'
 
 const MIGRATIONS_DIRECTORY = resolve(process.cwd(), 'migrations')
 
@@ -64,6 +66,21 @@ const discoverRequest = (
   })
 }
 
+// Wave F deliberate update (M-05, decision D4): the owner key is spent only for a signed-in
+// session. Each owner-key request below carries a fresh listener's session and a distinct client
+// address, so the per-account and per-address owner-key budget never couples tests. Requests
+// without a session are covered by the M-05 test (401 chksz_key_required).
+let listenerSequence = 0
+const signedInHeaders = async (): Promise<Record<string, string>> => {
+  const userId = `discover-listener-${++listenerSequence}`
+  await database.prepare(`
+    INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES (?, ?, 'user', 0, 0)
+  `).bind(userId, userId).run()
+  const issued = await issueSession(database as never, userId,
+    'session-secret-at-least-thirty-two-bytes', Date.now(), crypto)
+  return { cookie: `__Host-session=${issued.token}`, 'cf-connecting-ip': `198.51.100.${listenerSequence}` }
+}
+
 describe('POST /api/providers/chksz/discover', () => {
   miniflare = new Miniflare({
     compatibilityDate: '2025-12-01',
@@ -108,9 +125,10 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('rejects request with missing title when track not in catalogue_tracks', async () => {
+    const listener = await signedInHeaders()
     const handler = createProviderHandler(providerEnv())
     const response = await handler.fetch(
-      discoverRequest({ trackId: 'nonexistent-track', metadata: {} }),
+      discoverRequest({ trackId: 'nonexistent-track', metadata: {} }, listener),
     )
     expect(response.status).toBe(400)
     const body = (await response.json()) as { error: string }
@@ -118,6 +136,7 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('performs dynamic search, writes active discovery to D1, and caches subsequent calls', async () => {
+    const listener = await signedInHeaders()
     const searchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input))
       expect(url.origin).toBe('https://api.chksz.com')
@@ -155,7 +174,7 @@ describe('POST /api/providers/chksz/discover', () => {
           vocalStatus: 'uncertain',
           duration_s: 180,
         },
-      }),
+      }, listener),
     )
 
     expect(res1.status).toBe(200)
@@ -185,7 +204,7 @@ describe('POST /api/providers/chksz/discover', () => {
           vocalStatus: 'uncertain',
           duration_s: 180,
         },
-      }),
+      }, listener),
     )
 
     expect(res2.status).toBe(200)
@@ -196,6 +215,23 @@ describe('POST /api/providers/chksz/discover', () => {
     expect(searchMock).toHaveBeenCalledTimes(1) // Still 1!
   })
 
+  // Wave F exploration (task 21, design Property 8, M-05, decision D4). Expected to FAIL on the
+  // unfixed tree: a forged public Origin without a session spends the owner key on a search.
+  it('M-05: gives a forged-Origin discover request without a session no owner key (401 chksz_key_required)', async () => {
+    const searchMock = vi.fn(async () => new Response(
+      JSON.stringify({ code: 200, data: { songs: [{ id: 246813579, name: 'Forged Origin Song', artists: 'HOYO-MiX', duration: 90000 }] } }),
+      { headers: { 'content-type': 'application/json' } },
+    ))
+    const handler = createProviderHandler(providerEnv(), { fetch: searchMock as unknown as typeof fetch })
+    const res = await handler.fetch(discoverRequest({
+      trackId: 'm05-forged-origin-track',
+      metadata: { title: 'Forged Origin Song', vocalStatus: 'uncertain', duration_s: 90 },
+    }))
+    expect(res.status).toBe(401)
+    expect(await res.json()).toEqual({ error: 'chksz_key_required' })
+    expect(searchMock).not.toHaveBeenCalled()
+    expect(await database.prepare('SELECT COUNT(*) AS count FROM chksz_discovery_rate_events').first('count')).toBe(0)
+  })
   it('uses user key when x-chksz-api-key is supplied', async () => {
     const searchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input))
@@ -225,39 +261,35 @@ describe('POST /api/providers/chksz/discover', () => {
     expect(searchMock).toHaveBeenCalledTimes(1)
   })
 
-  it('refuses discovery for denylisted pair', async () => {
-    const searchMock = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          code: 200,
-          data: {
-            songs: [
-              {
-                id: 2100334024, // Denylisted for genshin-la-vaguelette
-                name: 'La vaguelette',
-                artists: 'HOYO-MiX',
-                duration: 149520,
-              },
-            ],
-          },
-        }),
-        { headers: { 'content-type': 'application/json' } },
-      ),
-    )
-
-    const handler = createProviderHandler(providerEnv(), { fetch: searchMock as unknown as typeof fetch })
-    const res = await handler.fetch(
-      discoverRequest({
-        trackId: 'genshin-la-vaguelette',
-        metadata: { title: 'La vaguelette', vocalStatus: 'vocal' },
-      }),
-    )
-
-    // Should return 503 unavailable because candidate 2100334024 is denylisted
-    expect(res.status).toBe(503)
+  it('refuses a denied active catalogue binding before searching upstream', async () => {
+    const pair = RUNTIME_DENYLIST.entries[0]
+    if (!pair) throw new Error('Reviewed denial policy must contain a pair')
+    expect(isChkszDenied(pair.canonical_track_id, pair.provider_external_id).blocked).toBe(true)
+    const listener = await signedInHeaders()
+    const searchMock = vi.fn(async () => { throw new Error('A denied binding must not search upstream') })
+    await database.prepare('INSERT INTO catalogue_tracks (track_id,title,vocal_status,work_group_id,created_at,updated_at,published_at) VALUES (?,?,?,?,0,0,0)')
+      .bind(pair.canonical_track_id, 'Synthetic denied-source fixture', 'instrumental', 'synthetic-denial-work').run()
+    try {
+      await database.prepare('INSERT INTO catalogue_sources (source_row_id,track_id,provider,external_id,source_status,created_at,updated_at) VALUES (?,?,?,?,?,0,0)')
+        .bind('denied-static-fixture', pair.canonical_track_id, 'chksz', pair.provider_external_id, 'active').run()
+      await expect(discoverChkszTrack(pair.canonical_track_id, { title: 'Synthetic denied-source fixture' },
+        'synthetic-test-key', database, { fetch: searchMock }))
+        .resolves.toEqual({ ok: false, error: 'denylisted', source: 'static' })
+      const handler = createProviderHandler(providerEnv(), { fetch: searchMock })
+      const response = await handler.fetch(discoverRequest({
+        trackId: pair.canonical_track_id, metadata: { title: 'Synthetic denied-source fixture', vocalStatus: 'instrumental' },
+      }, listener))
+      expect(response.status).toBe(403)
+      expect(await response.json()).toEqual({ error: 'unavailable' })
+      expect(searchMock).not.toHaveBeenCalled()
+    } finally {
+      await database.prepare('DELETE FROM catalogue_sources WHERE source_row_id = ?').bind('denied-static-fixture').run()
+      await database.prepare('DELETE FROM catalogue_tracks WHERE track_id = ?').bind(pair.canonical_track_id).run()
+    }
   })
 
   it('records negative cache and returns 503 for no-match', async () => {
+    const listener = await signedInHeaders()
     const searchMock = vi.fn(async () =>
       new Response(
         JSON.stringify({
@@ -273,7 +305,7 @@ describe('POST /api/providers/chksz/discover', () => {
       discoverRequest({
         trackId: 'unmatched-track',
         metadata: { title: 'Totally Nonexistent Song', vocalStatus: 'instrumental' },
-      }),
+      }, listener),
     )
 
     expect(res.status).toBe(503)
@@ -294,13 +326,14 @@ describe('POST /api/providers/chksz/discover', () => {
       discoverRequest({
         trackId: 'unmatched-track',
         metadata: { title: 'Totally Nonexistent Song', vocalStatus: 'instrumental' },
-      }),
+      }, listener),
     )
     expect(res2.status).toBe(503)
     expect(searchMock).toHaveBeenCalledTimes(1)
   })
 
   it('coalesces concurrent in-flight discoveries for the same track into 1 fetch', async () => {
+    const listener = await signedInHeaders()
     let callCount = 0
     const searchMock = vi.fn(async () => {
       callCount++
@@ -319,9 +352,9 @@ describe('POST /api/providers/chksz/discover', () => {
     const handler = createProviderHandler(providerEnv(), { fetch: searchMock as unknown as typeof fetch })
 
     const [p1, p2, p3] = await Promise.all([
-      handler.fetch(discoverRequest({ trackId: 'concurrent-track', metadata: { title: 'Concurrent Song', vocalStatus: 'uncertain', duration_s: 60 } })),
-      handler.fetch(discoverRequest({ trackId: 'concurrent-track', metadata: { title: 'Concurrent Song', vocalStatus: 'uncertain', duration_s: 60 } })),
-      handler.fetch(discoverRequest({ trackId: 'concurrent-track', metadata: { title: 'Concurrent Song', vocalStatus: 'uncertain', duration_s: 60 } })),
+      handler.fetch(discoverRequest({ trackId: 'concurrent-track', metadata: { title: 'Concurrent Song', vocalStatus: 'uncertain', duration_s: 60 } }, listener)),
+      handler.fetch(discoverRequest({ trackId: 'concurrent-track', metadata: { title: 'Concurrent Song', vocalStatus: 'uncertain', duration_s: 60 } }, listener)),
+      handler.fetch(discoverRequest({ trackId: 'concurrent-track', metadata: { title: 'Concurrent Song', vocalStatus: 'uncertain', duration_s: 60 } }, listener)),
     ])
 
     expect(p1.status).toBe(200)
@@ -331,6 +364,7 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('enforces D1 global rate limit when 15 events occur within 60s, returning 429 with retry-after', async () => {
+    const listener = await signedInHeaders()
     const searchMock = vi.fn(async () => {
       return new Response(
         JSON.stringify({
@@ -359,7 +393,7 @@ describe('POST /api/providers/chksz/discover', () => {
       discoverRequest({
         trackId: 'rate-limited-track',
         metadata: { title: 'Rate Safe Song', vocalStatus: 'uncertain', duration_s: 120 },
-      }),
+      }, listener),
     )
 
     expect(res.status).toBe(429)
@@ -371,6 +405,7 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('coalesces cross-isolate searches via track lock and D1 cache polling without duplicate upstream fetch', async () => {
+    const listener = await signedInHeaders()
     const searchMock = vi.fn(async () => {
       return new Response(
         JSON.stringify({
@@ -417,7 +452,7 @@ describe('POST /api/providers/chksz/discover', () => {
       discoverRequest({
         trackId: 'cross-isolate-track',
         metadata: { title: 'Cross Isolate Song', vocalStatus: 'uncertain', duration_s: 90 },
-      }),
+      }, listener),
     )
 
     expect(res.status).toBe(200)
@@ -429,6 +464,7 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('rejects HIGH_CONFIDENCE matches from runtime active use (fails closed to 503)', async () => {
+    const listener = await signedInHeaders()
     // Return a candidate that only reaches HIGH_CONFIDENCE (e.g. acceptable duration, not exact/near)
     const searchMock = vi.fn(async () => {
       return new Response(
@@ -447,7 +483,7 @@ describe('POST /api/providers/chksz/discover', () => {
       discoverRequest({
         trackId: 'high-conf-track',
         metadata: { title: 'High Conf Song', vocalStatus: 'uncertain', duration_s: 100 },
-      }),
+      }, listener),
     )
 
     expect(res.status).toBe(503)
@@ -463,18 +499,25 @@ describe('POST /api/providers/chksz/discover', () => {
     expect(row?.match_confidence).toBe('HIGH_CONFIDENCE')
   })
 
-  it('does not return a cached File 90 ID after that provider pair is deny-listed', async () => {
-    const trackId = 'zzz-shining-promise-in-the-sky-of-dawn'
+  it.each(['1997387229', '2691982296'])('does not return a cached File 90 ID after that provider pair is deny-listed (%s)', async (externalId) => {
+    const listener = await signedInHeaders()
+    const pair = RUNTIME_DENYLIST.entries.find(entry =>
+      entry.canonical_track_id === 'zzz-shining-promise-in-the-sky-of-dawn'
+      && entry.provider_external_id === externalId)
+    if (!pair) throw new Error('Reviewed File 90 denial policy must retain this incident pair')
+    const trackId = pair.canonical_track_id
+    const metadata = { title: 'Synthetic denied cached identity', vocalStatus: 'vocal', aliases: [] }
     const now = Date.now()
-    await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES (?, 'chksz', '1997387229', 'EXACT', 'chksz-identity-v1', ?, '{}', ?, ?, 'active', NULL, ?)").bind(trackId, 'fp_chksz-identity-v1_988e0d37', now - 1000, now - 1000, now + 60_000).run()
+    expect(isChkszDenied(trackId, pair.provider_external_id).blocked).toBe(true)
+    await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES (?, 'chksz', ?, 'EXACT', 'chksz-identity-v1', ?, '{}', ?, ?, 'active', NULL, ?)").bind(trackId, pair.provider_external_id, computeCanonicalMetadataFingerprint(metadata), now - 1000, now - 1000, now + 60_000).run()
 
     const before = await database.prepare("SELECT rowid AS rowId, last_verified_at AS lastVerifiedAt FROM chksz_dynamic_discoveries WHERE canonical_track_id = ?").bind(trackId).first<{ rowId: number; lastVerifiedAt: number }>()
     const searchMock = vi.fn(async () => new Response('{}'))
     const handler = createProviderHandler(providerEnv(), { fetch: searchMock as unknown as typeof fetch })
     const response = await handler.fetch(discoverRequest({
       trackId,
-      metadata: { title: 'Shining Promise in the Sky of Dawn', vocalStatus: 'vocal', aliases: [] },
-    }))
+      metadata,
+    }, listener))
 
     expect(response.status).toBe(403)
     expect(searchMock).toHaveBeenCalledTimes(0)
@@ -489,33 +532,35 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('serves the independently verified File 90 cache when its current-client fingerprint matches', async () => {
-    const trackId = 'zzz-shining-promise-in-the-sky-of-dawn'
+    const listener = await signedInHeaders()
+    const trackId = 'demo-zzz-language-sibling'
     const now = Date.now()
-    await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES (?, 'chksz', '2691982297', 'EXACT', 'chksz-identity-v1', 'fp_chksz-identity-v1_988e0d37', '{\"identity_audit\":\"verified\"}', ?, ?, 'active', NULL, ?)").bind(trackId, now - 1000, now, now + 60_000).run()
+    await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES (?, 'chksz', '9000000011', 'EXACT', 'chksz-identity-v1', 'fp_chksz-identity-v1_988e0d37', '{\"identity_audit\":\"verified\"}', ?, ?, 'active', NULL, ?)").bind(trackId, now - 1000, now, now + 60_000).run()
 
     const searchMock = vi.fn(async () => new Response('{}'))
     const handler = createProviderHandler(providerEnv(), { fetch: searchMock as unknown as typeof fetch })
     const response = await handler.fetch(discoverRequest({
       trackId,
       metadata: { title: 'Shining Promise in the Sky of Dawn', vocalStatus: 'vocal', aliases: [] },
-    }))
+    }, listener))
 
     expect(response.status).toBe(200)
     const body = await response.json() as { externalId: string; confidence: string; source: string }
-    expect(body).toEqual({ ok: true, externalId: '2691982297', confidence: 'EXACT', source: 'cache' })
+    expect(body).toEqual({ ok: true, externalId: '9000000011', confidence: 'EXACT', source: 'cache' })
     expect(searchMock).toHaveBeenCalledTimes(0)
   })
 
   it('revalidates a File 90 cache fingerprint that predates the current client metadata', async () => {
-    const trackId = 'zzz-shining-promise-in-the-sky-of-dawn'
+    const listener = await signedInHeaders()
+    const trackId = 'demo-zzz-language-sibling'
     const now = Date.now()
-    await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES (?, 'chksz', '2691982297', 'EXACT', 'chksz-identity-v1', ?, '{}', ?, ?, 'active', NULL, ?)").bind(trackId, 'fp_chksz-identity-v1_cde206cc', now - 1000, now - 1000, now + 60_000).run()
+    await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES (?, 'chksz', '9000000011', 'EXACT', 'chksz-identity-v1', ?, '{}', ?, ?, 'active', NULL, ?)").bind(trackId, 'fp_chksz-identity-v1_cde206cc', now - 1000, now - 1000, now + 60_000).run()
 
     const before = await database.prepare("SELECT rowid AS rowId FROM chksz_dynamic_discoveries WHERE canonical_track_id = ?").bind(trackId).first<{ rowId: number }>()
     const searchMock = vi.fn(async () => new Response(JSON.stringify({
       code: 200,
       data: { songs: [{
-        id: 2691982297,
+        id: 9000000011,
         name: 'Shining Promise in the Sky of Dawn',
         artists: '三Z-STUDIO/HOYO-MiX',
         album: '绝区零-拂晓之空 闪耀之誓',
@@ -526,7 +571,7 @@ describe('POST /api/providers/chksz/discover', () => {
     const response = await handler.fetch(discoverRequest({
       trackId,
       metadata: { title: 'Shining Promise in the Sky of Dawn', vocalStatus: 'vocal', aliases: [] },
-    }))
+    }, listener))
 
     expect(response.status).toBe(503)
     const body = await response.json() as { error: string }
@@ -534,7 +579,7 @@ describe('POST /api/providers/chksz/discover', () => {
     expect(searchMock).toHaveBeenCalledTimes(1)
     const row = await database.prepare("SELECT rowid AS rowId, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, status FROM chksz_dynamic_discoveries WHERE canonical_track_id = ?").bind(trackId).first<{ rowId: number; provider_external_id: string | null; match_confidence: string; matcher_version: string; canonical_metadata_fingerprint: string; status: string }>()
     expect(row?.rowId).toBe(before?.rowId)
-    expect(row?.provider_external_id).toBe('2691982297')
+    expect(row?.provider_external_id).toBe('9000000011')
     expect(row?.match_confidence).toBe('HIGH_CONFIDENCE')
     expect(row?.matcher_version).toBe('chksz-identity-v1')
     expect(row?.canonical_metadata_fingerprint).not.toBe('fp_chksz-identity-v1_cde206cc')
@@ -542,6 +587,7 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
   it('revalidates a cached match produced by a different matcher version', async () => {
+    const listener = await signedInHeaders()
     const now = Date.now()
     await database.prepare("INSERT INTO chksz_dynamic_discoveries (canonical_track_id, provider, provider_external_id, match_confidence, matcher_version, canonical_metadata_fingerprint, evidence_json, discovered_at, last_verified_at, status, failure_reason, expires_at) VALUES ('old-matcher-cache-track', 'chksz', '999888777', 'EXACT', 'chksz-identity-v0', ?, '{}', ?, ?, 'active', NULL, ?)").bind('fp_chksz-identity-v1_3ba539e9', now - 1000, now - 1000, now + 60_000).run()
 
@@ -553,7 +599,7 @@ describe('POST /api/providers/chksz/discover', () => {
     const response = await handler.fetch(discoverRequest({
       trackId: 'old-matcher-cache-track',
       metadata: { title: 'Versioned Cache Song', vocalStatus: 'uncertain', duration_s: 120, aliases: [] },
-    }))
+    }, listener))
 
     expect(response.status).toBe(200)
     const body = await response.json() as { externalId: string; source: string }
@@ -586,3 +632,4 @@ describe('POST /api/providers/chksz/discover', () => {
   })
 
 })
+

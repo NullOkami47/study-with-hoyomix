@@ -7,7 +7,7 @@ const CHKSZ_KEY = 'test-secret-chksz-api-key'
 const JELLYFIN_TOKEN = 'test-secret-jellyfin-token'
 const JELLYFIN_USER = '0123456789abcdef0123456789abcdef'
 const JELLYFIN_ORIGIN = 'https://jellyfin.example'
-const VALID_JELLYFIN_ID = '1234abcda0d954293110f4d561b0f614'
+const VALID_JELLYFIN_ID = '6213b704a0d954293110f4d561b0f614'
 const VALID_CHKSZ_ARTWORK_URL = 'https://p1.music.126.net/valid-artwork.jpg'
 
 const createMockDb = (providerOverrides: Record<string, { enabled?: number }> = {}) => ({
@@ -77,10 +77,8 @@ describe('Top-level Worker provider artwork proxy ingress routing', () => {
     vi.useRealTimers()
   })
 
-  it.each([
-    ['chksz', `/api/providers/chksz/artwork?url=${encodeURIComponent(VALID_CHKSZ_ARTWORK_URL)}`],
-    ['jellyfin', `/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`],
-  ])('%s artwork waits beyond metadata timeout but aborts at artwork timeout', async (_provider, path) => {
+  it('ChKSz artwork waits beyond metadata timeout but aborts at artwork timeout', async () => {
+    const path = `/api/providers/chksz/artwork?url=${encodeURIComponent(VALID_CHKSZ_ARTWORK_URL)}`
     vi.useFakeTimers()
     const fetchSpy = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
@@ -335,119 +333,34 @@ describe('Top-level Worker provider artwork proxy ingress routing', () => {
     })
   })
 
-  describe('Jellyfin artwork proxy ingress', () => {
-    const samplePng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
-
-    it.each(['GET', 'HEAD'])('bounds both item and album artwork dimensions with %s', async (method) => {
-      const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-        const requested = new URL(String(input))
-        const bounded = requested.searchParams.get('maxWidth') === '512' &&
-          requested.searchParams.get('maxHeight') === '512'
-        return new Response(method === 'HEAD' ? null : samplePng, {
-          headers: {
-            'content-type': 'image/png',
-            'content-length': String(bounded ? samplePng.length : 17_600_336),
-          },
-        })
-      })
+  describe('Retired Jellyfin artwork proxy ingress', () => {
+    it.each(['GET', 'HEAD'])('returns 503 for retired item and album artwork with %s without upstream requests', async (method) => {
+      const fetchSpy = vi.fn()
       globalThis.fetch = fetchSpy as unknown as typeof fetch
+      // Existing legacy credentials and an enabled database row must not restore Jellyfin.
       for (const imageId of [VALID_JELLYFIN_ID, '0123456789abcdef0123456789abcdef']) {
         const response = await worker.fetch(new Request(
           `${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${imageId}`, { method },
         ), createTestEnv())
-        expect(response.status).toBe(200)
-        const requested = new URL(String(fetchSpy.mock.calls.at(-1)![0]))
-        expect(requested.origin).toBe(JELLYFIN_ORIGIN)
-        expect(requested.pathname).toBe(`/Items/${imageId}/Images/Primary`)
-        expect([...requested.searchParams.entries()]).toEqual([
-          ['maxWidth', '512'], ['maxHeight', '512'],
-        ])
-        if (method === 'HEAD') expect(response.body).toBeNull()
-        else expect(new Uint8Array(await response.arrayBuffer())).toEqual(samplePng)
+        expect(response.status).toBe(503)
+        expect(response.headers.get('cache-control')).toBe('no-store')
+        expect(await response.json()).toEqual({ error: 'unavailable' })
       }
-      expect(fetchSpy).toHaveBeenCalledTimes(2)
+      expect(fetchSpy).not.toHaveBeenCalled()
     })
 
-    it('routes /api/providers/jellyfin/artwork/<valid-id> to provider handler and streams image', async () => {
-      const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        expect(String(input)).toBe(`${JELLYFIN_ORIGIN}/Items/${VALID_JELLYFIN_ID}/Images/Primary?maxWidth=512&maxHeight=512`)
-        expect(init?.method).toBe('GET')
-        const headers = new Headers(init?.headers)
-        expect(headers.get('authorization')).toBe(`MediaBrowser Token="${JELLYFIN_TOKEN}"`)
-        return new Response(samplePng, {
-          status: 200,
-          headers: {
-            'content-type': 'image/png',
-            'content-length': String(samplePng.byteLength),
-          },
-        })
-      })
+    it('keeps canonical hyphenated item IDs retired without upstream requests', async () => {
+      const hyphenatedId = '6213b704-a0d9-5429-3110-f4d561b0f614'
+      const fetchSpy = vi.fn()
       globalThis.fetch = fetchSpy as unknown as typeof fetch
 
-      const env = createTestEnv()
-      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`)
+      const response = await worker.fetch(new Request(
+        `${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${hyphenatedId}`,
+      ), createTestEnv())
 
-      const response = await worker.fetch(request, env)
-
-      expect(response.status).toBe(200)
-      expect(response.headers.get('content-type')).toBe('image/png')
-      expect(response.headers.get('content-length')).toBe(String(samplePng.byteLength))
-      expect(response.headers.get('cache-control')).toBe('public, max-age=3600')
-      expect(response.headers.get('x-content-type-options')).toBe('nosniff')
-      expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-      expect(response.headers.get('referrer-policy')).toBe('no-referrer')
-
-      const bodyBytes = new Uint8Array(await response.arrayBuffer())
-      expect(bodyBytes).toEqual(samplePng)
-      expect(fetchSpy).toHaveBeenCalledOnce()
-    })
-
-    it('accepts canonical hyphenated UUID format for item ID', async () => {
-      const hyphenatedId = '1234abcd-a0d9-5429-3110-f4d561b0f614'
-      const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-        expect(String(input)).toBe(`${JELLYFIN_ORIGIN}/Items/${VALID_JELLYFIN_ID}/Images/Primary?maxWidth=512&maxHeight=512`)
-        return new Response(samplePng, {
-          status: 200,
-          headers: { 'content-type': 'image/png' },
-        })
-      })
-      globalThis.fetch = fetchSpy as unknown as typeof fetch
-
-      const env = createTestEnv()
-      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${hyphenatedId}`)
-
-      const response = await worker.fetch(request, env)
-      expect(response.status).toBe(200)
-      expect(response.headers.get('content-type')).toBe('image/png')
-      expect(fetchSpy).toHaveBeenCalledOnce()
-    })
-
-    it('supports HEAD method cleanly with 200 and no body', async () => {
-      const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        expect(String(input)).toBe(`${JELLYFIN_ORIGIN}/Items/${VALID_JELLYFIN_ID}/Images/Primary?maxWidth=512&maxHeight=512`)
-        expect(init?.method).toBe('HEAD')
-        return new Response(null, {
-          status: 200,
-          headers: {
-            'content-type': 'image/png',
-            'content-length': '2048',
-          },
-        })
-      })
-      globalThis.fetch = fetchSpy as unknown as typeof fetch
-
-      const env = createTestEnv()
-      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`, {
-        method: 'HEAD',
-      })
-
-      const response = await worker.fetch(request, env)
-
-      expect(response.status).toBe(200)
-      expect(response.headers.get('content-type')).toBe('image/png')
-      expect(response.headers.get('content-length')).toBe('2048')
-      expect(response.body).toBeNull()
-      expect(fetchSpy).toHaveBeenCalledOnce()
+      expect(response.status).toBe(503)
+      expect(await response.json()).toEqual({ error: 'unavailable' })
+      expect(fetchSpy).not.toHaveBeenCalled()
     })
 
     it('rejects unsupported methods with 405 method_not_allowed from provider handler', async () => {
@@ -467,6 +380,8 @@ describe('Top-level Worker provider artwork proxy ingress routing', () => {
     })
 
     it('reaches provider handler and returns 400 for invalid item IDs', async () => {
+      const fetchSpy = vi.fn()
+      globalThis.fetch = fetchSpy as unknown as typeof fetch
       const env = createTestEnv()
       for (const badId of ['not-a-hex-id', '123', 'a'.repeat(33), '..%2Fpasswd']) {
         const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${badId}`)
@@ -474,40 +389,29 @@ describe('Top-level Worker provider artwork proxy ingress routing', () => {
         expect(response.status).toBe(400)
         expect(await response.json()).toEqual({ error: 'invalid_response' })
       }
+      expect(fetchSpy).not.toHaveBeenCalled()
     })
 
-    it('reaches provider handler and returns 404 when upstream image is not found', async () => {
-      const fetchSpy = vi.fn(async () => new Response('Not found', { status: 404 }))
+    it('does not leak legacy credentials or upstream URL in the retired response', async () => {
+      const fetchSpy = vi.fn()
       globalThis.fetch = fetchSpy as unknown as typeof fetch
 
-      const env = createTestEnv()
-      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`)
-      const response = await worker.fetch(request, env)
+      const response = await worker.fetch(new Request(
+        `${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`,
+      ), createTestEnv())
 
-      expect(response.status).toBe(404)
-      expect(await response.json()).toEqual({ error: 'not_found' })
-    })
-
-    it('does not leak Jellyfin API token or upstream URL to the client', async () => {
-      const fetchSpy = vi.fn(async () => new Response(samplePng, {
-        status: 200,
-        headers: {
-          'content-type': 'image/png',
-          'set-cookie': 'jellyfin-session=token',
-        },
-      }))
-      globalThis.fetch = fetchSpy as unknown as typeof fetch
-
-      const env = createTestEnv()
-      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`)
-      const response = await worker.fetch(request, env)
-
-      expect(response.status).toBe(200)
-      const allHeaders = JSON.stringify([...response.headers.entries()])
-      expect(allHeaders).not.toContain(JELLYFIN_TOKEN)
-      expect(allHeaders).not.toContain(JELLYFIN_ORIGIN)
+      expect(response.status).toBe(503)
+      expect(await response.clone().json()).toEqual({ error: 'unavailable' })
+      const serialized = JSON.stringify([...response.headers.entries()]) + await response.text()
+      expect(serialized).not.toContain(JELLYFIN_TOKEN)
+      expect(serialized).not.toContain(JELLYFIN_ORIGIN)
       expect(response.headers.get('authorization')).toBeNull()
       expect(response.headers.get('set-cookie')).toBeNull()
+      expect(response.headers.get('cache-control')).toBe('no-store')
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff')
+      expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+      expect(response.headers.get('referrer-policy')).toBe('no-referrer')
+      expect(fetchSpy).not.toHaveBeenCalled()
     })
   })
 
@@ -623,10 +527,13 @@ describe('Top-level Worker provider artwork proxy ingress routing', () => {
       globalThis.fetch = fetchSpy as unknown as typeof fetch
 
       const env = createTestEnv()
-      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/jellyfin/artwork/${VALID_JELLYFIN_ID}`)
+      const request = new Request(`${PUBLIC_ORIGIN}/api/providers/chksz/artwork?url=${encodeURIComponent(VALID_CHKSZ_ARTWORK_URL)}`)
       const response = await worker.fetch(request, env)
 
       expect(response.status).toBe(200)
+      expect(response.headers.get('content-type')).toBe('image/webp')
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(sampleWebp)
+      expect(fetchSpy).toHaveBeenCalledOnce()
       // Same-origin response served directly from the Worker host:
       // Enables client browser to consume artwork via same-origin <img> src matching 'self'
       expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")

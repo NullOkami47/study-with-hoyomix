@@ -11,6 +11,7 @@ const gate = workflow.split('  gate:\n')[1] ?? ''
 const commands = [
   'node --test scripts/public-ci.test.mjs',
   'npm ci --no-audit --no-fund',
+  'npm run test:lx-policy-native',
   'npm run typecheck',
   'npm test',
   'npm run test:workers -- --maxWorkers=2',
@@ -111,3 +112,22 @@ test('frontend invocation preserves the existing single worker limit', () => {
   assert.match(verify, /run: npm test\n/);
   assert.doesNotMatch(verify, /run: npm test --/);
 });
+
+
+test('the portable LX policy regression suite is a real mandatory command', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(pkg.scripts['test:lx-policy-native'],
+    'node --experimental-vm-modules --test --test-concurrency=1 src/features/player/lx/globalSourceRepository.native-tests.mjs')
+  assert.ok(existsSync(new URL('../src/features/player/lx/globalSourceRepository.native-tests.mjs', import.meta.url)))
+  assert.ok(verify.includes("'src/features/player/lx/globalSourceRepository.native-tests.mjs'"), 'Native test input must be hashed before execution')
+})
+
+
+test('the public build uses verification-only explicit response policy without operator files', () => {
+  const buildStep = verify.split('name: Build the public app\n')[1]?.split('\n      - name:')[0] ?? ''
+  assert.match(buildStep, /RESPONSE_POLICY_PUBLIC_ORIGIN: 'https:\/\/public-ci\.example\.invalid'/)
+  assert.match(buildStep, /RESPONSE_POLICY_R2_BASE_URL: 'https:\/\/media\.public-ci\.example\.invalid\/'/)
+  assert.match(buildStep, /LX_ALLOWED_ORIGINS: ''/)
+  assert.match(buildStep, /run: npm run build/)
+  assert.doesNotMatch(buildStep, /--mode|--allow-unknown|wrangler\.(?:remote|staging)|secrets\./)
+})

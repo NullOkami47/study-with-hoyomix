@@ -13,6 +13,8 @@ import {
   type ProviderAttempt,
 } from './providers/types'
 import { resolveTrack } from './resolver'
+import { createVkeysProvider } from './providers/vkeys'
+import { hasHandoverTicketMargin, isPreparationFresh } from './store'
 
 const track: Track = {
   id: 'track-test',
@@ -65,6 +67,58 @@ afterEach(() => {
 })
 
 describe('ProviderRegistry', () => {
+  it('times out a manual external resolution at its configured timeout without recovering through Jellyfin', async () => {
+    // D15 = A / D16 = No (task 8.1): the resolver is F0 again; a manual override runs alone with its
+    // own timeout, and the in-resolver Jellyfin recovery (jellyfinRecoveryTimeoutMs) no longer exists.
+    vi.useFakeTimers()
+    const external = provider('lx', vi.fn<AudioProvider['resolve']>(() => new Promise(() => {})))
+    const jellyfin = provider('jellyfin', vi.fn(async () => ({ kind: 'audio' as const, url: '/own.flac', mimeType: 'audio/flac' })))
+    const mapped = { ...track, sources: [{ provider: 'lx', externalId: 'lx' }, { provider: 'jellyfin', externalId: 'own' }] }
+    const registry = new ProviderRegistry([registration(external, { timeoutMs: 20_000 }), registration(jellyfin)])
+    let settled = false
+    const pending = resolveTrack(mapped, registry, { sourceOverride: 'lx' }).finally(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(7_000)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(13_000)
+    const result = await pending
+    expect(result.ok).toBe(false)
+    expect(result.attempts.map(({ providerId, code }) => [providerId, code])).toEqual([['lx', 'timeout']])
+    expect(external.resolve).toHaveBeenCalledOnce()
+    expect(jellyfin.resolve).not.toHaveBeenCalled()
+  })
+  it.each(['excluded', 'manual-only'])('does not recover automatically through %s Jellyfin', async (policy) => {
+    const external = provider('lx', async () => null)
+    const ownResolve = vi.fn(async () => ({ kind: 'audio' as const, url: '/own.flac', mimeType: 'audio/flac' }))
+    const mapped = { ...track, sources: [{ provider: 'lx', externalId: 'lx' }, { provider: 'jellyfin', externalId: 'own' }] }
+    const registry = new ProviderRegistry([registration(external), registration(provider('jellyfin', ownResolve), {
+      automaticEligible: policy !== 'manual-only',
+    })])
+    // jellyfinRecoveryTimeoutMs was removed with the in-resolver recovery (task 8.1).
+    const result = await resolveTrack(mapped, registry, { sourceOverride: 'lx',
+      excludeProviderIds: policy === 'excluded' ? ['jellyfin'] : [] })
+    expect(result.ok).toBe(false)
+    expect(ownResolve).not.toHaveBeenCalled()
+    if (policy === 'manual-only') {
+      expect((await resolveTrack(mapped, registry, { sourceOverride: 'jellyfin' })).ok).toBe(true)
+    }
+  })
+
+  it('continues automatic providers after Jellyfin fails in its configured place', async () => {
+    // Task 8.1: no jellyfinRecoveryTimeoutMs; Jellyfin is tried once, at its configured priority.
+    const ownResolve = vi.fn(async () => null)
+    const mapped = { ...track, sources: [{ provider: 'lx', externalId: 'lx' }, { provider: 'jellyfin', externalId: 'own' },
+      { provider: 'youtube', externalId: 'abcdefghijk' }] }
+    const registry = new ProviderRegistry([
+      registration(provider('lx', async () => null), { priority: 1 }),
+      registration(provider('jellyfin', ownResolve), { priority: 2 }),
+      registration(provider('youtube', async () => youtubePlayable), { priority: 3 }),
+    ])
+    const result = await resolveTrack(mapped, registry)
+    expect(result.ok && result.providerId).toBe('youtube')
+    expect(result.attempts.map(({ providerId }) => providerId)).toEqual(['lx', 'jellyfin', 'youtube'])
+    expect(ownResolve).toHaveBeenCalledOnce()
+  })
+
   it.each([
     [
       'a non-boolean enabled flag',
@@ -803,5 +857,83 @@ describe('deterministic provider chain with user exclusions', () => {
 
     expect(result.ok).toBe(false)
     expect(calls).toEqual([])
+  })
+})
+
+
+describe('audio ticket expiry normalisation', () => {
+  const audio = { kind: 'audio' as const, url: 'https://media.invalid/ticket.mp3', mimeType: 'audio/mpeg' }
+
+  it.each([1, 1_800_000_045_000, Number.MAX_SAFE_INTEGER])('preserves the exact positive safe epoch value %s without extending it', async expiresAt => {
+    const registry = new ProviderRegistry([
+      registration(provider('r2', async () => ({ ...audio, expiresAt }))),
+    ])
+    const result = await resolveTrack(track, registry)
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('expected an audio resolution')
+    expect(result.playable).toEqual({ ...audio, expiresAt })
+    expect(Object.keys(result.playable).sort()).toEqual(['expiresAt', 'kind', 'mimeType', 'url'])
+  })
+
+  it.each([
+    ['explicit undefined', undefined], ['null', null], ['string', '1800000045000'],
+    ['boolean', true], ['zero', 0], ['negative', -1], ['fraction', 1_800_000_045_000.5],
+    ['NaN', Number.NaN], ['positive infinity', Number.POSITIVE_INFINITY],
+    ['negative infinity', Number.NEGATIVE_INFINITY], ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+  ])('rejects %s expiry instead of silently granting legacy validity', async (_label, expiresAt) => {
+    const badResolve = vi.fn(async () => ({ ...audio, expiresAt } as Playable))
+    const registry = new ProviderRegistry([
+      registration(provider('r2', badResolve), { priority: 1 }),
+      registration(provider('youtube', async () => youtubePlayable), { priority: 2 }),
+    ])
+    const result = await resolveTrack(track, registry)
+    expect(result).toMatchObject({
+      ok: true, providerId: 'youtube', playable: youtubePlayable,
+      attempts: [
+        { providerId: 'r2', ok: false, code: 'invalid_response' },
+        { providerId: 'youtube', ok: true },
+      ],
+    })
+    expect(badResolve).toHaveBeenCalledOnce()
+    const manual = await resolveTrack(track, registry, { sourceOverride: 'r2' })
+    expect(manual).toMatchObject({
+      ok: false, code: 'exhausted',
+      attempts: [{ providerId: 'r2', ok: false, code: 'invalid_response' }],
+    })
+    expect(manual.attempts).toHaveLength(1)
+  })
+
+  it('keeps an omitted expiry absent and preserves the legacy preparation window', async () => {
+    const registry = new ProviderRegistry([registration(provider('r2', async () => audio))])
+    const result = await resolveTrack(track, registry)
+    if (!result.ok || result.playable.kind !== 'audio') throw new Error('expected an audio resolution')
+    expect(result.playable).toEqual(audio)
+    expect(result.playable).not.toHaveProperty('expiresAt')
+    const preparedAt = 1_800_000_000_000
+    const preparation = { id: 1, track, providerId: 'r2', playable: result.playable, generation: 1, preparedAt, armed: true }
+    expect(isPreparationFresh(preparation, undefined, preparedAt + 99_000)).toBe(true)
+    expect(isPreparationFresh(preparation, undefined, preparedAt + 100_001)).toBe(false)
+  })
+
+  it('carries a real Vkeys adapter response through the resolver into short-ticket freshness and margin checks', async () => {
+    const preparedAt = 1_800_000_000_000
+    const expiresAt = preparedAt + 45_000
+    const mapped: Track = { ...track, sources: [{ provider: 'vkeys', externalId: track.id }] }
+    const url = '/api/providers/vkeys/media/' + track.id + '/abcdefghijklmnopqrstuvwxyzABCDEF'
+    const response = Response.json({ url, mimeType: 'audio/mpeg', expiresAt })
+    Object.defineProperty(response, 'url', { value: window.location.origin + '/api/providers/vkeys/resolve' })
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response)
+    const registry = new ProviderRegistry([registration(createVkeysProvider({ fetch: fetchImpl }))])
+    const result = await resolveTrack(mapped, registry)
+    expect(result.ok).toBe(true)
+    if (!result.ok || result.playable.kind !== 'audio') throw new Error('expected Vkeys audio')
+    expect(result.playable).toEqual({ kind: 'audio', url: window.location.origin + url, mimeType: 'audio/mpeg', expiresAt })
+    const preparation = { id: 1, track: mapped, providerId: 'vkeys', playable: result.playable, generation: 1, preparedAt, armed: true }
+    expect(isPreparationFresh(preparation, undefined, preparedAt + 44_999)).toBe(true)
+    expect(isPreparationFresh(preparation, undefined, expiresAt)).toBe(false)
+    expect(hasHandoverTicketMargin(preparedAt, preparedAt + 15_000, result.playable.expiresAt)).toBe(true)
+    expect(hasHandoverTicketMargin(preparedAt, preparedAt + 15_001, result.playable.expiresAt)).toBe(false)
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(result.attempts).toMatchObject([{ providerId: 'vkeys', ok: true }])
   })
 })

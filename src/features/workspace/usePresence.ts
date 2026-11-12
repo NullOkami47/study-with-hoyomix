@@ -1,7 +1,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAccountSession } from '../account/session'
 
-/** One lifecycle per mounted FocusBar. Browser-local random ID deduplicates tabs; no fingerprint. */
+/** One lifecycle per mounted FocusBar. A server-issued, signed visitor cookie deduplicates tabs; no fingerprint. */
 export function usePresence() {
   const count = ref<number | null>(null)
   const ownerOnline = ref(false)
@@ -24,24 +24,27 @@ export function usePresence() {
     if (stopped || retry) return
     retry = setTimeout(() => { retry = undefined; void connect() }, Math.min(30_000, 1000 * 2 ** attempt++) + Math.random() * 500)
   }
+  // A WebSocket handshake failure hides its HTTP status (401 visitor_invalid, 429 connection_limit,
+  // 503 presence_unavailable all surface as a close before open). The first such failure since the
+  // last successful open re-bootstraps once at once, which replaces an invalid visitor cookie; any
+  // further failure waits for the exponential backoff, so a cap or outage never loops tightly.
+  let rebootstrapped = false
   const connect = async () => {
     const current = ++generation
     clear()
     if (stopped || typeof WebSocket === 'undefined') return
     try {
-      let visitor = ''
-      try {
-        visitor = localStorage.getItem('hoyomix-presence-visitor') ?? ''
-        if (!/^[a-f0-9-]{36}$/.test(visitor)) { visitor = crypto.randomUUID(); localStorage.setItem('hoyomix-presence-visitor', visitor) }
-      } catch { /* Server cookie still deduplicates tabs when storage is blocked. */ }
-      const response = await fetch('/api/presence/visitor', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'text/plain' }, body: visitor })
+      // The server issues and signs the HttpOnly visitor cookie; the browser never proposes an ID.
+      const response = await fetch('/api/presence/visitor', { method: 'POST', credentials: 'same-origin' })
       if (!response.ok) throw new Error('presence_unavailable')
       if (stopped || current !== generation) return
       const url = new URL('/api/presence', location.href)
       url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const active = new WebSocket(url)
       socket = active
+      let opened = false
       active.onopen = () => {
+        opened = true; rebootstrapped = false
         attempt = 0; lastMessage = Date.now()
         active.send('ping')
         active.send('refresh')
@@ -59,7 +62,12 @@ export function usePresence() {
           count.value = data.count!; ownerOnline.value = data.ownerOnline
         } catch { /* Untrusted messages cannot replace a valid aggregate. */ }
       }
-      active.onclose = active.onerror = () => { if (socket !== active) return; clear(); schedule() }
+      active.onclose = active.onerror = () => {
+        if (socket !== active) return
+        clear()
+        if (!opened && !rebootstrapped) { rebootstrapped = true; void connect(); return }
+        schedule()
+      }
     } catch { if (current === generation && !stopped) schedule() }
   }
   const refresh = () => { if (!stopped) void connect() }

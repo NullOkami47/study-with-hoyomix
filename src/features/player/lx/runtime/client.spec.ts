@@ -2,6 +2,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { LxRuntimeClient } from './client'
 import { setupWorkerHandler } from './worker'
 import { LX_RPC_MAX_BYTES } from './protocol'
+import { ProviderResolveError } from '../../providers/types'
+import { playbackLog } from '../../playbackLog'
 
 class TestWorker implements Partial<Worker> {
   onmessage: ((ev: MessageEvent) => void) | null = null
@@ -76,6 +78,10 @@ describe('LxRuntimeClient', () => {
     })
   })
 
+  // Deliberately changed by M-11 (task 23.5): this used to return `headers` from the guest and pin
+  // their passthrough as `requestHeaders`. The sandbox now refuses results that need custom headers
+  // (3.6), so the RPC round trip is checked with a header-free result, and the refusal crossing the
+  // Worker boundary is checked separately below.
   it('resolves musicUrl through worker RPC', async () => {
     client = new LxRuntimeClient({
       workerFactory: () => new TestWorker() as unknown as Worker,
@@ -86,7 +92,6 @@ describe('LxRuntimeClient', () => {
         if (action === 'musicUrl') {
           return {
             url: 'https://cdn.example.com/audio/' + info.musicInfo.id + '.flac',
-            headers: { 'X-Custom-Auth': 'allowed' },
             quality: 'lossless'
           };
         }
@@ -97,9 +102,19 @@ describe('LxRuntimeClient', () => {
     const result = await client.callMusicUrl('wy', { id: 'song_123' }, 'flac')
     expect(result).toEqual({
       url: 'https://cdn.example.com/audio/song_123.flac',
-      requestHeaders: { 'X-Custom-Auth': 'allowed' },
       actualQuality: 'lossless',
     })
+    expect(result.requestHeaders).toBeUndefined()
+  })
+
+  it('surfaces the sandbox refusal of a result needing custom headers through worker RPC', async () => {
+    client = new LxRuntimeClient({
+      workerFactory: () => new TestWorker() as unknown as Worker,
+    })
+    await client.loadSource(`
+      lx.on(lx.EVENT_NAMES.request, () => ({ url: 'https://cdn.example.com/a.flac', headers: { 'X-Custom-Auth': 'needed' } }));
+    `)
+    await expect(client.callMusicUrl('wy', { id: 'song_123' }, 'flac')).rejects.toThrow(/^invalid_response:/)
   })
 
   it('enforces call timeout and terminates unresponsive worker', async () => {
@@ -201,4 +216,83 @@ describe('LxRuntimeClient', () => {
     // Cannot call after dispose
     await expect(client.loadSource('// test')).rejects.toThrow(/disposed/i)
   })
+})
+
+
+it('abort terminates a busy Worker synchronously and rejects all pending RPCs',async()=>{
+ const worker=new TestWorker(()=>()=>new Promise(()=>{}))
+ const client=new LxRuntimeClient({workerFactory:()=>worker as unknown as Worker})
+ const pending=client.loadSource('// pending')
+ const rejection=expect(pending).rejects.toThrow(/abort/i)
+ try{client.abort();expect(worker.terminated).toBe(true);await rejection;await client.dispose()}finally{worker.terminate();await client.dispose()}
+})
+
+it('retains the caller timeout reason when aborting a busy Worker', async () => {
+  const worker = new TestWorker(() => () => new Promise(() => {}))
+  const client = new LxRuntimeClient({ workerFactory: () => worker as unknown as Worker })
+  const reason = new ProviderResolveError('timeout')
+  const rejection = expect(client.loadSource('// pending')).rejects.toBe(reason)
+  try {
+    client.abort(reason)
+    expect(worker.terminated).toBe(true)
+    await rejection
+  } finally {
+    worker.terminate()
+    await client.dispose()
+  }
+})
+
+it('records redacted lx.worker.error and lx.worker.timeout breadcrumbs without leaking tokens or raw URLs', async () => {
+  playbackLog.clear()
+  const worker = new TestWorker((post) => async (data: any) => {
+    if (data?.type === 'load') {
+      post({ type: 'error', error: 'paper lantern at https://guest.local/path?token=TOP_SECRET_123 Bearer abc.def.ghi' })
+    }
+  })
+  const errClient = new LxRuntimeClient({ workerFactory: () => worker as unknown as Worker })
+  await expect(errClient.loadSource('// test')).rejects.toThrow(/Worker fatal error/)
+  await errClient.dispose()
+
+  const hangingWorker = new TestWorker(() => async () => {})
+  const timeoutClient = new LxRuntimeClient({
+    workerFactory: () => hangingWorker as unknown as Worker,
+    callTimeoutMs: 25,
+  })
+  await expect(timeoutClient.loadSource('// hang')).rejects.toThrow(/timed out/i)
+  await timeoutClient.dispose()
+
+  const entries = playbackLog.snapshot()
+  const workerErr = entries.find((e) => e.type === 'lx.worker.error')
+  const workerTimeout = entries.find((e) => e.type === 'lx.worker.timeout')
+  expect(workerErr).toMatchObject({ category: 'fatal', level: 'error', stage: 'worker', requestType: 'load', pendingCount: 1 })
+  expect(workerErr).not.toHaveProperty('message')
+  expect(playbackLog.exportJson()).not.toMatch(/paper lantern|guest\.local|TOP_SECRET_123|abc\.def\.ghi/u)
+  expect(workerTimeout).toMatchObject({ level: 'error', stage: 'rpc', requestType: 'load', deadlineMs: 25 })
+})
+
+it.each(['onerror', 'onmessageerror'] as const)('ignores a terminated Worker’s late %s during the replacement load', async (eventName) => {
+  playbackLog.clear()
+  const first = new TestWorker(() => async () => {})
+  const next = new TestWorker((post) => async (data) => {
+    if (typeof data === 'object' && data !== null && 'id' in data) {
+      post({ type: 'load_result', id: data.id, success: true })
+    }
+  })
+  const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(next)
+  const client = new LxRuntimeClient({ workerFactory: factory })
+  try {
+    const rejected = expect(client.loadSource('// first')).rejects.toThrow(/Worker error/i)
+    const late = first[eventName]!
+    first.onerror!({ message: 'paper lantern' } as ErrorEvent)
+    await rejected
+    const replacement = client.loadSource('// second')
+    late({} as ErrorEvent & MessageEvent)
+    await expect(replacement).resolves.toBeDefined()
+    expect(next.terminated).toBe(false)
+    const fatals = playbackLog.snapshot().filter((entry) => entry.type === 'lx.worker.error')
+    expect(fatals).toHaveLength(1)
+    expect(fatals[0]).toMatchObject({ category: 'runtime', requestType: 'load' })
+  } finally {
+    await client.dispose()
+  }
 })

@@ -97,4 +97,55 @@ describe('CatalogFilters', () => {
     expect(wrapper.text()).not.toContain('place:')
     usePreferences().setLocale('en')
   })
+
+  it('renders Vocal tab option and filters catalogue to genuine singing tracks', async () => {
+    const catalogWithVocal: Track[] = [
+      ...tracks,
+      {
+        id: 'wildfire',
+        title: 'Wildfire',
+        aliases: {},
+        games: ['hsr'],
+        relationIds: [],
+        tabs: [],
+        workGroupId: 'wildfire-work',
+        vocalStatus: 'vocal',
+        needsClassification: false,
+        sources: [{ provider: 'youtube', externalId: 'wildfire-123' }],
+      },
+      {
+        id: 'uncertain-track',
+        title: 'Uncertain Track',
+        aliases: {},
+        games: ['hsr'],
+        relationIds: [],
+        tabs: [],
+        workGroupId: 'unc-work',
+        vocalStatus: 'uncertain',
+        needsClassification: false,
+        sources: [{ provider: 'youtube', externalId: 'unc-123' }],
+      },
+    ]
+
+    const wrapper = mount(CatalogFilters, { props: { tracks: catalogWithVocal } })
+    const vocalButton = wrapper.get('[data-filter-tab="vocal"]')
+    expect(vocalButton.text()).toBe('Vocal')
+    expect(vocalButton.attributes('aria-pressed')).toBe('false')
+
+    await vocalButton.trigger('click')
+    expect(vocalButton.attributes('aria-pressed')).toBe('true')
+    expect(latestIds(wrapper)).toEqual(['wildfire'])
+    expect(wrapper.get('.catalog-filters__count').text()).toContain('1')
+  })
+
+  it.each([
+    ['en', 'Vocal'],
+    ['zh-Hans', '人声'],
+    ['zh-Hant', '人聲'],
+  ] as const)('renders translated Vocal mode tab in %s', (locale, expectedText) => {
+    usePreferences().setLocale(locale)
+    const wrapper = mount(CatalogFilters, { props: { tracks } })
+    expect(wrapper.get('[data-filter-tab="vocal"]').text()).toBe(expectedText)
+    usePreferences().setLocale('en')
+  })
 })

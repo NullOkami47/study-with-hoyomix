@@ -280,10 +280,11 @@ describe('CSRF and Origin enforcement across the cookie-authenticated surface', 
           env as never,
         )
 
-        expect([400, 401]).toContain(response.status)
-        expect(await response.json()).toEqual({
-          error: expect.stringMatching(/^(?:invalid_oauth_state|oauth_callback_failed)$/),
-        })
+        // M-09 (deliberate): a callback without a sealed flow fails in the callback `catch`, which
+        // now returns the navigation to the app (was 401 {"error":"oauth_callback_failed"}).
+        expect(response.status).toBe(302)
+        expect(response.headers.get('location')).toBe(`${ORIGIN}/?auth_error=oauth_callback_failed`)
+        expect(await response.text()).toBe('')
         expect(response.headers.get('set-cookie') ?? '').not.toMatch(/__Host-session=[^;]/)
       }
       expect(await snapshot(database)).toBe(before)

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { BACKGROUND_OVERRIDES_STORAGE_KEY, parseOverrides, readCachedOverrides } from './overrides'
 
-const row = { id: 'zzz-astra-yao', status: 'archived' }
+const row = { id: 'fixture-scene-3', status: 'archived' }
 
 describe('atomic background override validation', () => {
   it.each(['published', 'archived', 'tombstoned'])('accepts %s with nullable Worker metadata', (status) => {
@@ -41,7 +41,7 @@ describe('atomic background override validation', () => {
     ...[-1, 1.5, '1', Infinity, NaN].map(displayOrder => ({ ...row, displayOrder })),
     ...[-1, 1.5, '1', null, Infinity, NaN].map(updatedAt => ({ ...row, updatedAt })),
   ])('rejects the entire snapshot for malformed row %j', (invalid) => {
-    expect(parseOverrides({ overrides: [{ id: 'zzz-ellen-joe', status: 'published' }, invalid] })).toBeNull()
+    expect(parseOverrides({ overrides: [{ id: 'fixture-scene-2', status: 'published' }, invalid] })).toBeNull()
   })
 
   it.each(['published', 'archived'])('rejects duplicate IDs even with %s status', (status) => {

@@ -203,7 +203,7 @@ export async function readImportBatch(db: D1Database, id: string): Promise<Impor
 }
 const syncAuditStatement = (
   db: D1Database,
-  actor: string,
+  actor: string | null,
   batchId: string,
   summary: ImportBatch['summary'],
   now: number,
@@ -217,10 +217,15 @@ const syncAuditStatement = (
   now,
 )
 
+/**
+ * `actor` is `null` only for the unattended discovery cycle, which has no admin session.
+ * `actor_user_id` is a nullable FK to `users(id)`, so a null actor is a distinct,
+ * unforgeable "automation" marker in the audit log rather than a borrowed human identity.
+ */
 export async function saveImportBatch(
   db: D1Database,
   workbook: Workbook,
-  actor: string,
+  actor: string | null,
   now: number,
   options: { resync?: boolean } = {},
 ): Promise<ImportBatch> {

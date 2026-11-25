@@ -30,7 +30,7 @@ const openLabel = computed(() =>
   format('musicLibrary.openAlbum', { album: props.album.title }),
 )
 
-const { artworkUrl, isLoaded, hasFailed, onLoad, onError } = useAlbumArtwork(
+const { artworkUrl, isLoaded, hasFailed, onLoad, onError, element, identity } = useAlbumArtwork(
   computed(() => props.album),
 )
 </script>
@@ -44,10 +44,12 @@ const { artworkUrl, isLoaded, hasFailed, onLoad, onError } = useAlbumArtwork(
       :aria-label="openLabel"
       @click="emit('open', album)"
     >
-      <span class="album-card__artwork" aria-hidden="true" :style="artworkStyle">
+      <span ref="element" class="album-card__artwork" aria-hidden="true" :style="artworkStyle">
         <img
           v-if="artworkUrl && !hasFailed"
           :src="artworkUrl"
+          :key="identity + artworkUrl"
+          :data-artwork-identity="identity"
           alt=""
           loading="lazy"
           decoding="async"

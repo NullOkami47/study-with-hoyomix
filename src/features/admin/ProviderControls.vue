@@ -7,7 +7,7 @@ import { usePreferences } from '../../stores/preferences'
 import { translate, type TranslationKey } from '../../i18n'
 import { formatRelative as formatRelativeHelper } from './format'
 
-const CANONICAL_PROVIDER_IDS = ['chksz', 'lx', 'jellyfin'] as const
+const CANONICAL_PROVIDER_IDS = ['chksz', 'lx', 'gd-studio'] as const
 
 const props = defineProps<{
   providers: AdminProvider[]
@@ -77,7 +77,7 @@ watch(() => props.providers, () => {
 function providerDisplayName(key: string): string {
   if (key === 'chksz') return 'ChKSz BYOK'
   if (key === 'lx') return 'LX Music'
-  if (key === 'jellyfin') return 'Jellyfin'
+  if (key === 'gd-studio') return 'GD Studio'
   return key
 }
 
@@ -153,7 +153,7 @@ function moveDown(index: number): void {
 
 function onResetOrder(): void {
   if (isMutating.value) return
-  const nextOrder = ['chksz', 'lx', 'jellyfin']
+  const nextOrder = ['chksz', 'lx', 'gd-studio']
   localOrder.value = nextOrder
   emit('order', nextOrder)
 }

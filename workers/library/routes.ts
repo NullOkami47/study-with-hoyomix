@@ -82,7 +82,8 @@ export function createLibraryHandler(env: LibraryEnv, options: LibraryRouteOptio
         const body = exactKeys(await requestJson(request), ['confirmation'])
         if (body.confirmation !== 'DELETE') return json({ error: 'deletion_confirmation_required' }, 400)
         const eventId = cryptoApi.randomUUID()
-        const event = await deleteAccount(env.DB, userId, now(), eventId)
+        // L-15 (D8): no avatar storage binding (no emitter) means no outbox row.
+        const event = await deleteAccount(env.DB, userId, now(), eventId, Boolean(options.emitAvatarDeletion))
         if (event && options.emitAvatarDeletion) {
           try {
             await options.emitAvatarDeletion(event)

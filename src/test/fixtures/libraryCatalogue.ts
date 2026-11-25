@@ -87,7 +87,7 @@ const SEEDS: TrackSeed[] = [
   },
 ]
 
-function toTrack(seed: TrackSeed): Track {
+function toTrack(seed: TrackSeed, index: number): Track {
   const track: Track = {
     id: seed.id,
     title: seed.title,
@@ -98,7 +98,10 @@ function toTrack(seed: TrackSeed): Track {
     workGroupId: seed.workGroupId ?? `work-${seed.id}`,
     needsClassification: false,
     vocalStatus: 'instrumental',
-    sources: [{ provider: 'jellyfin', externalId: `ext-${seed.id}` }],
+    sources: [
+      { provider: 'chksz', externalId: String(100001 + index) },
+      { provider: 'gd-studio', externalId: `netease:${100001 + index}` },
+    ],
   }
   if (seed.album !== undefined) track.album = seed.album
   return track

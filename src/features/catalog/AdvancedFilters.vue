@@ -11,7 +11,12 @@ const props = defineProps<{ id: string; state: CatalogFilterState; tracks: Track
 const emit = defineEmits<{ (event: 'close'): void }>()
 const { locale } = usePreferences()
 const text = (key: TranslationKey): string => translate(locale.value, key)
-const tabKey: Record<TabId, TranslationKey> = { sleep: 'tab.sleep', focus: 'tab.focus', chill: 'tab.chill' }
+const tabKey: Record<TabId | 'vocal', TranslationKey> = {
+  sleep: 'tab.sleep',
+  focus: 'tab.focus',
+  chill: 'tab.chill',
+  vocal: 'tab.vocal',
+}
 const gameKey: Record<GameId, TranslationKey> = { genshin: 'game.genshin', hsr: 'game.hsr', zzz: 'game.zzz' }
 const hasActiveFilters = computed(() => props.state.games.value.length !== CANONICAL_GAME_IDS.length
   || props.state.mode.value !== null || props.state.search.value !== ''
@@ -21,7 +26,21 @@ const relationKey: Record<RelationKind, TranslationKey> = {
 }
 const relationKinds: RelationKind[] = ['character', 'npc', 'place', 'faction', 'event']
 // Fixed filter choices keep All reachable even when no tracks have mode tags.
-const tabs: TabId[] = ['chill', 'focus', 'sleep']
+const tabs: readonly (TabId | 'vocal')[] = ['chill', 'focus', 'sleep', 'vocal']
+const modeCounts = computed(() => {
+  const selectedGames = new Set(props.state.games.value)
+  const selectedRelations = new Set(props.state.relationIds.value)
+  // Match the structural queue: catalogue search never narrows automatic playback.
+  const matchesContext = (track: Track) =>
+    (selectedGames.size === 0 || track.games.some((g) => selectedGames.has(g)))
+    && (selectedRelations.size === 0 || track.relationIds.some((id) => selectedRelations.has(id)))
+  return {
+    chill: props.tracks.filter((track) => matchesContext(track) && track.tabs.includes('chill')).length,
+    focus: props.tracks.filter((track) => matchesContext(track) && track.tabs.includes('focus')).length,
+    sleep: props.tracks.filter((track) => matchesContext(track) && track.tabs.includes('sleep')).length,
+    vocal: props.tracks.filter((track) => matchesContext(track) && track.vocalStatus === 'vocal').length,
+  }
+})
 const optionSearch = ref('')
 const optionLimit = ref(40)
 const relations = computed(() => [...new Set(props.tracks.flatMap((track) => track.relationIds))].sort())
@@ -49,6 +68,10 @@ function clearAll(): void {
       </div>
     </header>
 
+    <p v-if="state.mode.value === 'vocal'" class="advanced-filters__results" data-vocal-results role="status" aria-atomic="true">
+      {{ modeCounts.vocal === 0 ? text('catalog.noResults') : `${modeCounts.vocal} ${text('catalog.trackCount')}` }}
+    </p>
+
     <div class="advanced-filters__body" data-advanced-body>
       <fieldset data-filter-games>
         <legend>{{ text('catalog.games') }}</legend>
@@ -58,7 +81,23 @@ function clearAll(): void {
       <fieldset data-advanced-tabs>
         <legend>{{ text('catalog.modes') }}</legend>
         <button type="button" :aria-pressed="state.mode.value === null" data-filter-tab="all" @click="state.setMode(null)">{{ text('catalog.allModes') }}</button>
-        <button v-for="tab in tabs" :key="tab" type="button" :aria-pressed="state.mode.value === tab" :data-filter-tab="tab" @click="state.setMode(tab)">{{ text(tabKey[tab]) }}</button>
+        <button
+          v-for="tab in tabs"
+          :key="tab"
+          type="button"
+          :aria-pressed="state.mode.value === tab"
+          :data-filter-tab="tab"
+          :aria-label="tab === 'vocal' ? `${text(tabKey[tab])} (${modeCounts.vocal})` : text(tabKey[tab])"
+          @click="state.setMode(tab)"
+        >
+          <span>{{ text(tabKey[tab]) }}</span>
+          <span
+            v-if="tab === 'vocal'"
+            class="advanced-filters__tab-count"
+            data-filter-tab-count="vocal"
+            data-mode-count="vocal"
+          >({{ modeCounts.vocal }})</span>
+        </button>
       </fieldset>
 
       <label v-if="relations.length > 40" class="advanced-filters__search">
@@ -157,6 +196,7 @@ button[aria-pressed="true"] {
   font-family: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
 }
 .advanced-filters__body { gap: 1rem; padding-block: 0.75rem; }
+.advanced-filters__results { flex-shrink: 0; margin: 0; padding-block-start: 0.75rem; color: var(--liquid-text-secondary); font-size: 0.875rem; }
 header { padding-block-end: 0.75rem; border-color: var(--liquid-separator); }
 h2 { font-size: 1rem; font-weight: 680; }
 .advanced-filters__header-actions { display: flex; gap: 0.25rem; align-items: center; }
@@ -180,6 +220,12 @@ button {
 }
 button:hover { background: rgb(255 255 255 / 9%); }
 button[aria-pressed="true"] { color: var(--liquid-text-primary); background: var(--liquid-selected); border: 0; }
+.advanced-filters__tab-count {
+  margin-inline-start: 0.25rem;
+  font-size: 0.75rem;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
 @media (max-width: 47.99rem) {
   .advanced-filters { padding: 1rem 1rem max(1rem, env(safe-area-inset-bottom)); }
 }

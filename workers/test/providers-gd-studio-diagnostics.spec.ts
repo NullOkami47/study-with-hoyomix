@@ -3,11 +3,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { resolveGdStudioMetadata } from '../providers/gdStudio'
 import { createExactMediaUrlValidator } from '../providers/resolverMediaUrl'
 
-// F3 — bounded GD Studio failure observability.
+// Bounded GD Studio failure observability.
 //
-// The previous GD incident (see docs/verification/2026-09-16-gd-studio-502-investigation.md)
-// could not be localised from the returned HTTP status alone, because materially different
-// adapter branches collapsed onto the same externally visible `unavailable` / HTTP 502.
+// Materially different adapter branches must not collapse onto the same externally
+// visible `unavailable` / HTTP 502 without structured diagnostics.
 //
 // These tests pin each real branch to its own finite diagnostic code, so a future reviewer can
 // read `code` and know which boundary fired without guessing. They deliberately do NOT assert
@@ -525,3 +524,4 @@ describe('GD Studio failure diagnostics (F3)', () => {
     })
   })
 })
+

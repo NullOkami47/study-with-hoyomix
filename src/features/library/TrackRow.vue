@@ -49,9 +49,9 @@ const artworkStyle = computed(() => ({ '--artwork': placeholderArtwork(props.alb
 const meta = computed(() => [props.album, props.game].filter((value) => Boolean(value)).join(' · '))
 
 const artworkKey = computed(() =>
-  props.album ? `album:${props.album}` : `track:${props.track.id}`,
+  `track:${props.track.id}`,
 )
-const { artworkUrl, isLoaded, hasFailed, onLoad, onError } = useArtwork(
+const { artworkUrl, isLoaded, hasFailed, onLoad, onError, element, identity } = useArtwork(
   artworkKey,
   computed(() => props.track),
 )
@@ -63,10 +63,12 @@ const { artworkUrl, isLoaded, hasFailed, onLoad, onError } = useArtwork(
     data-track-row
     :data-track-id="track.id"
   >
-    <span class="track-row__artwork" aria-hidden="true" :style="artworkStyle">
+    <span ref="element" class="track-row__artwork" aria-hidden="true" :style="artworkStyle">
       <img
         v-if="artworkUrl && !hasFailed"
         :src="artworkUrl"
+        :key="identity + artworkUrl"
+        :data-artwork-identity="identity"
         alt=""
         loading="lazy"
         decoding="async"

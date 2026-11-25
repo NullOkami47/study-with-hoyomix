@@ -31,12 +31,12 @@
   <a href="#screenshots">Screenshots</a> •
   <a href="#capabilities">Capabilities</a> •
   <a href="#implemented">Implemented</a> •
-  <a href="#new-functions-and-structure">New Functions</a> •
+  <a href="#architecture-and-modules">Architecture</a> •
   <a href="#planned-features">Planned Features</a> •
   <a href="#tech-stack">Tech Stack</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#continuous-integration">Continuous Integration</a> •
-  <a href="#project-layout">Project Layout</a> •
+  <a href="#continuous-integration">CI</a> •
+  <a href="#project-layout">Layout</a> •
   <a href="#credits">Credits</a> •
   <a href="#links">Links</a> •
   <a href="#license">License</a>
@@ -48,26 +48,28 @@
 
 ## 📝 Project Description
 
-**Study with HOYO-MiX** ([`NullOkami47/study-with-hoyomix`](https://github.com/NullOkami47/study-with-hoyomix)) is the public open-source release of [`NullOkami47/hoyomix_web_player`](https://github.com/NullOkami47/hoyomix_web_player) — a calm, dark-mode study and focus web workspace built around a WebGPU / WebGL2 / CSS **Liquid Glass** interface, durable Pomodoro & sleep timers, multi-provider playback orchestration, anonymous-first local `IndexedDB` storage with optional OAuth cloud sync, and a Cloudflare Workers + D1 + R2 + Durable Objects edge backend.
+**Study with HOYO-MiX** ([`NullOkami47/study-with-hoyomix`](https://github.com/NullOkami47/study-with-hoyomix)) is a calm, dark-mode study and focus web workspace built around a WebGPU / WebGL2 / baked-tile / CSS **Liquid Glass** interface, durable Pomodoro & sleep timers, multi-provider playback orchestration with transitions & unified recovery, anonymous-first local `IndexedDB` storage with optional OAuth cloud sync, real-time Community Chat, and a Cloudflare Workers + D1 + R2 + Durable Objects edge backend.
 
 The public production app is **[Study with HOYO-MiX](https://app.study-with-hoyomix.workers.dev)**, served by the Cloudflare Worker `app`.
 
-This repository is a curated source distribution. The hosted app can run a different revision: the CI badge describes the public `main` branch, not the production deployment. Private operational records, deployment identities and unpublished release candidates are not included.
+This repository is a curated public open-source distribution. The hosted deployment may run its own release cadence and private data configuration; private operational scripts, deployment credentials, and proprietary media datasets are intentionally omitted.
 
-- [Build & Local Setup Guide (`BUILDING.txt`)](https://github.com/NullOkami47/study-with-hoyomix/blob/main/BUILDING.txt)
-- [Source & Licence Notices (`NOTICE`)](https://github.com/NullOkami47/study-with-hoyomix/blob/main/NOTICE)
+- [Architecture Overview (`docs/architecture.md`)](docs/architecture.md)
+- [Changelog (`CHANGELOG.md`)](CHANGELOG.md)
+- [Build & Self-Hosting Guide (`BUILDING.txt`)](BUILDING.txt)
+- [Source & Licence Notices (`NOTICE`)](NOTICE)
 - [Third-Party Open-Source Notices (`docs/THIRD_PARTY_NOTICES.md`)](docs/THIRD_PARTY_NOTICES.md)
 
 > [!IMPORTANT]
 > **Unofficial Fan Project & Public Open-Source Distribution Notice**
 >
 > - **Unofficial & Non-Commercial**: Study with HOYO-MiX is an independent, fan-made, non-commercial study companion. It is **not** affiliated with, endorsed, sponsored, or approved by HoYoverse / miHoYo / Cognosphere or HOYO-MiX. Game titles, characters, and music trademarks belong to their respective rightsholders.
-> - **Media & Credentials Excluded**: The public source release deliberately includes **no soundtrack library, copyrighted artwork, animated game wallpapers, user records, default third-party music-source scripts, or live service credentials**. Its shipped initial catalogue (`src/features/catalog/catalog.production.json` and `src/features/catalog/catalog.sample.json`) and static background definitions (`src/features/backgrounds/staticDefinitions.ts`) are empty by default so self-hosting operators can supply media and service credentials they are entitled to use.
+> - **Media & Credentials Excluded**: The public source release deliberately includes **no soundtrack library, copyrighted artwork, animated game wallpapers, user records, default third-party music-source scripts, or live service credentials**. Its shipped initial catalogue (`src/features/catalog/catalog.production.json`, `src/features/catalog/catalog.sample.json`, `public/catalogue/v1.json`) and static background definitions (`src/features/backgrounds/staticDefinitions.ts`) are empty by default so self-hosting operators can supply media and service credentials they are entitled to use.
 
 > [!WARNING]
 > **Third-Party Music Sources & External Services**
 >
-> Third-party music sources (including user's personal ChKSz API keys, and opt-in external resolvers) depend on external services outside this project's control. Endpoints may fail due to rate limits, regional restrictions, DNS/certificate errors, or upstream changes. Importing or enabling third-party sources is entirely at the user's own discretion and responsibility; please comply with local law, platform terms of service, and music copyright.
+> Third-party music sources (including user-supplied ChKSz API keys, custom/global LX scripts, and opt-in external resolvers) depend on external services outside this project's control. Endpoints may fail due to rate limits, regional restrictions, DNS/certificate errors, or upstream changes. Importing or enabling third-party sources is at the user's own discretion and responsibility; comply with local laws, platform terms of service, and music copyright.
 
 <a id="screenshots"></a>
 <a id="en-screenshots"></a>
@@ -93,78 +95,66 @@ This repository is a curated source distribution. The hosted app can run a diffe
 
 | Area | What you can do |
 | :--- | :--- |
-| **Liquid Glass Workspace** | Study over a dual-slot crossfade video/poster backdrop (`1080p30` default, optional `1440p30` companion with automatic frame-drop fallback) rendered beneath a multi-pass WebGPU / WebGL2 optical refraction shader (`StudioGlassCanvas`, `LiquidGlassCanvas`) with resilient CSS fallback |
-| **Durable Timers & Focus Logs** | Run monotonic-clock Pomodoro cycles (`focus`, `short-break`, `long-break`) with an optional break pause-lease for the player, configure a durable sleep timer (`15` / `30` / `45` / `60` / `90` min or custom), and review daily streaks in `StudyCalendar` |
-| **Catalogue & Smart Queue** | Filter tracks by game (`genshin`, `hsr`, `zzz`), listening mode (`sleep`, `focus`, `chill`), and relation (`place`, `character`, `npc`, `faction`, `event`), search titles/aliases across Simplified & Traditional Chinese via `opencc-js`, and reorder a virtualised non-modal queue |
-| **Multi-Provider Playback** | Resolve tracks across Worker-governed and client providers (`r2`, `jellyfin`, `youtube`, `chksz`, `meting`, `gd-studio`, `huanyin`, `qijie`, `piped`, `invidious`, `lx`, `lx-user`) with automatic fallback, MediaSession controls, and live latency/error diagnostics |
-| **QuickJS Custom Source Sandbox** | Import LX Music-compatible JavaScript sources and execute them inside an isolated Web Worker + `quickjs-emscripten-core` WebAssembly runtime (`src/features/player/lx/runtime/`) with strict memory, stack, timeout, and payload ceilings |
-| **Local-First Library & OAuth Sync** | Persist favourites, custom playlists, recent playback history (opt-in, capped at 100 entries), and preferences in native `IndexedDB` / `localStorage`, or sign in with **Google**, **GitHub**, and **LINUX DO** to sync across devices via Cloudflare D1 |
-| **Realtime Presence & Admin Console** | See live online listener counts and chat via the `OnlineCounter` Cloudflare Durable Object, and manage catalogue revisions, Google Sheets imports, R2 background transcoding (`mediabunny` + WebCodecs), notices, and provider health in `AdminShell` |
+| **Liquid Glass Studio Workspace** | Study over a dual-slot crossfade video/poster backdrop (`SceneBackdrop`) rendered beneath a multi-pass WebGPU / WebGL2 optical refraction surface (`StudioGlassCanvas`, `LiquidGlassCanvas`, `AdaptiveGlassSurface`) with baked PNG refraction tiles (`public/glass/refraction/`) and CSS fallback respecting reduced-transparency preferences |
+| **Durable Timers & Focus Logs** | Run monotonic-clock Pomodoro cycles (`focus`, `short-break`, `long-break`) with an optional break pause-lease for the player, configure a durable `SleepTimer` (`15` / `30` / `45` / `60` / `90` min presets or custom countdown), and review focus records & daily streaks in `StudyCalendar` |
+| **Catalogue, Vocal Tab & Smart Queue** | Filter tracks by game (`genshin`, `hsr`, `zzz`), listening mode (`sleep`, `focus`, `chill`, plus independent Vocal classification), and relation (`place`, `character`, `npc`, `faction`, `event`), search titles/aliases across Simplified & Traditional Chinese via `opencc-js` + Han folding, and reorder a virtualised non-modal `QueuePanel` with Shuffle & Repeat (`off` / `all` / `one`) |
+| **Multi-Provider Playback & Transitions** | Orchestrate active providers (`chksz`, `lx`, `gd-studio`) with bounded unified recovery (`requestSourceRecovery`: 10-second same-provider URL renewal followed by chain fallback), track preloading, **Off** / **Smooth Crossfade** / **Smart Mix** transitions (`2`–`12` s), album artwork caching (`artworkCache`), mobile background handoff handling, MediaSession integration, and `PlaybackDiagnostics` |
+| **QuickJS Custom & Global LX Registry** | Execute user-imported or Owner-published global LX Music JavaScript sources inside an isolated Web Worker + `quickjs-emscripten-core` WebAssembly sandbox (`src/features/player/lx/runtime/`) with `acorn` header validation, immutable script hashes, explicit CSP origin allow-listing (`LX_ALLOWED_ORIGINS`), and strict memory/stack/timeout/payload limits |
+| **Local-First Library & OAuth Sync** | Persist favourites, custom playlists, opt-in playback history (capped at 100 entries), and preferences offline-first in `IndexedDB` / `localStorage`, or sign in via **Google**, **GitHub**, or **LINUX DO** to sync library and focus data across devices in Cloudflare D1 |
+| **Community Chat, Presence & Admin Console** | Join the site-wide `ChatRoom` Durable Object (reply/edit, emoji stickers, blocking, reporting, bounded regex filters, moderator role, D1/DO retention & audit logs) alongside `OnlinePresence`, and manage catalogue revisions, discovery triage, Google Sheets staging, R2 background video transcoding (`mediabunny` + WebCodecs), global LX scripts, notices, and provider health in `AdminShell` |
 
 <a id="implemented"></a>
 <a id="en-implemented"></a>
 
 ## ✨ Implemented
 
-#### Player, Queue & Quality Model
+#### Player, Queue, Transitions & Recovery
 
-- **Compact & Expandable `PlayerBar`**: Single-row default with provenance-safe artwork, canonical track title, active provider badge, play/pause, and next; expands in-place to reveal seek bar, buffer progress, volume, queue trigger, source selector, and `PlaybackDiagnostics`.
-- **Non-Modal Resizable `QueuePanel`**: Retains `Shuffle` and `Repeat` states in the header, renders `Previously Played` above a fixed `Now Playing` row, virtualises `Up Next` for long queues, and supports 44 px pointer/keyboard reordering plus desktop width/height resizing.
-- **Sheet Suspension Invariant**: Opening modal sheets (`SettingsSheet`, `LibrarySheet`, `ControlCentre`) cleanly suspends active official YouTube IFrame media and restores playback intent on close without layout shift or duplicate resume events.
-- **Quality Selection (`src/features/player/qualityPreferences.ts`)**:
-  - **ChKSz tiers (`src/shared/chksz.ts`)**: `standard`, `exhigh`, `lossless`, `hires`, `jyeffect`, `sky`, `jymaster`.
-  - **LX tiers**: `standard`, `high`, `lossless`, `hires`.
-  - Unavailable target tiers degrade gracefully to playable resources while reporting the actual resolved quality metadata.
+- **Compact & Expandable `PlayerBar`**: Single-row default with provenance-safe artwork + local blob caching (`artworkCache.ts`), canonical track title, active provider badge, play/pause, and next; expands in-place to reveal seek bar, buffer progress, volume, transition controls, queue trigger, source selector, and `PlaybackDiagnostics`.
+- **Background Handoff & Unified Recovery (`store.ts`, `PlayerBar.vue`)**: Maintains `<audio>` element continuity across track transitions for mobile browsers, discards stale preloads/recoveries on generation change, preserves Play/Pause/Seek/Next/Previous intent, and runs unified `requestSourceRecovery` (rate-limited same-provider renewal before advancing down the automatic fallback chain).
+- **Preloading, Crossfade & Smart Mix (`preloadPolicy.ts`, `transitionEngine.ts`)**: Prepares the next track safely ahead of end-of-track; supports **Off**, **Smooth Crossfade**, and **Smart Mix** (`2`–`12` s) with gain-envelope scheduling and immediate cancellation on interruption, seek, backgrounding, or incompatible playback elements.
+- **Non-Modal Resizable `QueuePanel`**: Persists Shuffle & Repeat (`off` / `all` / `one`), renders `Previously Played`, fixed `Now Playing`, and virtualised `Up Next` with 44 px pointer/keyboard reordering plus desktop width/height resizing.
+- **Quality Selection (`src/features/player/qualityPreferences.ts`)**: Supports ChKSz tiers (`standard`, `exhigh`, `lossless`, `hires`, `jyeffect`, `sky`, `jymaster`) and LX tiers (`standard`, `high`, `lossless`, `hires`) with graceful fallback.
 
-#### Third-Party Music Sources & Security Boundaries
+#### Active Music Providers & Security Boundaries
 
-- **Local Consent Gate**: Third-party resolvers (`chksz`, `lx-user`, etc.) require explicit local user agreement (`ThirdPartyAgreement.vue`) and can be toggled in Settings.
-- **QuickJS WASM Runtime (`src/features/player/lx/runtime/`)**: Executes user scripts inside a dedicated module Worker using `quickjs-emscripten-core` and `@jitl/quickjs-wasmfile-release-asyncify` (`0.32.0`), enforcing deterministic memory, stack, call-timeout, and bridged-response limits defined in `protocol.ts`.
-- **ChKSz Personal Credential Support**: Supports user-supplied `chksz_` API keys (registered via `api.chksz.com` with a LinuxDo account) alongside Worker-side SSRF/origin validation (`src/shared/chksz.ts`).
+- **Active Canonical Providers (`chksz`, `lx`, `gd-studio`)**: Managed per deployment via `workers/providers/config.ts` and `AdminShell`, plus personal user opt-outs (`providerPreferences.ts`) and local consent gating (`ThirdPartyAgreement.vue`). GD Studio validates container headers against MIME types while keeping strict origin/ticket/SSRF guards.
+- **Retired & Inert Legacy Adapters**: **Jellyfin** and **Vkeys** are completely retired (excluded from runtime, configuration, and preferences; routes return `404`). Legacy proxy/discovery keys (`r2`, `meting`, `piped`, `invidious`, `qijie`, `lx-huanyin`, `lx-huibq`, `lx-ikun`) are unregistered in the default playback chain (`runtimeConfig.ts`) and disabled unless explicitly configured, while server-side routing/validation shims remain solely for SSRF security-contract tests and D1 catalogue/discovery compatibility (`LegacyProviderId`, migration `0021`, `workers/catalogue/discovery/`).
+- **QuickJS WASM Sandbox & Global LX Registry**: Runs third-party LX scripts inside an isolated Web Worker (`quickjs-emscripten-core` `0.32.0`), with Owner-managed global versions (`workers/lx/`), `acorn` (`8.15.0`) lexical metadata verification, and build/Worker CSP parity checks (`LX_ALLOWED_ORIGINS`).
 
-## New functions and structure
+<a id="architecture-and-modules"></a>
 
-The changes below are implemented in the development release line. Some are already part of earlier hosted releases. The remaining integration is **awaiting final verification**, and the combined source is awaiting a **reviewed public-source update**. This public checkout still contains the earlier application source edition. This section documents the new work without implying that it is already deployed or available from a fresh clone. The existing features above describe the public edition.
+## 🧩 Architecture & Catalogue Tooling
 
-| Area | New behaviour in the release candidate |
-| :--- | :--- |
-| **Background playback and recovery** | Keeps a stable active audio element through natural track handoff on Android, rejects stale preparation/recovery replies, and preserves explicit Play, Pause, Seek, Next and Previous intent. Apple mobile WebKit avoids the zero-volume preroll that caused incorrect media timing. Source failures use bounded recovery; Pause, Stop and sleep expiry must not be undone by late replies. |
-| **Track preparation and transitions** | Prepares the next track through the enabled provider fallback chain. Adds **Off**, **Smooth Crossfade** and **Smart Mix** settings; Off remains the default. Transition duration defaults to 5 seconds and can be set from 2–12 seconds. Overlap requires ready media and supported volume control, and cancels on interruption, seeking, backgrounding or stale ownership. Smart Mix analyses existing playback with a deterministic fallback. |
-| **Provider resilience and artwork** | GD Studio can reconcile a mismatched audio MIME label against a recognised container header while retaining URL, redirect, Range and media-ticket validation. Library artwork uses current LX/GD and applicable legacy fallback sources instead of an automatic dependency on the retired Jellyfin service. |
-| **Optional Vkeys QQ Music adapter** | Adds a distinct QQ Music provider with identity matching, media qualification and expiry/recovery handling. It is **disabled by default**. Qualification currently covers MP3 samples; this is not a claim of universal format, region or device support. NetEase playback through this adapter and InnerTube playback were investigated but are not integrated. |
-| **Global LX source management** | Adds an owner-managed registry with immutable script snapshots and content hashes, update/rollback by version, and explicit network-origin approval. Personal imported sources remain separate. Scripts continue to execute inside the bounded QuickJS sandbox. |
-| **Community chat and presence** | Separates chat protocol, storage, moderation and retention into dedicated Worker modules, with responsive and floating chat views, authenticated sending and request deduplication. Presence remains a separate service boundary. |
-| **Workspace polish** | Refines Focus glass surfaces, library artwork fallback and focus-record presentation alongside the playback work. |
-| **Catalogue discovery and review** | Adds deterministic discovery for Genshin Impact, Honkai: Star Rail and Zenless Zone Zero, an Admin discovery inbox, source/identity checks, classification suggestions and a Google Sheets staging/review flow. Canonical track identity remains separate from provider IDs; candidates without a qualified playable source remain candidates rather than silently entering the catalogue. Focus eligibility is independent of whether a track has vocals. |
-| **Optional catalogue automation** | Adds durable row/cycle/staging records for a bounded discover → classify → stage → publish round trip. Automatic processing and automatic publication are separate opt-ins, both **off by default**. Publication rechecks source identity, reviewed changes, catalogue revision and write-budget evidence; uncertain outcomes require reconciliation. No personal AI account or external schedule is implicitly connected. |
-
-The new work is organised around these boundaries. Paths in this table describe the **candidate structure** and will become navigable after the reviewed source update:
+See [`docs/architecture.md`](docs/architecture.md) for the full module breakdown across `src/`, `workers/`, and D1 migrations (`0001`–`0033`). Key backend boundaries:
 
 | Module or directory | Responsibility |
 | :--- | :--- |
-| `src/features/player/PlayerBar.vue`, `store.ts`, `preloadPolicy.ts` | Native audio lifecycle, explicit user intent, provider resolution and freshness checks for the prepared next track. |
-| `src/features/player/transitionEngine.ts` | Transition modes, overlap timing, envelopes and cancellation rules. |
-| `src/features/player/providers/vkeys.ts` and `workers/providers/vkeys*.ts` | Client adapter plus server-side identity, media and response-policy checks for the optional provider. |
-| `workers/lx/` and `src/features/player/lx/globalSourceRepository.ts` | Shared source registry, immutable snapshots, client cache and network-origin approval. |
-| `workers/chat/`, `workers/presence.ts` and `src/features/chat/` | Chat routing/protocol, persistence, retention/moderation, presence and responsive views. |
-| `tools/catalog-sync/catalog_sync/discovery.py` | Deterministic discovery inputs and candidate generation. |
-| `src/features/admin/CatalogueDiscovery.vue` | Review inbox, classification and staging controls. |
-| `workers/catalogue/discovery/` | Candidate storage, source qualification, Sheets reconciliation, staging and optional automation/publication. |
-| `migrations/0029_community_chat.sql`–`0031_lx_global_sources.sql` | Chat sending/retention records and the shared LX source registry. |
-| `migrations/0032_catalogue_discovery.sql` and `0033_catalogue_discovery_automation.sql` | Additive discovery and automation ledgers. Schema preparation does not activate automation. |
+| `src/features/liquid-glass/` & `src/features/glass/` | WebGPU / WebGL2 optical refraction renderers, baked PNG tiles, and reduced-transparency handling |
+| `src/features/player/` (`PlayerBar.vue`, `store.ts`, `transitionEngine.ts`) | Dual-element `<audio>` orchestration, unified recovery, preloading, crossfade/Smart Mix, artwork cache, and QuickJS LX sandbox |
+| `workers/providers/` | Server-side adapters (`chksz`, `gd-studio`), transient media/artwork tickets, and SSRF/ingress guards |
+| `workers/lx/` & `src/features/player/lx/` | Versioned global LX source registry, `acorn` metadata header checks, client repository cache, and origin approval |
+| `workers/chat/`, `workers/presence.ts` & `src/features/chat/` | `ChatRoom` SQLite Durable Object, `OnlinePresence`, moderation/blocking/filters, guarded retention recovery, and responsive chat UI |
+| `workers/catalogue/` & `tools/catalog-sync/` | D1 catalogue versioning, discovery inbox/staging, Google Sheets sync, opt-in automation ledgers, and standalone Python metadata discovery CLI |
+| `migrations/` | Cloudflare D1 SQLite schema migrations (`0001`–`0033`, including chat, global LX sources, discovery, and automation ledgers) |
 
-Release qualification still includes complete source-bound CI and physical-device checks for background transitions, source recovery, manual controls, sleep shutdown, crossfade and installed PWAs. A normal browser run or passing unit tests does not establish all of those behaviours. Public-source synchronisation and production activation are separate reviewed steps.
+<a id="known-limitations"></a>
+
+### ⚠️ Known Limitations & Acceptance Boundaries
+
+- **Physical-Device Playback Acceptance**: While unit and harness regression tests cover background handoff, recovery, Sleep Timer shutdown, and crossfade state machines in `jsdom`, **audible background playback, Screen-Off lock-screen continuity, and installed PWA behaviour on real Android and iOS physical devices have NOT been tested in this public source sync and must be verified by operators on target hardware before production rollout.**
+- **Proxy WebSocket Limitation**: Same-origin Worker deployment (or a WebSocket-capable reverse proxy preserving `PUBLIC_ORIGIN`) is required for live Community Chat & Presence; HTTP-only API proxies will keep Chat disconnected.
+- **Empty Public Defaults**: No music tracks, artwork, or animated wallpapers ship in the repository; operators must supply authorised catalogue entries and configured providers.
 
 <a id="planned-features"></a>
 <a id="en-planned-features"></a>
 
-## Planned work
+## 🗂️ Planned Features
 
-- Complete release qualification and the reviewed public-source update for the implemented changes above.
-- Expand the catalogue, including eligible fan-made arrangements, after source and redistribution-rights review.
-- Improve Liquid Glass rendering, surface depth and visual polish.
-- Explore Zenless Zone Zero TV/CRT, Genshin Impact and Honkai: Star Rail interface themes.
-- Qualify additional music providers and formats before enabling them.
+- Expand public-compatible catalogue tooling and eligible fan-made arrangement workflows.
+- Further Liquid Glass rendering performance tuning across mobile GPUs.
+- Game-inspired visual themes (Zenless Zone Zero CRT/TV, Genshin Impact, Honkai: Star Rail).
+- Additional audio provider qualifications where licensing and platform stability permit.
 
 <a id="tech-stack"></a>
 <a id="en-tech-stack"></a>
@@ -173,85 +163,62 @@ Release qualification still includes complete source-bound CI and physical-devic
 
 | Layer | Implementation |
 | :--- | :--- |
-| **UI & Reactivity** | Vue 3.5 (Composition API, `<script setup>`), `@vueuse/core`, TypeScript 5.6, Vite 8.3 |
-| **Glass & Styling** | Custom CSS Design Tokens (`src/styles/tokens.css`), Multi-Pass WebGPU / WebGL2 Shaders (`src/features/liquid-glass/`), Lucide Vue Next |
-| **Playback & Media** | `HTMLAudioElement`, Official YouTube IFrame Player API, MediaSession API, `mediabunny` 1.61.1 (WebCodecs MP4 inspection & transcode) |
-| **Custom Source Sandbox** | Web Worker + QuickJS WebAssembly (`quickjs-emscripten-core` & `@jitl/quickjs-wasmfile-release-asyncify` `0.32.0`) |
+| **UI & Reactivity** | Vue 3.5 (Composition API, `<script setup>`), TypeScript 5.6, Vite 8.3 |
+| **Glass & Styling** | Custom CSS Design Tokens (`src/styles/tokens.css`), Multi-Pass WebGPU / WebGL2 Shaders (`src/features/liquid-glass/`), baked PNG refraction tiles, Lucide Vue Next |
+| **Playback & Media** | Dual `HTMLAudioElement`, Official YouTube IFrame Player API, MediaSession API, `mediabunny` 1.61.1 (WebCodecs MP4 inspection & transcode) |
+| **Custom Source Sandbox** | Web Worker + QuickJS WebAssembly (`quickjs-emscripten-core` & `@jitl/quickjs-wasmfile-release-asyncify` `0.32.0`) + Worker `acorn` (`8.15.0`) header parser |
 | **Search & Localisation** | Trilingual i18n (`en`, `zh-Hans`, `zh-Hant`), `opencc-js` 1.4.2 + precomputed CJK Han-folding (`src/features/catalog/hanFold.ts`) |
-| **Local Persistence** | Native browser `IndexedDB` (`src/features/library/localRepository.ts`, `src/features/focus/localRepository.ts`), `localStorage` (`src/utils/safeStorage.ts`), PWA (`vite-plugin-pwa`) |
-| **Edge Backend & Storage** | Cloudflare Workers (`workers/index.ts`), Durable Objects (`workers/online-counter.js`), Cloudflare D1 (SQLite), Cloudflare R2 |
+| **Local Persistence** | Native browser `IndexedDB`, `localStorage`, PWA (`vite-plugin-pwa` `1.3.0`) |
+| **Edge Backend & Storage** | Cloudflare Workers (`workers/index.ts`), Durable Objects (`OnlinePresence`, SQLite `ChatRoom`), Cloudflare D1 (`0001`–`0033`), Cloudflare R2 |
 | **Authentication & Security** | OAuth 2.0 / OIDC (Google, GitHub, LINUX DO), HMAC-SHA256 Session Cookies & Media Tickets, Strict Origin / CSRF / SSRF Guards |
-| **Testing & Tooling** | Vitest, `@vue/test-utils`, `fake-indexeddb`, `jsdom`, Miniflare, Wrangler 4 |
+| **Testing & Tooling** | Vitest 5, `@vue/test-utils`, `fast-check`, `fake-indexeddb`, `jsdom`, Miniflare, Wrangler 4, Python `pytest` (`tools/catalog-sync`) |
 
 <a id="quick-start"></a>
 <a id="en-quick-start"></a>
 
-## 🚀 Quick Start
+## 🚀 Quick Start & Self-Hosting
 
 #### 1. Prerequisites
 
-- **Node.js** `22.18.0` or newer; public CI verifies the Node.js 22 line
-- **npm** (bundled with Node.js)
-- **Git**
+- **Node.js** `22.18.0` or newer (Node.js 22 LTS verified in Public CI)
+- **npm** & **Git**
+- Optional (only for `tools/catalog-sync`): **Python** `3.10+` (`pip install -e .[test]`)
 
 #### 2. Install & Run Frontend Development
 
 ```bash
-# Install exact locked dependencies from package-lock.json
-npm ci
-
-# Start the local Vite development server (automatically decodes PWA icons & generates build info)
+npm ci --no-audit --no-fund
 npm run dev
 ```
 
 Common verification and build scripts:
 
 ```bash
-npm run typecheck     # Generate build info and run vue-tsc + tsc type checking
-npm test              # Run frontend unit and component tests via Vitest
-npm run test:workers  # Run Cloudflare Worker + D1 integration tests via Miniflare/Vitest
-npm run build         # Decode PWA icons, generate build info, and build production bundle into dist/
-npm run preview       # Preview the built frontend locally
-npm run verify        # Run typecheck, frontend tests, Worker tests, and production build
+npm run typecheck                           # Generate build info and run vue-tsc + tsc
+npm test                                    # Run frontend Vitest unit & component suites
+npm run test:workers -- --maxWorkers=2      # Run Cloudflare Worker, D1 & Durable Object tests
+npm run build                               # Bundle frontend + PWA into dist/ (bundle mode)
+npm run preview                             # Preview the built frontend locally
+npm run d1:migrate:local                    # Apply D1 migrations (0001–0033) to local DB
 ```
 
-#### 3. Local Sign-In Button Preview (`HOYOMIX_DEV_AUTH_PREVIEW`)
+#### 3. Environment Configuration (`.dev.vars` & `.env`)
 
-Normal `npm run dev` leaves authentication requests to the downstream backend. To preview all three sign-in buttons (`Google`, `GitHub`, `LINUX DO`) without authenticating, explicitly set `HOYOMIX_DEV_AUTH_PREVIEW=1` in the development server's process environment:
-
-```powershell
-$env:HOYOMIX_DEV_AUTH_PREVIEW = '1'
-try { npm run dev } finally { Remove-Item Env:HOYOMIX_DEV_AUTH_PREVIEW }
-```
-
-```sh
-HOYOMIX_DEV_AUTH_PREVIEW=1 npm run dev
-```
-
-Only the exact value `1` enables this mock; absent, `0`, and `true` leave it off. Do not add it to checked-in environment files; Vite `.env` files do not enable it. It applies only to the Vite development server in `development` mode, never production or staging builds, deployed environments, or `npm run preview`, even when the flag is set.
-
-The mock handles only exact `GET /api/auth/providers` (three available providers), `GET /api/session` (signed-out `401`), and `GET /api/auth/{google,github,linuxdo}/start` (plain-text `501` stating OAuth did not occur). Query strings, including identity-linking queries, are accepted. Responses carry `X-Hoyomix-Dev-Auth-Mock: 1`; JSON responses also contain `mock: true`. Starts do not redirect, create cookies or tokens, sign in, or link identities. Other methods and routes, including trailing slashes and callbacks, continue downstream.
-
-#### 4. Recreate the PWA Icons
-
-The install icons are stored in Git as text-only Base64 sources (`scripts/pwa-icons/pwa-icon-192.png.base64.txt` and `scripts/pwa-icons/pwa-icon-512.png.base64.txt`) so code-review systems that reject binary patches can still carry the complete PWA change. The generated PNG files are intentionally ignored.
-
-Run the decoder directly when you need the raster files:
+1. Copy `.dev.vars.example` to `.dev.vars` (gitignored) for local Cloudflare Worker / Wrangler secrets (`PUBLIC_ORIGIN`, `SESSION_HMAC_SECRET`, `OAUTH_STATE_SECRET`, optional OAuth credentials, `OWNER_PROVIDER`/`OWNER_SUBJECT`, `CHKSZ_API_KEY`, `GD_STUDIO_*`, `LX_ALLOWED_ORIGINS`, `R2_*`, Google Sheets keys, reverse proxy settings).
+2. Optionally copy `.env.example` to `.env.local` for non-secret client flags (`VITE_ENABLE_DEMO_CATALOG`, optional analytics). **Never put secrets in `VITE_*` variables.**
+3. For a release build with explicit CSP origin pinning:
 
 ```bash
-node scripts/generate-pwa-icons.mjs
+RESPONSE_POLICY_PUBLIC_ORIGIN=https://your-domain.example \
+RESPONSE_POLICY_R2_BASE_URL=https://media.your-domain.example/ \
+npm run build:release
 ```
 
-`npm run dev` and `npm run build` run the decoder automatically. The decoder validates the Base64 syntax, PNG signature, declared dimensions, and SHA-256 digest before writing `public/pwa-icon-192.png` and `public/pwa-icon-512.png`.
+#### 4. Local Sign-In Button Preview (`HOYOMIX_DEV_AUTH_PREVIEW`)
 
-#### 5. Complete Local Worker + D1 Backend Environment
+Set `HOYOMIX_DEV_AUTH_PREVIEW=1` in the `npm run dev` process environment to preview OAuth login buttons (`Google`, `GitHub`, `LINUX DO`) without configuring real OAuth apps. Only exact `1` activates the dev-only mock; production/staging/preview builds ignore it completely.
 
-To run the complete local Cloudflare Worker + frontend environment:
-
-1. Copy `.dev.vars.example` to `.dev.vars` (ignored by Git).
-2. Generate independent `SESSION_HMAC_SECRET` and `OAUTH_STATE_SECRET` values in `.dev.vars`, each at least 32 random bytes. Never use client-side `VITE_` variables for secrets.
-3. Optional OAuth & Owner bootstrap: configure provider credentials (`GOOGLE_*`, `GITHUB_*`, `LINUXDO_*`) in `workers/auth/types.ts` / `workers/index.ts` and explicit owner identity via `OWNER_PROVIDER` and `OWNER_SUBJECT`, or leave them unset to keep sign-in providers disabled.
-4. Initialise the local D1 database, build the frontend, and start Wrangler:
+#### 5. Complete Local Worker + D1 + Durable Objects Environment
 
 ```bash
 npm run d1:migrate:local
@@ -259,34 +226,20 @@ npm run build
 npm run dev:worker
 ```
 
-Open `http://localhost:8787`. The checked-in `wrangler.toml` identifies local resources only.
+Open `http://localhost:8787`. Checked-in `wrangler.toml` binds local D1, `PRESENCE` (`OnlinePresence`), and SQLite-backed `CHAT` (`ChatRoom`).
 
-#### 6. Supplying Your Own Media (Open-Source Release)
+#### 6. Recreating Generated Assets & Supplying Media
 
-Because the public release deliberately ships with an empty catalogue and background list:
+- **PWA Icons**: Automatically decoded during `predev`/`prebuild` via `node scripts/generate-pwa-icons.mjs` from verified Base64 sources under `scripts/pwa-icons/`.
+- **Glass Refraction Tiles**: Verified cleanly against `scripts/generate-glass-refraction-tiles.mjs --check`.
+- **Catalogue & Discovery**: Populate `src/features/catalog/catalog.production.json` (`catalog.sample.json`) per `src/features/catalog/schema.ts`, or use `tools/catalog-sync` and `AdminShell` catalogue/discovery workflows. Regenerate Han search folding via `node scripts/generate-han-fold-table.mjs`.
+- **Providers & Backgrounds**: Configure active server providers (`chksz`, `lx`, `gd-studio`) via environment variables and `AdminShell`; add redistributable static backgrounds in `src/features/backgrounds/staticDefinitions.ts` + `public/`, or bind `BACKGROUND_BUCKET` in R2 for admin uploads.
 
-- **Music Catalogue**: Populate `src/features/catalog/catalog.production.json` (and `catalog.sample.json`) conforming to `src/features/catalog/schema.ts`, or administer catalogue revisions and optional Google Sheets imports through `workers/catalogue/`. To regenerate the optional Han folding table after adding catalogue text, run `node scripts/generate-han-fold-table.mjs`.
-- **Music Providers**: Configure opt-in server-side providers in `src/features/player/providers/registry.ts`, `workers/providers/routing.ts`, `workers/providers/config.ts`, and `workers/index.ts` with your own authorised R2 or supported resolver resources. Jellyfin is retired from the hosted service; legacy source references do not imply an active service.
-- **Background Stage**: To add redistributable static backgrounds, update `src/features/backgrounds/staticDefinitions.ts` and place the referenced files under `public/`. Uploaded dynamic backgrounds require an explicitly configured `BACKGROUND_BUCKET` R2 binding.
+<a id="continuous-integration"></a>
 
-## Continuous integration
+## Continuous Integration
 
-[Public CI](https://github.com/NullOkami47/study-with-hoyomix/actions/workflows/public-ci.yml) runs for pull requests into `main`, pushes to `main`, and manual dispatch. It uses standard GitHub-hosted Ubuntu 24.04 runners and Node.js 22.
-
-The workflow installs the public lockfile, checks types, runs the complete public frontend and Worker test suites, builds the app, applies migrations to an ephemeral local D1 database, and checks production dependencies for high or critical vulnerabilities. Frontend tests retain their existing three-worker limit; Worker tests use two workers. The jobs request read-only repository access and use no deployment secrets, self-hosted runner, dependency cache or uploaded artifact.
-
-The job summary records the tested commit/tree, tool versions and input hashes before the build. `All public checks` passes only when validation succeeds; failed, cancelled or skipped validation is rejected. See [the CI guide](docs/public-ci.md) for exact commands, action pins and the result gate.
-
-To run the application checks locally:
-
-```sh
-npm ci
-npm run verify
-npm run d1:migrate:local
-npm audit --omit=dev --audit-level=high
-```
-
-These checks cover the source and synthetic fixtures published here. They do not demonstrate live provider availability, audible background playback on physical devices, production readiness, or equivalence with an unpublished candidate. The supplied catalogue and background definitions remain empty by default.
+[Public CI](https://github.com/NullOkami47/study-with-hoyomix/actions/workflows/public-ci.yml) runs on pull requests into `main`, pushes to `main`, and `workflow_dispatch` on Ubuntu 24.04 with Node.js 22 (`All public checks` gate): `scripts/public-ci.test.mjs`, `npm ci`, `npm run typecheck`, `npm test`, `npm run test:workers -- --maxWorkers=2`, `npm run build`, `npm run d1:migrate:local`, and `npm audit --omit=dev --audit-level=high`. Secret scanning scripts are also included (`scripts/secret-scan.sh`, `scripts/dist-secret-scan.sh`). See [`docs/public-ci.md`](docs/public-ci.md).
 
 <a id="project-layout"></a>
 <a id="en-project-layout"></a>
@@ -295,61 +248,33 @@ These checks cover the source and synthetic fixtures published here. They do not
 
 ```text
 study-with-hoyomix/
-├── .github/workflows/public-ci.yml # Public hosted validation and success gate
+├── .github/workflows/public-ci.yml   # Hosted Public CI and All public checks gate
 ├── docs/
-│   ├── licenses/                 # MIT, Apache-2.0 & runtime dependency licence texts
-│   └── THIRD_PARTY_NOTICES.md    # Upstream & third-party attribution notices
-├── migrations/                   # Cloudflare D1 SQLite migrations (0001–0028)
-├── public/                       # PWA manifests, robots.txt, SVG icon & title cache helper
-├── scripts/
-│   ├── pwa-icons/                # Base64-encoded 192px & 512px PNG icon sources
-│   ├── generate-build-info.mjs   # Build metadata generator
-│   ├── generate-han-fold-table.mjs # OpenCC CJK search-folding table generator
-│   ├── generate-pwa-icons.mjs    # Verified Base64-to-PNG icon decoder
-│   └── public-notices.ts         # Vite plugin serving /legal/*.txt notices
+│   ├── licenses/                     # MIT (Acorn, OpenCC), Apache-2.0 & runtime dependency texts
+│   ├── architecture.md               # Client/Worker/D1/DO architecture overview
+│   ├── chat-retention-recovery.md    # Community Chat retention & guarded recovery guide
+│   ├── community-chat.txt            # Community Chat deployment & moderation notes
+│   ├── public-ci.md                  # Public CI specification
+│   └── THIRD_PARTY_NOTICES.md        # Upstream & third-party attribution notices
+├── migrations/                       # Cloudflare D1 SQLite migrations (0001–0033)
+├── public/                           # PWA manifests, glass refraction tiles, empty catalogue shell
+├── scripts/                          # Build info, PWA icon decoder, glass tile verifier, secret scans
 ├── src/
-│   ├── components/shell/         # Accessible AppShell landmark & skip-link frame
-│   ├── features/
-│   │   ├── account/              # OAuth session, identity linking & D1 preference/library sync
-│   │   ├── admin/                # AdminShell, catalogue/background/notice/provider managers
-│   │   ├── backgrounds/          # Dual-slot video/poster store, overrides & staticDefinitions.ts
-│   │   ├── catalog/              # Schema validation, multi-dimensional filters, OpenCC & Han fold
-│   │   ├── chat/                 # FloatingChatWindow & safe-dock layout geometry
-│   │   ├── focus/                # Pomodoro recorder, StudyCalendar & local/remote repositories
-│   │   ├── legal/                # FanProjectNotice store & component
-│   │   ├── library/              # MusicLibrary, AlbumCard, IndexedDB repository & merge dialog
-│   │   ├── liquid-glass/         # WebGPU/WebGL2 multi-pass shaders, StudioGlassCanvas & NOTICE.md
-│   │   ├── notices/              # System NoticeCentre & NoticeHistory
-│   │   ├── player/               # PlayerBar, QueuePanel, QuickJS LX sandbox & provider adapters
-│   │   ├── settings/             # Unified 8-section SettingsSheet, LxSourceManager & agreements
-│   │   ├── timers/               # Durable monotonic-clock Pomodoro & SleepTimer stores
-│   │   └── workspace/            # StudyWorkspace root, FocusBar, ControlCentre, SceneBackdrop
-│   ├── i18n/                     # Trilingual messages (en, zh-Hans, zh-Hant)
-│   ├── pwa/                      # Service worker registration, install & update status
-│   ├── shared/                   # Shared ChKSz validation, matcher & version signature logic
-│   ├── stores/                   # Workspace preferences store
-│   ├── styles/                   # Liquid Glass CSS custom properties (tokens.css)
-│   ├── test/                     # Frontend unit, attribution, runtime & Vite config specs
-│   ├── types/                    # TypeScript environment declarations
-│   └── utils/                    # Safe storage wrapper
-├── tests/fixtures/               # Tiny synthetic MP4 & poster fixtures for video validation tests
+│   ├── components/shell/             # Accessible AppShell frame
+│   ├── features/                     # account, admin, backgrounds, catalog, chat, focus, glass, legal,
+│   │                                 # library, liquid-glass, notices, player, settings, timers, workspace
+│   ├── i18n/                         # Trilingual messages (en, zh-Hans, zh-Hant)
+│   ├── shared/                       # Shared ChKSz, discovery, and LX CSP helpers
+│   ├── stores/, styles/, types/, utils/, test/
+├── tests/fixtures/                   # Tiny synthetic MP4 & poster fixtures
+├── tools/catalog-sync/               # Self-contained Python catalogue discovery & CLI tests
 ├── workers/
-│   ├── account/                  # User preference sync handlers
-│   ├── admin/                    # Role-gated admin API routes & authorization
-│   ├── auth/                     # Google, GitHub & LINUX DO OAuth/OIDC flows & session signing
-│   ├── backgrounds/              # R2 background media & MP4 bitstream validation routes
-│   ├── catalogue/                # D1 catalogue staging, diffing, publication & Google Sheets import
-│   ├── focus/                    # Focus session sync routes
-│   ├── library/                  # Cloud library sync routes
-│   ├── providers/                # Server-side audio provider config, SSRF guards & routes
-│   ├── test/                     # Miniflare Worker + D1 security & integration test suites
-│   ├── index.ts                  # Main Cloudflare Worker fetch & scheduled handler
-│   ├── online-counter.js         # OnlineCounter Durable Object (WebSocket presence & chat)
-│   └── presence.ts               # Presence routing helpers
-├── BUILDING.txt                  # Local development and Worker setup instructions
-├── LICENSE                       # GNU General Public License v3.0
-├── NOTICE                        # Source, modification & copyright notices
-└── wrangler.toml                 # Local Cloudflare Workers, D1, R2 & Durable Objects config
+│   ├── account/, admin/, auth/, backgrounds/, catalogue/, focus/, library/, lx/, providers/
+│   ├── chat/                         # ChatRoom SQLite Durable Object, routes, retention & moderation
+│   ├── test/                         # Miniflare Worker, D1 & DO security/integration suites
+│   ├── index.ts                      # Main Cloudflare Worker fetch & scheduled handler
+│   └── presence.ts                   # OnlinePresence Durable Object & presence routes
+├── BUILDING.txt, CHANGELOG.md, LICENSE, NOTICE, wrangler.toml, .dev.vars.example, .env.example
 ```
 
 <a id="credits"></a>
@@ -357,51 +282,9 @@ study-with-hoyomix/
 
 ## 🙏 Credits
 
-The public edition contains the incorporated components listed below. Research references informed design or evaluation work; they are not claims of bundled dependencies, shipped candidate features, live-service availability or device acceptance.
-
-### Incorporated foundations and renderer components
-
-- [shshouse/StudyWithMiku](https://github.com/shshouse/StudyWithMiku) — the application baseline from which this project was adapted; retained notices are in [NOTICE](NOTICE) and [third-party notices](docs/THIRD_PARTY_NOTICES.md).
-- [iyinchao/liquid-glass-studio](https://github.com/iyinchao/liquid-glass-studio) — selected renderer and shader components adapted under MIT; retained notices and source mapping are in [the renderer notice](src/features/liquid-glass/NOTICE.md).
-
-### Upstream acknowledgements and compatibility references
-
-- [DIYgod/APlayer](https://github.com/DIYgod/APlayer) — acknowledged by the original StudyWithMiku project; its legacy bundles are not included in this public source edition.
-- [metowolf/Meting](https://github.com/metowolf/Meting) — API/compatibility research reference. The separate @meting/core-based compatibility service is not included in this public source edition.
-
-### Design, architecture and platform research
-
-- [gxxk-dev/StudyWithMiku](https://github.com/gxxk-dev/StudyWithMiku) — reference for Focus records, sessions and PWA design; the local implementation follows its own storage and update model.
-- [WenqiOfficial/StudyWithMiku](https://github.com/WenqiOfficial/StudyWithMiku) — update-strategy research reference; its polling/update implementation was not incorporated.
-- [pdone/lx-music-source](https://github.com/pdone/lx-music-source) — protocol research for independently implemented LX resolver adapters; upstream scripts were not copied wholesale.
-- [guoyue2010/lxmusic-](https://github.com/guoyue2010/lxmusic-) — historical source-provenance research using dated LX mirror snapshots; not a bundled runtime dependency.
-- [lladlam/MeloX-Android](https://github.com/lladlam/MeloX-Android) — reference for third-party music-source disclosure and consent topics; its branding and cloud-control architecture were not adopted.
-- [jizizr/mhub](https://github.com/jizizr/mhub) — research reference for multi-provider resolution, media validation and playback qualification; its code is not vendored or added as a dependency.
-- [qier222/YesPlayMusic](https://github.com/qier222/YesPlayMusic) — NetEase resolver and player-architecture feasibility reference; no application code was incorporated.
-- [metowolf/MetingJS](https://github.com/metowolf/MetingJS) — browser-player integration research reference; not incorporated into the Worker-only provider architecture.
-- [NeteaseCloudMusicApiEnhanced/api-enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) — resolver API feasibility research; not shipped as a provider or dependency in this public edition.
-- [sxhxliang/gpui-liquid-glass](https://github.com/sxhxliang/gpui-liquid-glass) — design reference for backdrop ownership, layering, lifecycle cleanup and readable fallbacks; native code was not ported.
-- [lucaperullo/simple-liquid-glass](https://github.com/lucaperullo/simple-liquid-glass) — evaluated renderer/Web Component alternative that informed CSP and backdrop-ownership decisions; no source was incorporated.
-- [gentpan/liquidglass](https://github.com/gentpan/liquidglass) — source-review reference for refraction and fallback approaches; no source was incorporated.
-- [regosen/Gapless-5](https://github.com/regosen/Gapless-5) — research reference for preload readiness, fade envelopes and cleanup; not a runtime dependency.
-- [subframe7536/audio0](https://github.com/subframe7536/audio0) — research reference for queue-aware preparation, listener cleanup and Media Session lifecycle; not a runtime dependency.
-- [goldfire/howler.js](https://github.com/goldfire/howler.js) — research reference for media fallback, pooling/unlock and fade cancellation; not a runtime dependency.
-- [meyda/meyda](https://github.com/meyda/meyda) — research reference for bounded audio-feature sampling; no Meyda dependency or FFT/BPM pipeline was added.
-- [monochrome-music/monochrome](https://github.com/monochrome-music/monochrome) — reference for guarded synchronous handoff on the existing audio element; in particular [PR #558](https://github.com/monochrome-music/monochrome/pull/558), studied during background-playback work. It was not vendored or treated as device-acceptance proof.
-- [phiamo/capacitor-plugin-playlist](https://github.com/phiamo/capacitor-plugin-playlist) — native playlist and background-audio feasibility reference; no plugin or native application was integrated.
-- [androidx/media](https://github.com/androidx/media) — platform research for MediaSessionService and native background-audio lifecycle; not a dependency of this web app.
-- [WebKit/WebKit](https://github.com/WebKit/WebKit) — source and behaviour research on background media, volume handling and platform limits; no WebKit code was incorporated.
-- [TeamPiped/Piped-Backend](https://github.com/TeamPiped/Piped-Backend), [OpenAPI](https://github.com/TeamPiped/OpenAPI) and [documentation](https://github.com/TeamPiped/documentation) — API schema and stream-response research for the independent provider adapter; the Piped frontend and backend are not bundled.
-- [iv-org/invidious](https://github.com/iv-org/invidious) — API and audio-stream contract research for an independently implemented bounded provider adapter; server code was not bundled.
-
-### Historical development tooling
-
-- [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) — historical media-preparation metadata tooling recorded in earlier work; not bundled with this public source edition.
-
-
-The actual browser sandbox dependency is [justjake/quickjs-emscripten](https://github.com/justjake/quickjs-emscripten). Other shipped dependency notices, including Mediabunny and OpenCC, are maintained in [third-party notices](docs/THIRD_PARTY_NOTICES.md) and the retained licence texts.
-
-These acknowledgements record the role established by source and research records. Similar project names or a link appearing inside another project do not by themselves establish use.
+- [shshouse/StudyWithMiku](https://github.com/shshouse/StudyWithMiku) — original GPL-3.0 baseline (`7b094632d08a6599a1b334e6c6af41dc10ea6495`); see [`NOTICE`](NOTICE) and [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md).
+- [iyinchao/liquid-glass-studio](https://github.com/iyinchao/liquid-glass-studio) — selected MIT-licensed renderer/shader components (`d13c3e53813ebc1d8b52d878071b63212a550ebc`); see [`src/features/liquid-glass/NOTICE.md`](src/features/liquid-glass/NOTICE.md).
+- Open-source runtime packages including `vue`, `lucide-vue-next`, `acorn`, `opencc-js`, `mediabunny` (MPL-2.0), and `quickjs-emscripten`. See [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md) for complete copyright notices, upstream references, and licence texts.
 
 <a id="links"></a>
 <a id="en-links"></a>
@@ -415,6 +298,4 @@ These acknowledgements record the role established by source and research record
 
 ## 📄 License & Attribution
 
-The implementation baseline is derived from [StudyWithMiku](https://github.com/shshouse/StudyWithMiku) at commit [`7b094632d08a6599a1b334e6c6af41dc10ea6495`](https://github.com/shshouse/StudyWithMiku/tree/7b094632d08a6599a1b334e6c6af41dc10ea6495). Study with HOYO-MiX is licensed under **GPL-3.0**; see [LICENSE](LICENSE), [NOTICE](https://github.com/NullOkami47/study-with-hoyomix/blob/main/NOTICE), and [third-party notices](docs/THIRD_PARTY_NOTICES.md).
-
-The post-MVP LLM classification system is intentionally separated from the MVP plans. No upstream media is included until its provenance is independently verified and recorded.
+Derived from [StudyWithMiku](https://github.com/shshouse/StudyWithMiku) at commit [`7b094632d08a6599a1b334e6c6af41dc10ea6495`](https://github.com/shshouse/StudyWithMiku/tree/7b094632d08a6599a1b334e6c6af41dc10ea6495). Study with HOYO-MiX is licensed under **GPL-3.0**; see [`LICENSE`](LICENSE), [`NOTICE`](NOTICE), and [`docs/THIRD_PARTY_NOTICES.md`](docs/THIRD_PARTY_NOTICES.md).

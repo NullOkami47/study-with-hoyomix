@@ -9,6 +9,7 @@ export const PUBLIC_NOTICES = {
   '/legal/notice.txt': 'NOTICE',
   '/legal/third-party-notices.txt': 'docs/THIRD_PARTY_NOTICES.md',
   '/legal/liquid-glass-notice.txt': 'src/features/liquid-glass/NOTICE.md',
+  '/legal/acorn-8.15.0.txt': 'docs/licenses/acorn-8.15.0.txt',
 } as const
 
 // Plain-text static hosts do not consistently declare a charset. The UTF-8

@@ -3,14 +3,16 @@ import { readBoundedJsonRequest } from './boundedJson'
 import type { Env } from '../env'
 import { findSession, readCookie, SESSION_COOKIE } from '../auth/session'
 
-export type UserToggleableProviderId = 'chksz' | 'lx' | 'jellyfin'
+export type UserToggleableProviderId = 'chksz' | 'lx' | 'gd-studio'
 
 /**
  * Canonical, ordered set of providers a user may disable for themselves.
- * Normal automatic providers are chksz, lx, and jellyfin.
+ * Retired identities remain readable in stored data but are dropped on read,
+ * so an old preference can neither select nor exclude a provider that no longer
+ * exists.
  */
 export const USER_TOGGLEABLE_PROVIDER_IDS: readonly UserToggleableProviderId[] =
-  Object.freeze(['chksz', 'lx', 'jellyfin'] as const)
+  Object.freeze(['chksz', 'lx', 'gd-studio'] as const)
 
 export const LEGACY_LX_IDS = [
   'lx-huibq',
@@ -65,12 +67,11 @@ const inCanonicalOrder = (
     (CANONICAL_ORDER.get(left) ?? 0) - (CANONICAL_ORDER.get(right) ?? 0))
 
 /**
- * Pure helper to migrate legacy disabled provider IDs to the three-provider model:
+ * Pure helper to migrate legacy disabled provider IDs to the canonical provider model:
  * 1. Old chksz disabled -> new chksz disabled.
  * 2. All 8 old LX IDs disabled -> new lx disabled.
  * 3. If not all 8 old LX IDs disabled -> new lx remains enabled.
- * 4. Jellyfin absent -> remains enabled (not disabled).
- * 5. Obsolete IDs (r2, meting, piped, invidious, gd-studio, qijie, etc.) -> dropped.
+ * 5. Obsolete IDs (r2, meting, piped, invidious, qijie, etc.) -> dropped.
  * 6. Idempotent: migrating an already migrated array leaves it unchanged.
  */
 export function migrateLegacyDisabledProviderIds(
@@ -88,10 +89,12 @@ export function migrateLegacyDisabledProviderIds(
     result.push('lx')
   }
 
-  if (set.has('jellyfin')) {
-    result.push('jellyfin')
+  if (set.has('gd-studio')) {
+    result.push('gd-studio')
   }
 
+  // Retired identities, including Vkeys and Jellyfin, are intentionally dropped. A stored
+  // exclusion must never be able to describe a provider that no longer exists.
   return inCanonicalOrder(result)
 }
 

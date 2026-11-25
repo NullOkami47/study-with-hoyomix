@@ -67,17 +67,14 @@ describe('migrateLegacyDisabledProviderIds', () => {
     expect(migrateLegacyDisabledProviderIds(['chksz', ...LEGACY_LX_IDS])).toEqual(['chksz', 'lx'])
   })
 
-  it('keeps jellyfin enabled when absent', () => {
-    expect(migrateLegacyDisabledProviderIds(['chksz'])).toEqual(['chksz'])
+  it('drops retired jellyfin and vkeys when present in input', () => {
+    expect(migrateLegacyDisabledProviderIds(['jellyfin'])).toEqual([])
+    expect(migrateLegacyDisabledProviderIds(['vkeys', 'jellyfin', 'chksz'])).toEqual(['chksz'])
   })
 
-  it('preserves jellyfin when present in input', () => {
-    expect(migrateLegacyDisabledProviderIds(['jellyfin'])).toEqual(['jellyfin'])
-  })
-
-  it('drops obsolete IDs completely (r2, meting, piped, invidious, gd-studio, qijie, etc.)', () => {
+  it('drops obsolete IDs completely (r2, meting, piped, invidious, qijie, etc.)', () => {
     expect(migrateLegacyDisabledProviderIds([
-      'r2', 'meting', 'piped', 'invidious', 'gd-studio', 'qijie', 'youtube', 'unknown',
+      'r2', 'meting', 'piped', 'invidious', 'qijie', 'youtube', 'jellyfin', 'vkeys', 'unknown',
     ])).toEqual([])
   })
 
@@ -85,12 +82,12 @@ describe('migrateLegacyDisabledProviderIds', () => {
     expect(migrateLegacyDisabledProviderIds([])).toEqual([])
     expect(migrateLegacyDisabledProviderIds(['chksz'])).toEqual(['chksz'])
     expect(migrateLegacyDisabledProviderIds(['lx'])).toEqual(['lx'])
-    expect(migrateLegacyDisabledProviderIds(['jellyfin'])).toEqual(['jellyfin'])
-    expect(migrateLegacyDisabledProviderIds(['chksz', 'lx', 'jellyfin'])).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect(migrateLegacyDisabledProviderIds(['gd-studio'])).toEqual(['gd-studio'])
+    expect(migrateLegacyDisabledProviderIds(['chksz', 'lx', 'gd-studio'])).toEqual(['chksz', 'lx', 'gd-studio'])
   })
 
   it('sorts the migrated result in canonical order', () => {
-    expect(migrateLegacyDisabledProviderIds(['jellyfin', 'chksz', 'lx'])).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect(migrateLegacyDisabledProviderIds(['gd-studio', 'chksz', 'lx'])).toEqual(['chksz', 'lx', 'gd-studio'])
   })
 })
 
@@ -137,29 +134,29 @@ describe('browser provider preference store', () => {
   it('keeps the stored selection in canonical order', () => {
     const store = createProviderPreferencesStore({ storage })
 
-    store.setDisabled('jellyfin', true)
+    store.setDisabled('gd-studio', true)
     store.setDisabled('chksz', true)
     store.setDisabled('lx', true)
 
-    expect([...store.disabledProviderIds()]).toEqual(['chksz', 'lx', 'jellyfin'])
+    expect([...store.disabledProviderIds()]).toEqual(['chksz', 'lx', 'gd-studio'])
   })
 
   it('restores a valid persisted v2 selection', () => {
     storage.setItem(PROVIDER_PREFERENCES_STORAGE_KEY, JSON.stringify({
       version: 2,
-      disabledProviderIds: ['jellyfin', 'chksz'],
+      disabledProviderIds: ['gd-studio', 'chksz'],
     }))
 
     const store = createProviderPreferencesStore({ storage })
 
-    expect([...store.disabledProviderIds()]).toEqual(['chksz', 'jellyfin'])
+    expect([...store.disabledProviderIds()]).toEqual(['chksz', 'gd-studio'])
   })
 
   describe('v1 to v2 local storage migration', () => {
     it('reads v2 key first if present and ignores v1', () => {
       storage.setItem(PROVIDER_PREFERENCES_STORAGE_KEY, JSON.stringify({
         version: 2,
-        disabledProviderIds: ['jellyfin'],
+        disabledProviderIds: ['gd-studio'],
       }))
       storage.setItem(PROVIDER_PREFERENCES_STORAGE_KEY_V1, JSON.stringify({
         version: 1,
@@ -168,7 +165,7 @@ describe('browser provider preference store', () => {
 
       const store = createProviderPreferencesStore({ storage })
 
-      expect([...store.disabledProviderIds()]).toEqual(['jellyfin'])
+      expect([...store.disabledProviderIds()]).toEqual(['gd-studio'])
       expect(storage.getItem(PROVIDER_PREFERENCES_STORAGE_KEY_V1)).not.toBeNull()
     })
 
@@ -257,11 +254,11 @@ describe('browser provider preference store', () => {
 
     const store = createProviderPreferencesStore({ storage })
 
-    expect([...store.disabledProviderIds()]).toEqual(['chksz'])
+    expect([...store.disabledProviderIds()]).toEqual(['chksz', 'gd-studio'])
   })
 
   it.each([
-    'r2', 'meting', 'piped', 'invidious', 'lx-huibq', 'lx-ikun', 'youtube', 'qijie', 'gd-studio', 'lx-unknown', '',
+    'r2', 'meting', 'piped', 'invidious', 'lx-huibq', 'lx-ikun', 'youtube', 'qijie', 'lx-unknown', '',
   ])('refuses to disable the non-toggleable ID %s', (id) => {
     const store = createProviderPreferencesStore({ storage })
 
@@ -286,12 +283,12 @@ describe('browser provider preference store', () => {
 
   it('fetches and adopts the account selection when signing in', async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse({ disabledProviderIds: ['lx', 'jellyfin'] })) as unknown as typeof fetch
+      jsonResponse({ disabledProviderIds: ['lx', 'gd-studio'] })) as unknown as typeof fetch
     const store = createProviderPreferencesStore({ storage, fetch: fetchImpl })
 
     await store.setSignedIn(true)
 
-    expect([...store.disabledProviderIds()]).toEqual(['lx', 'jellyfin'])
+    expect([...store.disabledProviderIds()]).toEqual(['lx', 'gd-studio'])
     expect(fetchImpl).toHaveBeenCalledWith(ENDPOINT, expect.objectContaining({
       method: 'GET',
       credentials: 'same-origin',
@@ -331,17 +328,17 @@ describe('browser provider preference store', () => {
   it('synchronises a later local change while signed in', async () => {
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
       jsonResponse({
-        disabledProviderIds: init?.method === 'PUT' ? ['jellyfin'] : [],
+        disabledProviderIds: init?.method === 'PUT' ? ['gd-studio'] : [],
       })) as unknown as typeof fetch
     const store = createProviderPreferencesStore({ storage, fetch: fetchImpl })
     await store.setSignedIn(true)
 
-    store.setDisabled('jellyfin', true)
+    store.setDisabled('gd-studio', true)
     await store.flush()
 
     const put = vi.mocked(fetchImpl).mock.calls.find(([, init]) => init?.method === 'PUT')
-    expect(put![1]?.body).toBe(JSON.stringify({ disabledProviderIds: ['jellyfin'] }))
-    expect(store.isDisabled('jellyfin')).toBe(true)
+    expect(put![1]?.body).toBe(JSON.stringify({ disabledProviderIds: ['gd-studio'] }))
+    expect(store.isDisabled('gd-studio')).toBe(true)
   })
 
   it('preserves valid local state when the remote read fails', async () => {
@@ -363,11 +360,11 @@ describe('browser provider preference store', () => {
     const store = createProviderPreferencesStore({ storage, fetch: fetchImpl })
     await store.setSignedIn(true)
 
-    store.setDisabled('jellyfin', true)
+    store.setDisabled('gd-studio', true)
     await store.flush()
 
-    expect([...store.disabledProviderIds()]).toEqual(['jellyfin'])
-    expect(stored(storage)).toEqual({ version: 2, disabledProviderIds: ['jellyfin'] })
+    expect([...store.disabledProviderIds()]).toEqual(['gd-studio'])
+    expect(stored(storage)).toEqual({ version: 2, disabledProviderIds: ['gd-studio'] })
   })
 
   it.each([
@@ -384,6 +381,19 @@ describe('browser provider preference store', () => {
     await store.setSignedIn(true)
 
     expect([...store.disabledProviderIds()]).toEqual(['chksz'])
+  })
+
+  it('drops a retired member from an older Worker and keeps the live exclusion', async () => {
+    const response = new Response('{"disabledProviderIds":["lx","vkeys"]}', {
+      headers: { 'content-type': 'application/json' },
+    })
+    Object.defineProperty(response, 'url', { configurable: true, value: ENDPOINT })
+    const fetchImpl = vi.fn(async () => response) as unknown as typeof fetch
+    const store = createProviderPreferencesStore({ storage, fetch: fetchImpl })
+
+    await store.setSignedIn(true)
+
+    expect([...store.disabledProviderIds()]).toEqual(['lx'])
   })
 
   it('returns to local-only behaviour after signing out', async () => {
@@ -439,7 +449,7 @@ describe('browser provider preference store', () => {
     expect([...USER_TOGGLEABLE_PROVIDER_IDS]).toEqual([
       'chksz',
       'lx',
-      'jellyfin',
+      'gd-studio',
     ])
   })
 
@@ -490,9 +500,9 @@ it('does not copy one account provider choices into a different account', async 
   const store = createProviderPreferencesStore({ storage, fetch: fetcher })
   await store.setSignedIn(true, 'account-a')
   await store.setSignedIn(false)
-  remote = ['jellyfin']
+  remote = ['gd-studio']
   await store.setSignedIn(true, 'account-b')
-  expect([...store.disabledProviderIds()]).toEqual(['jellyfin'])
+  expect([...store.disabledProviderIds()]).toEqual(['gd-studio'])
   expect(puts).toBe(0)
 })
 
@@ -503,11 +513,11 @@ it('ignores a pending account read after logout without uploading anonymous edit
   const signingIn = store.setSignedIn(true, 'account-a')
   await Promise.resolve()
   await store.setSignedIn(false)
-  store.setDisabled('jellyfin', true)
+  store.setDisabled('gd-studio', true)
   finish(jsonResponse({ disabledProviderIds: ['lx'] }))
   await signingIn
   await store.flush()
-  expect([...store.disabledProviderIds()]).toEqual(['jellyfin'])
+  expect([...store.disabledProviderIds()]).toEqual(['gd-studio'])
   expect(fetcher).toHaveBeenCalledTimes(1)
 })
 
@@ -515,14 +525,14 @@ it('ignores an earlier account read after switching accounts while it is pending
   let finish!: (response: Response) => void
   const fetcher = vi.fn()
     .mockImplementationOnce(() => new Promise<Response>(resolve => { finish = resolve }))
-    .mockResolvedValue(jsonResponse({ disabledProviderIds: ['jellyfin'] }))
+    .mockResolvedValue(jsonResponse({ disabledProviderIds: ['gd-studio'] }))
   const store = createProviderPreferencesStore({ storage: new MemoryStorage(), fetch: fetcher })
   const first = store.setSignedIn(true, 'account-a')
   await Promise.resolve()
   const second = store.setSignedIn(true, 'account-b')
   finish(jsonResponse({ disabledProviderIds: ['lx'] }))
   await Promise.all([first, second])
-  expect([...store.disabledProviderIds()]).toEqual(['jellyfin'])
+  expect([...store.disabledProviderIds()]).toEqual(['gd-studio'])
   expect(fetcher.mock.calls).toHaveLength(2)
 })
 
@@ -537,11 +547,11 @@ it('does not overwrite a newer local edit with an in-flight write echo', async (
   await store.setSignedIn(true, 'account-a')
   store.setDisabled('lx', true)
   await Promise.resolve()
-  store.setDisabled('jellyfin', true)
+  store.setDisabled('gd-studio', true)
   finish(jsonResponse({ disabledProviderIds: ['lx'] }))
   await store.flush()
-  expect([...store.disabledProviderIds()]).toEqual(['lx', 'jellyfin'])
-  expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toEqual({ disabledProviderIds: ['lx', 'jellyfin'] })
+  expect([...store.disabledProviderIds()]).toEqual(['lx', 'gd-studio'])
+  expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toEqual({ disabledProviderIds: ['lx', 'gd-studio'] })
 })
 
 it('cancels queued account writes when the user signs out before they start', async () => {
@@ -560,7 +570,7 @@ it('ignores a write response from the previous account after a switch', async ()
   const fetcher = vi.fn()
     .mockResolvedValueOnce(jsonResponse({ disabledProviderIds: [] }))
     .mockImplementationOnce(() => new Promise<Response>(resolve => { finish = resolve }))
-    .mockResolvedValue(jsonResponse({ disabledProviderIds: ['jellyfin'] }))
+    .mockResolvedValue(jsonResponse({ disabledProviderIds: ['gd-studio'] }))
   const store = createProviderPreferencesStore({ storage: new MemoryStorage(), fetch: fetcher })
   await store.setSignedIn(true, 'account-a')
   store.setDisabled('lx', true)
@@ -569,7 +579,7 @@ it('ignores a write response from the previous account after a switch', async ()
   finish(jsonResponse({ disabledProviderIds: ['lx'] }))
   await Promise.resolve()
   await Promise.resolve()
-  expect([...store.disabledProviderIds()]).toEqual(['jellyfin'])
+  expect([...store.disabledProviderIds()]).toEqual(['gd-studio'])
   expect(fetcher.mock.calls).toHaveLength(3)
 })
 
@@ -601,7 +611,7 @@ it('never writes inherited local choices after the new account read fails', asyn
   const store = createProviderPreferencesStore({ storage: new MemoryStorage(), fetch: fetcher })
   await store.setSignedIn(true, 'account-a')
   await store.setSignedIn(true, 'account-b')
-  store.setDisabled('jellyfin', true)
+  store.setDisabled('gd-studio', true)
   await store.flush()
   expect(fetcher.mock.calls).toHaveLength(2)
 })
@@ -639,9 +649,19 @@ it('merges first-login anonymous choices once while retaining the V2 local envel
   expect(stored(storage)).toEqual({ version: 2, disabledProviderIds: ['chksz', 'lx'] })
 
   await store.setSignedIn(false)
-  store.setDisabled('jellyfin', true)
+  store.setDisabled('gd-studio', true)
   remote = []
   await store.setSignedIn(true, 'account-a')
   expect([...store.disabledProviderIds()]).toEqual([])
   expect(writes).toBe(1)
+})
+
+
+it('preserves the independent GD Studio exclusion across legacy preference migration', () => {
+  expect(migrateLegacyDisabledProviderIds(['gd-studio', 'lx-ikun', 'unknown'])).toEqual(['gd-studio'])
+})
+
+it('drops retired Vkeys disablement instead of resurrecting the provider', () => {
+  expect(migrateLegacyDisabledProviderIds(['vkeys'])).toEqual([])
+  expect(migrateLegacyDisabledProviderIds(['vkeys', 'lx'])).toEqual(['lx'])
 })

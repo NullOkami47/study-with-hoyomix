@@ -12,7 +12,6 @@ import {
   maxChatSize,
   parseChatLayout,
   resolveChatLayout,
-  resolveChatSheetLayout,
   serialiseChatLayout,
 } from './chatLayout'
 
@@ -140,33 +139,6 @@ describe('floating chat layout', () => {
     expect(reconciled.height).toBeGreaterThanOrEqual(MIN_DERIVED_CHAT_HEIGHT)
     expect(overlaps(reconciled, progress)).toBe(false)
     expect(overlaps(reconciled, controls)).toBe(false)
-  })
-  it('keeps portrait and short-landscape sheets above the Player controls with a scrollable body band', () => {
-    const resolveSheet = resolveChatSheetLayout
-    const portrait = resolveSheet(
-      { width: 375, height: 812, top: 124 },
-      [
-        { x: 16, y: 486, width: 343, height: 310 },
-        { x: 16, y: 640, width: 343, height: 24 },
-        { x: 16, y: 670, width: 343, height: 96 },
-      ],
-      48,
-    )
-    expect(portrait).toEqual({ blockEnd: 342, availableHeight: 346 })
-
-    // The player card consumes the lower half of this 667x375 landscape viewport. The
-    // sheet yields the card but keeps 150px above the seek row for its header and body.
-    const landscape = resolveSheet(
-      { width: 667, height: 375, top: 54 },
-      [
-        { x: 16, y: 130, width: 635, height: 229 },
-        { x: 16, y: 220, width: 635, height: 16 },
-        { x: 16, y: 244, width: 635, height: 96 },
-      ],
-      48,
-    )
-    expect(landscape).toEqual({ blockEnd: 171, availableHeight: 150 })
-    expect(landscape.availableHeight).toBeGreaterThan(48 + 64)
   })
   /**
    * The measured phone case: a bar that wraps to two rows reaches 124px, and an expanded
@@ -309,19 +281,42 @@ describe('floating chat layout', () => {
   })
 
   it('lets the viewport win over the minimum when the viewport is smaller than it', () => {
-    // A window shrunk to fit a 200px viewport would have unusable controls, so the
-    // minimum is kept and the clamp pins it to the safe margin: reachable, not tidy.
+    // Width keeps its usable minimum and pins to the safe margin. Height takes the band a
+    // short viewport has (here 200 - 16 - 16 = 168), so the composer and resize corner stay
+    // on screen, and never drops below the derived floor.
     const viewport = { width: 200, height: 200 }
     const limit = maxChatSize(viewport)
 
-    expect(limit).toEqual({ width: MIN_CHAT_WIDTH, height: MIN_CHAT_HEIGHT })
+    expect(limit).toEqual({ width: MIN_CHAT_WIDTH, height: 168 })
     expect(clampChatLayout({ x: 900, y: 900, width: 400, height: 400 }, viewport))
-      .toEqual({ x: CHAT_SAFE_MARGIN, y: CHAT_SAFE_MARGIN, width: MIN_CHAT_WIDTH, height: MIN_CHAT_HEIGHT })
+      .toEqual({ x: CHAT_SAFE_MARGIN, y: CHAT_SAFE_MARGIN, width: MIN_CHAT_WIDTH, height: 168 })
+    expect(maxChatSize({ width: 200, height: 100 }).height).toBe(MIN_DERIVED_CHAT_HEIGHT)
   })
 
   it('round-trips only the four geometry fields', () => {
     const raw = serialiseChatLayout({ x: 1, y: 2, width: 300, height: 400 })
 
     expect(Object.keys(JSON.parse(raw) as object).sort()).toEqual(['height', 'width', 'x', 'y'])
+  })
+})
+
+describe('phone window geometry', async () => {
+  const layout = await import('./chatLayout')
+  it('opens the phone window at 300x380 at the bottom right, clear of a docked player', () => {
+    const viewport = { width: 375, height: 812, top: 68 }
+    const player = { x: 0, y: 720, width: 375, height: 76 }
+    const box = layout.defaultNarrowChatLayout(viewport, [player])
+    expect(box).toMatchObject({ width: 300, height: 380, x: 375 - 300 - layout.CHAT_SAFE_MARGIN })
+    expect(box.y + box.height).toBeLessThanOrEqual(player.y)
+    expect(box.y).toBeGreaterThanOrEqual(68)
+  })
+  it('lowers the minimum height to the band a short viewport has, never below the derived floor', () => {
+    expect(layout.minChatHeight({ width: 1280, height: 900 })).toBe(layout.MIN_CHAT_HEIGHT)
+    // Landscape phone: 375 - 68 - 16 = 291px of band.
+    expect(layout.minChatHeight({ width: 667, height: 375, top: 68 })).toBe(291)
+    const clamped = layout.clampChatLayout({ x: 0, y: 0, width: 300, height: 380 }, { width: 667, height: 375, top: 68 })
+    expect(clamped.y).toBe(68)
+    expect(clamped.y + clamped.height).toBeLessThanOrEqual(375 - layout.CHAT_SAFE_MARGIN)
+    expect(layout.minChatHeight({ width: 375, height: 200, top: 68 })).toBe(layout.MIN_DERIVED_CHAT_HEIGHT)
   })
 })

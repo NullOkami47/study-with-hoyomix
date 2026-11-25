@@ -4,12 +4,12 @@
  * ## Architecture & Resolution Pipeline
  *
  * Each album card and track row resolves a real cover image whenever available:
- * 1. Primary candidate: `/api/providers/jellyfin/artwork/:itemId` (proxied by the Worker
- *    with upstream authorization, strict CSP, and `Cache-Control: public, max-age=3600`).
- * 2. Fallback candidate: If Jellyfin is absent or returns an error, fallback to ChKSz via
+ * 1. Canonical NetEase bindings use the existing LX/GD artwork GET routes, without audio
+ *    resolution or a ChKSz key. Both retain their server-side provider enablement guards.
+ * 2. Legacy fallback: If those candidates are unavailable, fallback to ChKSz via
  *    `POST /api/providers/chksz/resolve`, which returns `/api/providers/chksz/artwork?url=...`
  *    (proxied with strict CSP and `Cache-Control: public, max-age=86400`).
- * 3. Graceful fallback: If neither is available or both fail, render the deterministic
+ * 3. Graceful fallback: If every candidate fails, render the deterministic
  *    FNV-1a gradient fallback. No broken-image icons are ever displayed.
  *
  * ## Quota, Concurrency & Caching Guardrails
@@ -24,8 +24,13 @@
 
 import {
   computed,
+  getCurrentInstance,
+  getCurrentScope,
+  inject,
+  nextTick,
+  onMounted,
+  onScopeDispose,
   ref,
-  shallowReactive,
   toValue,
   watch,
   type MaybeRefOrGetter,
@@ -34,6 +39,10 @@ import {
 
 import type { Track, TrackSource } from '../catalog/types'
 import type { AlbumEntry } from './catalogueIndex'
+import { isChkszExternalId } from '../../shared/chksz'
+import { deriveLxCandidates } from '../player/lx/candidates'
+import { publicArtworkUrl, sharedArtworkCache, type ArtworkLease } from './artworkCache'
+import { artworkPermissionsKey } from './artworkPermissions'
 
 /** FNV-1a, 32-bit. Small, dependency-free, and stable across engines. */
 function hashSeed(seed: string): number {
@@ -56,250 +65,285 @@ export function placeholderArtwork(seed: string): string {
   return `linear-gradient(145deg, hsl(${hue}, 58%, 42%), hsl(${secondary}, 52%, 22%))`
 }
 
-const MAX_CONCURRENT_RESOLVES = 4
-let activeResolves = 0
-const queue: (() => void)[] = []
-
-/** In-memory cache mapping artwork key (e.g. `album:${title}` or `track:${id}`) to resolved URL or null (failed). */
-const artworkCache = shallowReactive(new Map<string, string | null>())
+// Bounded metadata-resolution memo only. Displayed bytes belong exclusively to sharedArtworkCache.
+const artworkCache = new Map<string, { url: string | null; until: number }>()
 const inFlightResolves = new Map<string, Promise<string | null>>()
-
+const resolutionControllers = new Set<AbortController>()
+let cacheEpoch = 0
+function readCachedArtwork(key: string): string | null | undefined {
+  const entry = artworkCache.get(key)
+  if (entry && entry.until > Date.now()) return entry.url
+  artworkCache.delete(key)
+}
+function cacheArtwork(key: string, url: string | null): void {
+  if (url && !publicArtworkUrl(url)) return
+  artworkCache.delete(key)
+  artworkCache.set(key, { url, until: Date.now() + 30000 })
+  while (artworkCache.size > 64) artworkCache.delete(artworkCache.keys().next().value!)
+}
 export function clearArtworkCache(): void {
+  cacheEpoch++
+  for (const controller of resolutionControllers) controller.abort()
+  resolutionControllers.clear()
+  sharedArtworkCache.clear()
   artworkCache.clear()
   inFlightResolves.clear()
-  queue.length = 0
-  activeResolves = 0
-}
-
-function enqueueResolve<T>(task: () => Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const run = async () => {
-      activeResolves++
-      try {
-        const result = await task()
-        resolve(result)
-      } catch (err) {
-        reject(err)
-      } finally {
-        activeResolves--
-        if (queue.length > 0) {
-          const next = queue.shift()!
-          next()
-        }
-      }
-    }
-
-    if (activeResolves < MAX_CONCURRENT_RESOLVES) {
-      void run()
-    } else {
-      queue.push(run)
-    }
-  })
 }
 
 function findSource(track: Track | undefined, provider: string): TrackSource | undefined {
   return track?.sources?.find((s) => s.provider === provider)
 }
 
-export function getJellyfinArtworkUrl(externalId: string): string {
-  return `/api/providers/jellyfin/artwork/${encodeURIComponent(externalId)}`
+function neteaseArtworkCandidates(track: Track | undefined): string[] {
+  if (!track) return []
+  const binding = deriveLxCandidates(track).find(candidate => candidate.source === 'wy' && isChkszExternalId(candidate.id))
+  const explicit = findSource(track, 'gd-studio')?.externalId.match(/^netease:([0-9]{1,20})(?::(?:128|192|320|740|999))?$/u)?.[1]
+  const id = binding?.id ?? explicit
+  if (!id) return []
+  const providers = binding ? ['lx','gd-studio'] : ['gd-studio','lx']
+  return providers.map(provider => `/api/providers/${provider}/artwork/${id}`)
+}
+
+/** Uses the same candidates as image loading; never resolves audio to choose a cover. */
+export function hasArtworkSource(track: Track | undefined): boolean {
+  return Boolean(findSource(track, 'chksz') || neteaseArtworkCandidates(track).length)
 }
 
 export function isValidArtworkUrl(url: string): boolean {
-  if (typeof url !== 'string' || !url.trim()) return false
-  if (
-    url.startsWith('/api/providers/chksz/artwork?url=') ||
-    url.startsWith('/api/providers/jellyfin/artwork/')
-  ) {
-    return true
-  }
-  try {
-    const origin =
-      typeof globalThis.location?.origin === 'string'
-        ? globalThis.location.origin
-        : 'http://localhost'
-    const parsed = new URL(url, origin)
-    return (
-      (parsed.pathname.startsWith('/api/providers/chksz/artwork') ||
-        parsed.pathname.startsWith('/api/providers/jellyfin/artwork')) &&
-      parsed.origin === origin
-    )
-  } catch {
-    return false
-  }
+  return Boolean(publicArtworkUrl(url))
 }
 
-export async function fetchChkszArtwork(externalId: string): Promise<string | null> {
+export async function fetchChkszArtwork(externalId: string, signal?: AbortSignal): Promise<string | null> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 8000)
+  const cancel = () => controller.abort()
+  signal?.addEventListener('abort', cancel, { once: true })
+  if (signal?.aborted) controller.abort()
+  let onAbort = () => {}
   try {
-    const response = await fetch('/api/providers/chksz/resolve', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ externalId, level: 'standard' }),
-      signal: controller.signal,
-    })
-    if (!response.ok) return null
-    const data = (await response.json()) as { metadata?: { artworkUrl?: string } }
-    const url = data?.metadata?.artworkUrl
-    if (typeof url === 'string' && isValidArtworkUrl(url)) {
-      return url
-    }
-    return null
+    if (controller.signal.aborted) return null
+    return await Promise.race([
+      (async () => {
+        const response = await fetch('/api/providers/chksz/resolve', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ externalId, level: 'standard' }), signal: controller.signal,
+        })
+        if (!response.ok || controller.signal.aborted) return null
+        const data = (await response.json()) as { metadata?: { artworkUrl?: string } }
+        const url = data?.metadata?.artworkUrl
+        return !controller.signal.aborted && typeof url === 'string' && isValidArtworkUrl(url) ? url : null
+      })(),
+      new Promise<null>(resolve => {
+        onAbort = () => resolve(null)
+        controller.signal.addEventListener('abort', onAbort, { once: true })
+      }),
+    ])
   } catch {
     return null
   } finally {
     clearTimeout(timeout)
+    signal?.removeEventListener('abort', cancel)
+    controller.signal.removeEventListener('abort', onAbort)
   }
 }
 
 export async function resolveChkszArtwork(key: string, externalId: string): Promise<string | null> {
-  const cached = artworkCache.get(key)
+  const cached = readCachedArtwork(key)
   if (cached !== undefined) return cached
-
-  const existing = inFlightResolves.get(key)
+  const identity = 'chksz:' + externalId
+  const existing = inFlightResolves.get(identity)
   if (existing) return existing
-
-  const promise = enqueueResolve(() => fetchChkszArtwork(externalId))
-  inFlightResolves.set(key, promise)
-
+  const epoch = cacheEpoch
+  const controller = new AbortController()
+  resolutionControllers.add(controller)
+  // Every observer receives the epoch-checked promise, including callers that join it.
+  // Check again at execution time: clearing a queue must not start old provider requests.
+  const promise = sharedArtworkCache.schedule(() => epoch === cacheEpoch && !controller.signal.aborted
+    ? fetchChkszArtwork(externalId, controller.signal) : Promise.resolve(null))
+    .then(result => epoch === cacheEpoch ? result : null, () => null)
+    .finally(() => resolutionControllers.delete(controller))
+  inFlightResolves.set(identity, promise)
   try {
     const result = await promise
-    artworkCache.set(key, result)
-    return result
+    if (epoch === cacheEpoch) cacheArtwork(key, result)
+    return epoch === cacheEpoch ? result : null
   } catch {
-    artworkCache.set(key, null)
+    if (epoch === cacheEpoch) cacheArtwork(key, null)
     return null
   } finally {
-    inFlightResolves.delete(key)
+    if (inFlightResolves.get(identity) === promise) inFlightResolves.delete(identity)
   }
 }
 
 export interface UseArtworkResult {
   artworkUrl: Ref<string | undefined>
+  sourceUrl: Ref<string | undefined>
+  element: Ref<HTMLElement | undefined>
+  identity: Readonly<Ref<string>>
   isLoaded: Ref<boolean>
   hasFailed: Ref<boolean>
-  onLoad: () => void
-  onError: () => void
+  onLoad: (event?: Event) => void
+  onError: (event?: Event) => void
 }
 
 export function useArtwork(
   keyRef: MaybeRefOrGetter<string>,
   trackRef: MaybeRefOrGetter<Track | undefined>,
+  options: { candidates?: MaybeRefOrGetter<readonly string[]>; player?: boolean; waiting?: MaybeRefOrGetter<boolean>;
+    retainedSource?: MaybeRefOrGetter<string | undefined>;
+    retainedDisplaySource?: MaybeRefOrGetter<string | undefined> } = {},
 ): UseArtworkResult {
   const artworkUrl = ref<string>()
+  const sourceUrl = ref<string>()
+  const element = ref<HTMLElement>()
   const isLoaded = ref(false)
   const hasFailed = ref(false)
-  let currentKey = ''
-  let currentCandidatePhase: 'jellyfin' | 'chksz' | 'none' = 'none'
-
-  const update = () => {
-    const key = toValue(keyRef)
-    const track = toValue(trackRef)
-    currentKey = key
-    isLoaded.value = false
-    hasFailed.value = false
-
-    // Check cache first
-    const cached = artworkCache.get(key)
-    if (cached !== undefined) {
-      if (cached === null) {
-        hasFailed.value = true
-        artworkUrl.value = undefined
-        currentCandidatePhase = 'none'
-      } else {
-        artworkUrl.value = cached
-        currentCandidatePhase = cached.includes('/jellyfin/') ? 'jellyfin' : 'chksz'
+  const component = getCurrentInstance()
+  const permissions = component ? inject(artworkPermissionsKey, undefined) : undefined
+  const permitted = (url: string) => !permissions || permissions.allows(url)
+  let visible = !component || options.player === true || typeof IntersectionObserver === 'undefined'
+  let disposed = false, revision = 0, retryCount = 0
+  let displaySource: string | undefined
+  let displayed: ArtworkLease | undefined, pending: ArtworkLease | undefined
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
+  let stopCapacity: (() => void) | undefined
+  let observer: IntersectionObserver | undefined
+  const selectedCandidates = () => (options.candidates ? [...toValue(options.candidates)] : neteaseArtworkCandidates(toValue(trackRef)))
+    .flatMap(value => { const url = publicArtworkUrl(value); return url && permitted(url) ? [url] : [] })
+  const identity = computed(() => JSON.stringify([toValue(keyRef), selectedCandidates()]))
+  // Vue consumers (including CompactPlayback) must finish replacing their DOM src before
+  // the last old lease can revoke it. A pending request never owns the displayed cover.
+  const releaseAfterRender = (lease?: ArtworkLease) => { if (lease) void nextTick(() => lease.release()) }
+  const stopRetry = () => { if (retryTimer) clearTimeout(retryTimer); retryTimer = undefined }
+  const clearDisplay = () => {
+    const old = displayed; displayed = undefined; displaySource = undefined
+    artworkUrl.value = undefined; sourceUrl.value = undefined; isLoaded.value = false
+    releaseAfterRender(old)
+  }
+  const cancelPending = () => { pending?.release(); pending = undefined; stopRetry(); stopCapacity?.(); stopCapacity = undefined }
+  const acquire = async (token: number) => {
+    if (!visible || disposed || token !== revision) return
+    const candidates = selectedCandidates()
+    let capacityVersion: number | undefined
+    const tryCandidate = async (candidate: string) => {
+      if (token !== revision || disposed || !visible || !permitted(candidate)) return false
+      const next = sharedArtworkCache.acquire(candidate, { pin: options.player === true })
+      pending = next
+      const result = await next.ready
+      if (token !== revision || disposed || !visible || !permitted(candidate)) { next.release(); return false }
+      if (pending === next) pending = undefined
+      if (!result) {
+        if (next.capacityLimited) capacityVersion = next.capacityVersion
+        next.release(); return false
       }
-      return
+      const old = displayed
+      displayed = next; displaySource = result.sourceUrl
+      artworkUrl.value = result.url; sourceUrl.value = result.sourceUrl
+      isLoaded.value = true; hasFailed.value = false
+      releaseAfterRender(old)
+      return true
     }
-
-    if (!track) {
-      hasFailed.value = true
-      artworkUrl.value = undefined
-      currentCandidatePhase = 'none'
-      return
+    for (const candidate of candidates) if (await tryCandidate(candidate)) return
+    if (token !== revision || disposed || !visible) return
+    const waitForCapacity = () => {
+      if (capacityVersion === undefined) return false
+      // A crowded viewport waits for an actual release, with no network retry loop.
+      stopCapacity?.()
+      stopCapacity = sharedArtworkCache.onCapacityAvailable(() => {
+        stopCapacity = undefined
+        if (token === revision && visible && !disposed) void acquire(token)
+      }, capacityVersion)
+      return true
     }
-
-    const jellyfin = findSource(track, 'jellyfin')
-    const chksz = findSource(track, 'chksz')
-
-    if (jellyfin) {
-      currentCandidatePhase = 'jellyfin'
-      artworkUrl.value = getJellyfinArtworkUrl(jellyfin.externalId)
-    } else if (chksz) {
-      currentCandidatePhase = 'chksz'
-      artworkUrl.value = undefined
-      void resolveChkszArtwork(key, chksz.externalId).then((url) => {
-        if (currentKey !== key) return
-        if (url) {
-          artworkUrl.value = url
-        } else {
-          hasFailed.value = true
-          artworkUrl.value = undefined
-        }
-      })
+    if (waitForCapacity()) return
+    // Keep the existing Library-only metadata fallback; Player never resolves audio for artwork.
+    if (!options.candidates) {
+      const source = findSource(toValue(trackRef), 'chksz')
+      if (source && permitted('/api/providers/chksz/artwork?url=')) {
+        const fallback = await resolveChkszArtwork(toValue(keyRef), source.externalId)
+        if (token !== revision || disposed || !visible) return
+        if (fallback && !candidates.includes(fallback) && await tryCandidate(fallback)) return
+      }
+    }
+    if (token !== revision || disposed || !visible) return
+    if (waitForCapacity()) return
+    const retained = publicArtworkUrl(toValue(options.retainedSource) || '')
+    if (retained && permitted(retained) && retained === displaySource && displayed) {
+      sourceUrl.value = displaySource; hasFailed.value = false
     } else {
-      currentCandidatePhase = 'none'
-      hasFailed.value = true
-      artworkUrl.value = undefined
-      artworkCache.set(key, null)
+      clearDisplay(); hasFailed.value = true
+    }
+    // One automatic retry per visible identity, only for a short transient cooldown.
+    // Security refusals and a server's longer Retry-After are never polled in a loop.
+    const retryAt = candidates.map(value => sharedArtworkCache.retryAt(value)).filter((value): value is number => value !== undefined)
+    const delay = Math.min(...retryAt) - Date.now()
+    if (retryCount < 1 && delay > 0 && delay <= 90000) {
+      retryCount++
+      retryTimer = setTimeout(() => { retryTimer = undefined; void acquire(token) }, delay)
     }
   }
-
-  watch(() => [toValue(keyRef), toValue(trackRef)], update, { immediate: true })
-
-  const onLoad = () => {
-    isLoaded.value = true
-    if (artworkUrl.value) {
-      artworkCache.set(currentKey, artworkUrl.value)
+  const update = () => {
+    revision++; cancelPending(); retryCount = 0; hasFailed.value = false
+    const candidates = selectedCandidates()
+    if (displaySource && !permitted(displaySource)) clearDisplay()
+    // Same validated binding survives track changes, equivalent objects and audio renewals.
+    if (displayed && displaySource && candidates.includes(displaySource)) {
+      sourceUrl.value = displaySource
+      return
     }
-  }
-
-  const onError = () => {
-    const key = currentKey
-    const track = toValue(trackRef)
-
-    if (currentCandidatePhase === 'jellyfin') {
-      const chksz = findSource(track, 'chksz')
-      if (chksz) {
-        currentCandidatePhase = 'chksz'
-        isLoaded.value = false
-        artworkUrl.value = undefined
-        void resolveChkszArtwork(key, chksz.externalId).then((url) => {
-          if (currentKey !== key) return
-          if (url) {
-            artworkUrl.value = url
-          } else {
-            hasFailed.value = true
-            artworkUrl.value = undefined
-            artworkCache.set(key, null)
-          }
-        })
-        return
-      }
+    sourceUrl.value = undefined
+    if (!candidates.length && toValue(options.waiting)) return
+    if (!candidates.length && (options.candidates || !findSource(toValue(trackRef), 'chksz'))) {
+      clearDisplay(); hasFailed.value = true; return
     }
-
-    hasFailed.value = true
-    artworkUrl.value = undefined
-    currentCandidatePhase = 'none'
-    artworkCache.set(key, null)
+    if (visible && (!component || component.isMounted)) void acquire(revision)
   }
-
-  return {
-    artworkUrl,
-    isLoaded,
-    hasFailed,
-    onLoad,
-    onError,
+  watch(() => JSON.stringify([toValue(keyRef), selectedCandidates(), findSource(toValue(trackRef), 'chksz')?.externalId, permissions?.revision.value]), update, { immediate: true })
+  watch(() => toValue(options.waiting), () => { if (!selectedCandidates().length) update() })
+  watch(() => toValue(options.retainedDisplaySource ?? options.retainedSource), (retained, previous) => {
+    const old = publicArtworkUrl(previous || '')
+    if (!old || old === publicArtworkUrl(retained || '') || displaySource !== old || selectedCandidates().includes(old)) return
+    clearDisplay(); hasFailed.value = !pending
+  })
+  if (component) onMounted(() => {
+    if (options.player || typeof IntersectionObserver === 'undefined') { visible = true; void acquire(revision); return }
+    observer = new IntersectionObserver(entries => {
+      const next = entries.some(entry => entry.isIntersecting)
+      if (visible === next) return
+      visible = next
+      if (visible) void acquire(revision)
+      else { revision++; cancelPending(); clearDisplay() }
+    }, { rootMargin: '160px' })
+    if (element.value) observer.observe(element.value)
+  })
+  if (getCurrentScope()) onScopeDispose(() => {
+    disposed = true; revision++; observer?.disconnect(); cancelPending(); clearDisplay()
+  })
+  const currentEvent = (event?: Event) => {
+    const image = event?.target as HTMLImageElement | undefined
+    if (!image) return Boolean(sourceUrl.value)
+    if (!sourceUrl.value || !artworkUrl.value) return false
+    if (image.dataset.artworkIdentity && image.dataset.artworkIdentity !== identity.value) return false
+    return image.src === new URL(artworkUrl.value, globalThis.location.origin).href
   }
+  const onLoad = (event?: Event) => {
+    if (!disposed && currentEvent(event)) isLoaded.value = true
+  }
+  const onError = (event?: Event) => {
+    if (disposed || !currentEvent(event)) return
+    const failed = displaySource
+    if (failed) sharedArtworkCache.invalidate(failed)
+    clearDisplay(); hasFailed.value = true
+    revision++; cancelPending(); void acquire(revision)
+  }
+  return { artworkUrl, sourceUrl, element, identity, isLoaded, hasFailed, onLoad, onError }
 }
 
 export function useAlbumArtwork(
   albumRef: MaybeRefOrGetter<AlbumEntry>,
 ): UseArtworkResult {
   const album = computed(() => toValue(albumRef))
-  const key = computed(() => `album:${album.value.title}`)
+  const key = computed(() => `album:${album.value.id}`)
   const track = computed(() => album.value.representativeTrack)
   return useArtwork(key, track)
 }

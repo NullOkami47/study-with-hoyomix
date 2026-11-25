@@ -1,4 +1,3 @@
-vi.mock('./staticDefinitions', async () => import('../../test/fixtures/staticBackgrounds'))
 import { describe, expect, it, vi } from 'vitest'
 
 import { listStaticBackgrounds } from './catalogue'
@@ -6,6 +5,14 @@ import { BACKGROUND_OVERRIDES_STORAGE_KEY } from './overrides'
 import { createBackgroundRepository } from './repository'
 import { createBackgroundStore, BACKGROUND_SELECTION_STORAGE_KEY } from './store'
 import type { PublicBackground } from './types'
+
+// Keep the real catalogue and override logic; supply only synthetic definitions.
+// This mock is local to this spec and never changes the public runtime defaults.
+vi.mock('./staticDefinitions', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./staticDefinitions')>()
+  const { createStaticBackgroundFixture } = await import('../../test/fixtures/publicBackgrounds')
+  return { ...actual, ...createStaticBackgroundFixture() }
+})
 
 const apiRow = (id: string): PublicBackground => ({
   id,
@@ -41,7 +48,7 @@ const memoryStorage = (initial: Record<string, string> = {}) => {
   }
 }
 
-const DISABLED = 'zzz-astra-yao'
+const DISABLED = 'fixture-scene-3'
 
 describe('background repository catalogue merge', () => {
   it('syncs shipped video IDs together with published API IDs', async () => {
@@ -107,8 +114,8 @@ describe('background overrides never fail open', () => {
   })
 
   it.each([
-    { overrides: [{ id: 'zzz-ellen-joe', status: 'published' }, { id: DISABLED, status: 7 }] },
-    { overrides: [{ id: 'zzz-ellen-joe', status: 'published' }, { id: DISABLED, status: 'invalid' }] },
+    { overrides: [{ id: 'fixture-scene-2', status: 'published' }, { id: DISABLED, status: 7 }] },
+    { overrides: [{ id: 'fixture-scene-2', status: 'published' }, { id: DISABLED, status: 'invalid' }] },
     { overrides: [{ id: DISABLED, status: 'archived' }, { id: DISABLED, status: 'published' }] },
     { overrides: [{ id: DISABLED, status: 'published', title: false }] },
   ])('preserves the verified disable and exact cache after a poisoned partial response: %j', async (malformed) => {
@@ -228,13 +235,13 @@ describe('store availability before the first request resolves', () => {
   it.each(['sequential', 'random'] as const)('keeps cached restrictions through pending, malformed and offline reloads in %s rotation', async (mode) => {
     const original = JSON.stringify({ version: 1, overrides: [{ id: DISABLED, status: 'tombstoned' }] })
     localStorage.setItem(BACKGROUND_OVERRIDES_STORAGE_KEY, original)
-    localStorage.setItem(BACKGROUND_SELECTION_STORAGE_KEY, JSON.stringify({ selectedIds: [DISABLED, 'zzz-qingyi', 'zzz-ellen-joe'], autoRotate: true, intervalSeconds: 1200 }))
+    localStorage.setItem(BACKGROUND_SELECTION_STORAGE_KEY, JSON.stringify({ selectedIds: [DISABLED, 'fixture-scene-1', 'fixture-scene-2'], autoRotate: true, intervalSeconds: 1200 }))
     let release!: () => void
     const pending = new Promise<void>(resolve => { release = resolve })
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       if (url !== '/api/backgrounds/overrides') return jsonResponse({ backgrounds: [] })
       await pending
-      return jsonResponse({ overrides: [{ id: 'zzz-ellen-joe', status: 'published' }, { id: DISABLED, status: 7 }] })
+      return jsonResponse({ overrides: [{ id: 'fixture-scene-2', status: 'published' }, { id: DISABLED, status: 7 }] })
     }))
     const store = createBackgroundStore()
     try {
@@ -300,7 +307,7 @@ describe('store availability before the first request resolves', () => {
   })
 
   it('preserves saved shipped choices throughout quarantine and restores their order after a valid snapshot', async () => {
-    const selectedIds = ['zzz-qingyi', 'zzz-ellen-joe']
+    const selectedIds = ['fixture-scene-1', 'fixture-scene-2']
     const saved = JSON.stringify({ selectedIds, autoRotate: true, intervalSeconds: 1200 })
     const storage = memoryStorage({ [BACKGROUND_OVERRIDES_STORAGE_KEY]: '{broken', [BACKGROUND_SELECTION_STORAGE_KEY]: saved })
     let valid = false

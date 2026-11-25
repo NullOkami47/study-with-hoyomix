@@ -9,7 +9,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
 export const cloudflareCountry = (request: Request): string | undefined => {
-  // Cloudflare sees the Vercel egress country, not the browser's country.
+  // Cloudflare sees the reverse-proxy egress country, not the browser's country.
   if (isAuthenticatedProxyRequest(request)) return undefined
   try {
     const cf = (request as CloudflareRequest).cf

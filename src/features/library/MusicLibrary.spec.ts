@@ -11,11 +11,13 @@
  * instead, in its own block.
  */
 
-import { mount, type VueWrapper } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { artworkBlob, mockValidatedArtwork } from '../../test/artworkLeaseFixture'
 import type { Track } from '../catalog/types'
 import { createPlaybackStore, type PlaybackStore } from '../player/store'
+import { clearArtworkCache } from './artwork'
 import { LIBRARY_BROWSING_STORAGE_KEY } from './libraryBrowsingState'
 import MusicLibrary from './MusicLibrary.vue'
 import {
@@ -90,6 +92,12 @@ function largeCatalogue(count: number): Track[] {
 
 beforeEach(() => {
   window.localStorage.clear()
+  clearArtworkCache()
+})
+
+afterEach(() => {
+  clearArtworkCache()
+  vi.restoreAllMocks()
 })
 
 describe('MusicLibrary — sections and grouping', () => {
@@ -110,6 +118,33 @@ describe('MusicLibrary — sections and grouping', () => {
     expect(cards[0].get('[data-game-name]').text()).toBe('Genshin Impact')
     expect(cards[0].get('[data-game-counts]').text()).toBe('2 albums · 5 tracks')
     expect(cards[2].get('[data-game-name]').text()).toBe('Zenless Zone Zero')
+  })
+
+  it('renders each game’s existing catalogue artwork in browsing and search results', async () => {
+    const cache = mockValidatedArtwork()
+    const wrapper = mountLibrary()
+    try {
+      await openGames(wrapper)
+      await flushPromises()
+
+      for (const [game, url] of [
+        ['genshin', '/api/providers/lx/artwork/100001'],
+        ['hsr', '/api/providers/lx/artwork/100006'],
+        ['zzz', '/api/providers/lx/artwork/100008'],
+      ]) {
+        expect(cache.acquire).toHaveBeenCalledWith(url, { pin: false })
+        expect(wrapper.get(`[data-game-id="${game}"] [data-game-artwork]`).attributes('src')).toBe(artworkBlob(url))
+      }
+
+      await search(wrapper, 'Genshin Impact')
+      await flushPromises()
+      expect(wrapper.get('[data-search-games] [data-game-artwork]').attributes('src')).toBe(
+        artworkBlob('/api/providers/lx/artwork/100001'),
+      )
+    } finally {
+      wrapper.unmount()
+      await flushPromises()
+    }
   })
 
   it('shows only the selected game’s albums and tracks', async () => {

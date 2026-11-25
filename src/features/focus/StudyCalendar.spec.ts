@@ -68,6 +68,26 @@ describe('StudyCalendar', () => {
     expect(wrapper.get('[data-focus-calendar-day="2026-08-10"]').text()).toContain('0 sessions')
   })
 
+  it('refreshes dated records at local midnight without a session change and releases its timer', async () => {
+    vi.setSystemTime(new Date('2026-08-10T15:59:30.000Z'))
+    const wrapper = mount(StudyCalendar, {
+      props: { sessions: [focusRecord()], timeZone: 'Asia/Hong_Kong' },
+    })
+    expect(wrapper.find('[data-focus-calendar-empty]').exists()).toBe(true)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(wrapper.get('[data-focus-calendar-day="2026-08-11"]').text()).toContain('1 completed')
+    wrapper.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('uses the current day when a newly stored session arrives before the minute refresh', async () => {
+    vi.setSystemTime(new Date('2026-08-10T15:59:59.000Z'))
+    const wrapper = mount(StudyCalendar, { props: { sessions: [], timeZone: 'Asia/Hong_Kong' } })
+    vi.setSystemTime(new Date('2026-08-10T16:01:00.000Z'))
+    await wrapper.setProps({ sessions: [focusRecord()] })
+    expect(wrapper.get('[data-focus-calendar-day="2026-08-11"]').text()).toContain('1 completed')
+  })
+
   it('announces an empty local history without removing the calendar semantics', () => {
     const wrapper = mount(StudyCalendar, {
       props: { sessions: [], timeZone: 'Asia/Hong_Kong' },

@@ -10,10 +10,12 @@ import type { Track } from '../catalog/types'
 import { ProviderRegistry } from '../player/providers/registry'
 import type { Playable } from '../player/providers/types'
 import PlayerBar from '../player/PlayerBar.vue'
+import { artworkBlob, mockValidatedArtwork } from '../../test/artworkLeaseFixture'
 import { createRuntimeProviderRepository } from '../player/runtimeConfig'
 import type { ProviderPreferencesStore } from '../player/providerPreferences'
 import { getDefaultPlaybackQualityPreferencesStore } from '../player/qualityPreferences'
 import type { PlaybackStore } from '../player/store'
+import { getDefaultLocalLibraryRepository } from '../library/localRepository'
 import {
   POMODORO_STORAGE_KEY,
   PomodoroFocusQueueCapacityError,
@@ -22,10 +24,31 @@ import {
 import { usePreferences } from '../../stores/preferences'
 import StudyWorkspace from './StudyWorkspace.vue'
 
-const runtimeRepositoryMocks = vi.hoisted(() => ({
-  load: vi.fn(async () => new ProviderRegistry([])),
-  prefetch: vi.fn(() => new Promise<void>(() => undefined)),
-}))
+const runtimeRepositoryMocks = vi.hoisted(() => {
+  let snapshot: ProviderRegistry | undefined
+  const stateListeners = new Set<(rows: readonly { id: string; available: boolean; enabled: boolean }[]) => void>()
+  let playbackStates: readonly { id: string; available: boolean; enabled: boolean }[] = []
+  const publishStates = (rows: readonly { id: string; available: boolean; enabled: boolean }[]) => {
+    for (const listener of stateListeners) listener(rows)
+  }
+  const load = vi.fn(async (_options?: { forceRefresh?: boolean }) => new ProviderRegistry([]))
+  return { load,
+    loadPlayback: async (options?: { forceRefresh?: boolean }) => {
+      snapshot = await load(options); publishStates(playbackStates); return snapshot
+    },
+    peekPlayback: () => snapshot, resetSnapshot: () => { snapshot = undefined },
+    prefetch: vi.fn(() => new Promise<void>(() => undefined)),
+    states: vi.fn(async () => { const rows: { id: string; available: boolean; enabled: boolean }[] = []; publishStates(rows); return rows }),
+    subscribeStates(listener: (rows: readonly { id: string; available: boolean; enabled: boolean }[]) => void) {
+      stateListeners.add(listener); return () => stateListeners.delete(listener)
+    },
+    publishStates(rows: readonly { id: string; available: boolean; enabled: boolean }[]) {
+      publishStates(rows)
+    },
+    setPlaybackStates(rows: readonly { id: string; available: boolean; enabled: boolean }[]) { playbackStates = rows },
+    resetStateListeners() { stateListeners.clear() },
+  }
+})
 
 const remoteMocks = vi.hoisted(() => ({
   load: vi.fn(async (): Promise<{ revision: string; tracks: Track[] }> => {
@@ -120,7 +143,7 @@ const controlledCatalogue: Track[] = [
     relationIds: ['character:amber', 'event:shared'], tabs: ['focus'], workGroupId: 'dawn',
     vocalStatus: 'instrumental', needsClassification: false,
     sources: [
-      { provider: 'jellyfin', externalId: 'dawn-focus.ogg' },
+      { provider: 'gd-studio', externalId: 'dawn-focus.ogg' },
       { provider: 'r2', externalId: 'dawn-focus.ogg' },
     ],
   },
@@ -129,7 +152,7 @@ const controlledCatalogue: Track[] = [
     relationIds: ['place:express', 'event:shared'], tabs: ['sleep'], workGroupId: 'rails',
     vocalStatus: 'instrumental', needsClassification: false,
     sources: [
-      { provider: 'jellyfin', externalId: 'express-sleep.ogg' },
+      { provider: 'gd-studio', externalId: 'express-sleep.ogg' },
       { provider: 'r2', externalId: 'express-sleep.ogg' },
     ],
   },
@@ -138,7 +161,7 @@ const controlledCatalogue: Track[] = [
     relationIds: ['npc:fairy', 'event:shared'], tabs: ['chill'], workGroupId: 'hollow',
     vocalStatus: 'uncertain', needsClassification: true,
     sources: [
-      { provider: 'jellyfin', externalId: 'hollow-chill.ogg' },
+      { provider: 'gd-studio', externalId: 'hollow-chill.ogg' },
       { provider: 'r2', externalId: 'hollow-chill.ogg' },
     ],
   },
@@ -147,7 +170,7 @@ const controlledCatalogue: Track[] = [
     relationIds: ['place:harbour', 'event:shared'], tabs: ['sleep'], workGroupId: 'dawn',
     vocalStatus: 'instrumental', needsClassification: false,
     sources: [
-      { provider: 'jellyfin', externalId: 'harbour-sleep.ogg' },
+      { provider: 'gd-studio', externalId: 'harbour-sleep.ogg' },
       { provider: 'r2', externalId: 'harbour-sleep.ogg' },
     ],
   },
@@ -158,7 +181,7 @@ const unmatchedTrack: Track = {
   relationIds: [], tabs: ['chill'], workGroupId: 'outside-catalogue',
   vocalStatus: 'instrumental', needsClassification: false,
   sources: [
-    { provider: 'jellyfin', externalId: 'unmatched-current.ogg' },
+    { provider: 'gd-studio', externalId: 'unmatched-current.ogg' },
     { provider: 'r2', externalId: 'unmatched-current.ogg' },
   ],
 }
@@ -175,6 +198,9 @@ beforeEach(() => {
   window.localStorage.setItem('hoyomix-player-shuffle-v1', 'false')
   catalogMocks.tracks = controlledCatalogue
   runtimeRepositoryMocks.load.mockReset().mockResolvedValue(new ProviderRegistry([]))
+  runtimeRepositoryMocks.resetSnapshot()
+  runtimeRepositoryMocks.states.mockReset().mockResolvedValue([])
+  runtimeRepositoryMocks.resetStateListeners()
   resetAccountSession()
   timerClockMocks.now = Date.parse('2026-08-25T08:00:00.000Z')
   pomodoroHookMocks.onFocusSessionError = undefined
@@ -187,6 +213,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs()
   vi.useRealTimers()
+  Reflect.deleteProperty(navigator, 'mediaSession')
 })
 
 function seedPendingFocusCompletion(endedAt: number): void {
@@ -241,6 +268,128 @@ function closeControlCentre(wrapper: ReturnType<typeof mount>): Promise<void> {
 }
 
 describe('StudyWorkspace', () => {
+  it('reacquires the playing cover after startup config failure and successful playback validation', async () => {
+    const artwork = mockValidatedArtwork()
+    const session = { metadata: null as MediaMetadata | null, playbackState: 'none', setActionHandler: vi.fn(), setPositionState: vi.fn() }
+    vi.stubGlobal('MediaMetadata', class {
+      readonly title: string; readonly artist: string; readonly album: string; readonly artwork: readonly MediaImage[]
+      constructor(init: MediaMetadataInit) { this.title = init.title ?? ''; this.artist = init.artist ?? ''; this.album = init.album ?? ''; this.artwork = init.artwork ?? [] }
+    })
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: session })
+    const mediaLoad = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const mapped: Track = { ...controlledCatalogue[0], sources: [{ provider: 'lx', externalId: 'wy:cover-retry' }] }
+    catalogMocks.tracks = [mapped]
+    runtimeRepositoryMocks.states.mockImplementationOnce(async () => {
+      runtimeRepositoryMocks.publishStates([])
+      throw new Error('provider_config_unavailable')
+    })
+    runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry([{
+      provider: { id: 'lx', resolve: vi.fn(async () => ({ kind: 'audio' as const, url: '/audio.mp3', mimeType: 'audio/mpeg',
+        metadata: { artworkUrl: '/api/providers/lx/artwork/12345' } })) },
+      enabled: true, priority: 1, timeoutMs: 100,
+    }]))
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    try {
+      await flushPromises()
+      expect(artwork.acquire).not.toHaveBeenCalled()
+      const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+      runtimeRepositoryMocks.setPlaybackStates([{ id: 'lx', available: true, enabled: true }])
+      await player.playNow(mapped)
+      await flushPromises()
+      expect(wrapper.get('[data-player-artwork-image]').attributes('src')).toBe(artworkBlob('/api/providers/lx/artwork/12345'))
+      expect(session.metadata?.artwork).toEqual([{ src: artworkBlob('/api/providers/lx/artwork/12345') }])
+      expect(artwork.acquire).toHaveBeenCalledOnce()
+    } finally { wrapper.unmount(); mediaLoad.mockRestore(); artwork.acquire.mockRestore(); artwork.invalidate.mockRestore(); artwork.retain.mockRestore(); vi.unstubAllGlobals() }
+  })
+
+  it('clears displayed cover and Media Session artwork after validated provider disablement', async () => {
+    const artwork = mockValidatedArtwork()
+    const session = { metadata: null as MediaMetadata | null, playbackState: 'none', setActionHandler: vi.fn(), setPositionState: vi.fn() }
+    vi.stubGlobal('MediaMetadata', class {
+      readonly title: string; readonly artist: string; readonly album: string; readonly artwork: readonly MediaImage[]
+      constructor(init: MediaMetadataInit) { this.title = init.title ?? ''; this.artist = init.artist ?? ''; this.album = init.album ?? ''; this.artwork = init.artwork ?? [] }
+    })
+    Object.defineProperty(navigator, 'mediaSession', { configurable: true, value: session })
+    const mediaLoad = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const mapped: Track = { ...controlledCatalogue[0], sources: [{ provider: 'lx', externalId: 'wy:revoked-cover' }] }
+    catalogMocks.tracks = [mapped]
+    runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry([{
+      provider: { id: 'lx', resolve: vi.fn(async () => ({ kind: 'audio' as const, url: '/audio.mp3', mimeType: 'audio/mpeg',
+        metadata: { artworkUrl: '/api/providers/lx/artwork/54321' } })) },
+      enabled: true, priority: 1, timeoutMs: 100,
+    }]))
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    try {
+      await flushPromises()
+      runtimeRepositoryMocks.publishStates([{ id: 'lx', available: true, enabled: true }])
+      await flushPromises()
+      const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+      runtimeRepositoryMocks.setPlaybackStates([{ id: 'lx', available: true, enabled: true }])
+      await player.playNow(mapped)
+      await flushPromises()
+      expect(wrapper.find('[data-player-artwork-image]').exists()).toBe(true)
+      expect(session.metadata?.artwork).toEqual([{ src: artworkBlob('/api/providers/lx/artwork/54321') }])
+      runtimeRepositoryMocks.publishStates([{ id: 'lx', available: true, enabled: false }])
+      await flushPromises()
+      expect(wrapper.find('[data-player-artwork-image]').exists()).toBe(false)
+      expect(session.metadata?.artwork).toEqual([])
+      expect(artwork.acquire).toHaveBeenCalledOnce()
+      expect([...artwork.releases.values()][0]).toHaveBeenCalledOnce()
+      expect([...artwork.metadataReleases.values()][0]).toHaveBeenCalledOnce()
+    } finally { wrapper.unmount(); mediaLoad.mockRestore(); artwork.acquire.mockRestore(); artwork.invalidate.mockRestore(); artwork.retain.mockRestore(); vi.unstubAllGlobals() }
+  })
+
+  it('records same-track source recovery once while a deliberate replay records a new listening session', async () => {
+    const recent = vi.spyOn(getDefaultLocalLibraryRepository(), 'recordRecent').mockResolvedValue(true)
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const mediaLoad = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const mapped: Track = { ...controlledCatalogue[0], sources: [
+      { provider: 'lx', externalId: 'external' }, { provider: 'gd-studio', externalId: 'gd' },
+    ] }
+    catalogMocks.tracks = [mapped]
+    let lxCalls = 0
+    runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry(['lx', 'gd-studio'].map((id, priority) => ({
+      provider: { id, resolve: vi.fn(async () => id === 'lx' && ++lxCalls > 1 ? null : ({ kind: 'audio' as const, url: `https://media.invalid/${id}.ogg`, mimeType: 'audio/ogg' })) },
+      enabled: true, priority, timeoutMs: 100,
+    }))))
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    try {
+      const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+      await player.playNow(mapped)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(1)
+      expect(await player.requestSourceRecovery!('lx', player.playbackGeneration.value, 102)).toBe('continuing')
+      await flushPromises()
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(1)
+      await player.playNow(mapped)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(2)
+      const generation = player.playbackGeneration.value
+      const session = player.listeningSessionId.value
+      player.reportMediaState('ended', generation)
+      player.pause()
+      await player.play()
+      player.reportMediaState('playing', generation)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(3)
+      expect(player.listeningSessionId.value).toBe(session + 1)
+      expect(player.playbackGeneration.value).toBe(generation)
+      player.setRepeatMode('one')
+      player.reportMediaState('ended', generation)
+      await player.play()
+      player.reportMediaState('playing', generation)
+      await nextTick()
+      expect(recent).toHaveBeenCalledTimes(4)
+      expect(player.listeningSessionId.value).toBe(session + 2)
+    } finally {
+      wrapper.unmount()
+      recent.mockRestore(); mediaPlay.mockRestore(); mediaLoad.mockRestore()
+    }
+  })
   it('does not publish a delayed anonymous Focus list after the authenticated scope has loaded', async () => {
     let finish!: (values: FocusSessionRecord[]) => void
     const pending = new Promise<FocusSessionRecord[]>(resolve => { finish = resolve })
@@ -325,13 +474,13 @@ describe('StudyWorkspace', () => {
       mimeType: 'audio/ogg',
     }))
     runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry([{
-      provider: { id: 'jellyfin', resolve }, enabled: true, priority: 1, timeoutMs: 100,
+      provider: { id: 'gd-studio', resolve }, enabled: true, priority: 1, timeoutMs: 100,
     }]))
     const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
     const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
     const replacement = tracks.map((track) => ({
       ...track, title: 'Published ' + track.title,
-      sources: [{ provider: 'jellyfin', externalId: 'published-' + track.id + '.ogg' }],
+      sources: [{ provider: 'gd-studio', externalId: 'published-' + track.id + '.ogg' }],
     }))
     return { wrapper, player, resolve, replacement, deliver }
   }
@@ -643,27 +792,26 @@ describe('StudyWorkspace', () => {
     wrapper.unmount()
   })
 
-  it('bridges the glass gray preference to both the WebGL canvas and the CSS fallback', async () => {
+  it('keeps the glass gray preference without a second workspace compositor', async () => {
     const preferences = usePreferences()
     preferences.setVisualStyle('studio')
     preferences.setStudioGlassGray(40)
     const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
     await nextTick()
 
-    // One preference, two render paths: the shader prop and the custom property the
-    // backdrop-filter fallback reads must never drift apart.
+    // The workspace retains its material preferences; AppShell owns the sole optical engine.
     const root = wrapper.get('main[data-workspace="cinematic"]').element as HTMLElement
     expect(root.style.getPropertyValue('--studio-glass-gray-strength')).toBe('0.4')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('glassGray')).toBe(40)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
 
     preferences.setStudioGlassGray(75)
     await nextTick()
     expect(root.style.getPropertyValue('--studio-glass-gray-strength')).toBe('0.75')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('glassGray')).toBe(75)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
     wrapper.unmount()
   })
 
-  it('bridges the edge dispersion preference to the shader and the CSS fallback', async () => {
+  it('keeps the edge preference without a second workspace compositor', async () => {
     const preferences = usePreferences()
     preferences.setVisualStyle('studio')
     preferences.setStudioEdge(40)
@@ -672,12 +820,12 @@ describe('StudyWorkspace', () => {
 
     const root = wrapper.get('main[data-workspace="cinematic"]').element as HTMLElement
     expect(root.style.getPropertyValue('--studio-edge-strength')).toBe('0.4')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('edge')).toBe(40)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
 
     preferences.setStudioEdge(0)
     await nextTick()
     expect(root.style.getPropertyValue('--studio-edge-strength')).toBe('0')
-    expect(wrapper.getComponent({ name: 'StudioGlassCanvas' }).props('edge')).toBe(0)
+    expect(wrapper.find('[data-studio-glass-canvas]').exists()).toBe(false)
     wrapper.unmount()
   })
 
@@ -794,6 +942,21 @@ describe('StudyWorkspace', () => {
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
     expect(wrapper.getComponent(PlayerBar).props('mediaSuspended')).toBe(false)
     expect(wrapper.get('[data-focus-pomodoro-start]').element).toBe(document.activeElement)
+  })
+
+  it('updates today statistics across local midnight while a persisted summary remains open', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-05T08:00:00.000Z'))
+    seedPendingFocusCompletion(Date.now())
+    const wrapper = mount(StudyWorkspace, { attachTo: document.body, global: { stubs: workspaceStubs } })
+    await flushPromises()
+    expect(wrapper.get('[data-focus-summary-today-actual]').text()).toBe('1m')
+    expect(wrapper.get('[data-focus-summary-today-completed]').text()).toBe('1')
+    vi.setSystemTime(new Date('2026-11-06T08:00:00.000Z'))
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+    expect(wrapper.get('[data-focus-summary-today-actual]').text()).toBe('0s')
+    expect(wrapper.get('[data-focus-summary-today-completed]').text()).toBe('0')
   })
 
   it('returns Summary focus to the live Pomodoro control when completion replaces Settings', async () => {
@@ -945,6 +1108,29 @@ describe('StudyWorkspace', () => {
     expect(player.status.value).toBe('idle')
   })
 
+  it('reconciles upcoming tracks when Vocal music mode is selected', async () => {
+    const vocalTrack: Track = {
+      id: 'wildfire-vocal', title: 'Wildfire Vocal', aliases: {}, games: ['hsr'],
+      relationIds: ['event:shared'], tabs: [], workGroupId: 'wildfire',
+      vocalStatus: 'vocal', needsClassification: false,
+      sources: [{ provider: 'r2', externalId: 'wildfire-vocal.ogg' }],
+    }
+    catalogMocks.tracks = [...controlledCatalogue, vocalTrack]
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+
+    // Initially all modes: includes vocal track
+    expect(queueIds(player)).toContain('wildfire-vocal')
+
+    // Open advanced filters and select Vocal tab
+    await wrapper.get('[data-advanced-trigger]').trigger('click')
+    await wrapper.get('[data-filter-tab="vocal"]').trigger('click')
+
+    // Only genuine vocal tracks reconcile into upcoming queue
+    expect(queueIds(player)).toEqual(['wildfire-vocal'])
+    expect(wrapper.get('[data-focus-filter-summary]').text()).toContain('Vocal')
+  })
+
   it('repopulates after an actual filter change even when matching IDs and order stay the same', async () => {
     const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
     const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
@@ -1057,7 +1243,7 @@ describe('StudyWorkspace', () => {
       global: { stubs: workspaceStubs },
     })
 
-    // A fresh load keeps the unfinished chat out of the resting scene.
+    // A fresh load keeps chat out of the resting scene.
     expect(wrapper.find('[data-floating-chat]').exists()).toBe(false)
 
     await openSection(wrapper, 'chat')
@@ -1075,7 +1261,8 @@ describe('StudyWorkspace', () => {
     expect(wrapper.find('[data-control-centre-open-chat]').exists()).toBe(false)
     // One chat surface: the hub offers an action on the floating window rather than
     // mounting a second live chat inside itself.
-    expect(wrapper.findAll('[data-chat-availability]')).toHaveLength(2)
+    expect(wrapper.findAll('[data-chat-panel]')).toHaveLength(1)
+    expect(wrapper.find('[data-control-centre-panel] [data-chat-panel]').exists()).toBe(false)
 
     // Focus lands on the window itself rather than on a control inside it, so the user
     // arrives at the top of the window and tabs in from there.
@@ -1143,7 +1330,11 @@ describe('StudyWorkspace', () => {
     const settings = wrapper.getComponent({ name: 'SettingsSheet' })
 
     expect(settings.props('providerPreferences')).toBe(sharedStore)
-    expect(settings.props('providerRepository')).toBe(runtimeRepositoryMocks)
+    const artworkAwareRepository = settings.props('providerRepository')
+    expect(artworkAwareRepository.loadPlayback).toBe(runtimeRepositoryMocks.loadPlayback)
+    expect(artworkAwareRepository.peekPlayback).toBe(runtimeRepositoryMocks.peekPlayback)
+    expect(artworkAwareRepository.prefetch).toBe(runtimeRepositoryMocks.prefetch)
+    expect(artworkAwareRepository.states).toEqual(expect.any(Function))
   })
 
   it('invalidates speculative preload when provider preferences change', () => {
@@ -1181,7 +1372,7 @@ describe('StudyWorkspace', () => {
     expect(wrapper.findComponent({ name: 'NoticeCentre' }).exists()).toBe(true)
   })
 
-  it('updates runtime state to published and injects Jellyfin sources into player when /api/catalogue succeeds', async () => {
+  it('updates runtime state to published and injects remote sources into player when /api/catalogue succeeds', async () => {
     vi.stubEnv('VITE_ENABLE_DEMO_CATALOG', 'false')
     catalogMocks.tracks = controlledCatalogue.slice(0, 3)
     let deliver!: (catalogue: { revision: string; tracks: Track[] }) => void
@@ -1189,11 +1380,11 @@ describe('StudyWorkspace', () => {
       new Promise<{ revision: string; tracks: Track[] }>((resolve) => { deliver = resolve }))
     const resolve = vi.fn(async (track: Track): Promise<Playable> => ({
       kind: 'audio',
-      url: 'https://media.invalid/jellyfin/' + track.id,
+      url: 'https://media.invalid/gd-studio/' + track.id,
       mimeType: 'audio/mpeg',
     }))
     runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry([{
-      provider: { id: 'jellyfin', resolve }, enabled: true, priority: 1, timeoutMs: 100,
+      provider: { id: 'gd-studio', resolve }, enabled: true, priority: 1, timeoutMs: 100,
     }]))
 
     const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
@@ -1204,7 +1395,7 @@ describe('StudyWorkspace', () => {
     const jellyfinReplacement: Track[] = catalogMocks.tracks.map((track) => ({
       ...track,
       sources: [
-        { provider: 'jellyfin', externalId: `jf-${track.id}` },
+        { provider: 'gd-studio', externalId: `jf-${track.id}` },
         { provider: 'chksz', externalId: `chk-${track.id}` },
       ],
     }))
@@ -1214,7 +1405,7 @@ describe('StudyWorkspace', () => {
 
     expect(wrapper.get('main').attributes('data-catalogue-status')).toBe('published')
     expect(player.queue.value).toEqual(jellyfinReplacement)
-    expect(player.queue.value[0].sources.some((s) => s.provider === 'jellyfin')).toBe(true)
+    expect(player.queue.value[0].sources.some((s) => s.provider === 'gd-studio')).toBe(true)
     expect(player.queue.value[0].sources.some((s) => s.provider === 'r2')).toBe(false)
     wrapper.unmount()
   })
@@ -1229,5 +1420,51 @@ describe('StudyWorkspace', () => {
 
     expect(wrapper.get('main').attributes('data-catalogue-status')).toBe('fallback')
     wrapper.unmount()
+  })
+})
+
+// Wave A verify-first check (P95-09). A pass on 8309e3a refutes the finding.
+describe('StudyWorkspace verify first (Wave A)', () => {
+  it.each(['provider recovery', 'media renewal'] as const)('P95-09: keeps the Library open across a same-session %s', async (change) => {
+    const recent = vi.spyOn(getDefaultLocalLibraryRepository(), 'recordRecent').mockResolvedValue(true)
+    const mediaPlay = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+    const mediaLoad = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {})
+    const mapped: Track = { ...controlledCatalogue[0], sources: [
+      { provider: 'lx', externalId: 'external' }, { provider: 'gd-studio', externalId: 'gd' },
+    ] }
+    catalogMocks.tracks = [mapped]
+    let urls = 0
+    let lxCalls = 0
+    runtimeRepositoryMocks.load.mockResolvedValue(new ProviderRegistry(['lx', 'gd-studio'].map((id, priority) => ({
+      provider: { id, resolve: vi.fn(async () => id === 'lx' && change === 'provider recovery' && ++lxCalls > 1 ? null : ({ kind: 'audio' as const, url: `https://media.invalid/${id}-${++urls}.ogg`, mimeType: 'audio/ogg' })) },
+      enabled: true, priority, timeoutMs: 100,
+    }))))
+    const wrapper = mount(StudyWorkspace, { global: { stubs: workspaceStubs } })
+    try {
+      const player = wrapper.getComponent(PlayerBar).props('store') as PlaybackStore
+      await player.playNow(mapped)
+      player.reportMediaState('playing', player.playbackGeneration.value)
+      await openSection(wrapper, 'library')
+      expect(wrapper.find('[data-control-centre-panel] [data-library-sheet]').exists()).toBe(true)
+      const session = player.listeningSessionId.value
+      const generation = player.playbackGeneration.value
+
+      if (change === 'provider recovery') {
+        await player.requestSourceRecovery!('lx', generation, 102)
+        await flushPromises()
+        expect(player.activeProviderId.value).toBe('gd-studio')
+      } else {
+        expect(await player.renewMedia('lx', generation)).toBe(true)
+        expect(player.activeProviderId.value).toBe('lx')
+      }
+      await nextTick()
+      // Both are a new playback generation within the same listening session.
+      expect(player.playbackGeneration.value).toBeGreaterThan(generation)
+      expect(player.listeningSessionId.value).toBe(session)
+      expect(wrapper.find('[data-overlay-sheet="control-centre"]').exists()).toBe(true)
+    } finally {
+      wrapper.unmount()
+      recent.mockRestore(); mediaPlay.mockRestore(); mediaLoad.mockRestore()
+    }
   })
 })

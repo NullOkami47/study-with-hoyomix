@@ -61,7 +61,11 @@ export function createAccountPreferencesRepository(fetcher: typeof fetch = fetch
       headers: {
         accept: 'application/json',
         'x-account-preferences-schema': '2',
-        ...(method === 'PUT' && revision ? { 'if-match': revision } : {}),
+        // L-24 (D9): every write is conditional. The client echoes the server's ETag, quoted or
+        // bare; before it has one it claims the row-less state, so an existing row is never
+        // overwritten blindly (the server answers 409/412 and automatic sync re-reads). The bare
+        // form is the one every Worker version accepts.
+        ...(method === 'PUT' ? { 'if-match': revision ?? 'absent' } : {}),
         ...(userId ? { 'x-account-user-id': userId } : {}),
         ...(body ? { 'content-type': 'application/json' } : {}),
       },
@@ -80,7 +84,9 @@ export function createAccountPreferencesRepository(fetcher: typeof fetch = fetch
       throw new Error('account_preferences_invalid_response')
     }
     if (useAccountSession().userId.value !== userId) throw new Error('account_session_changed')
-    revision = response.headers.get('etag')
+    // Cloudflare weakens the Worker's strong ETag to W/"<n>" on compressed responses. Echo the
+    // strong form so an older Worker, which rejects W/ with 400, still accepts the write.
+    revision = response.headers.get('etag')?.trim().replace(/^W\//u, '') ?? null
     const prefs = (value as { preferences: unknown }).preferences
     return prefs === null ? null : parseSyncedUserPreferences(prefs)
   }

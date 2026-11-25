@@ -4,10 +4,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { usePreferences } from '../../stores/preferences'
 import {
   CHAT_LAYOUT_STORAGE_KEY,
+  CHAT_NARROW_LAYOUT_STORAGE_KEY,
   CHAT_SAFE_MARGIN,
   MIN_CHAT_HEIGHT,
   MIN_CHAT_WIDTH,
-  MIN_DERIVED_CHAT_HEIGHT,
   parseChatLayout,
   serialiseChatLayout,
 } from './chatLayout'
@@ -239,136 +239,152 @@ describe('FloatingChatWindow', () => {
     expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(saved)
   })
 
-  it('withholds drag and resize on a narrow viewport while keeping chat and close usable', async () => {
-    setViewport(375, 667)
-    const wrapper = mountWindow()
-    const chat = wrapper.get<HTMLElement>('[data-floating-chat]')
-    const before = chat.element.getAttribute('style')
-
-    expect(chat.attributes('data-chat-narrow')).toBe('true')
-    expect(wrapper.find('[data-floating-chat-resize]').exists()).toBe(false)
-
-    wrapper.get('[data-floating-chat-handle]').element
-      .dispatchEvent(pointer('pointerdown', { clientX: 100, clientY: 100 }))
-    wrapper.get('[data-floating-chat-handle]').element
-      .dispatchEvent(pointer('pointermove', { clientX: 300, clientY: 300 }))
-    await wrapper.vm.$nextTick()
-
-    // A gesture writes nothing at all: the sheet's placement belongs to CSS here, so
-    // there is no inline box for a drag to move even by accident.
-    expect(chat.element.getAttribute('style')).toBe(before)
-    expect(chat.element.style.transform).toBe('')
-    expect(wrapper.find('[data-floating-chat-close]').exists()).toBe(true)
-  })
-
   /**
-   * On a phone the window is not a small floating window -- it is a sheet. Clamping desktop
-   * coordinates into a 375px viewport produces something that still behaves like a window
-   * whose gestures have been taken away: an arbitrary inset position, a size derived from
-   * whatever the user last dragged on a monitor, and no relationship to the player it has
-   * to share the screen with.
-   *
-   * So the geometry is handed to CSS at narrow widths, and the remembered desktop layout is
-   * left alone rather than being overwritten by the sheet's placement. A user who opens the
-   * site on their phone and then on their laptop finds the window where they left it.
+   * Phones get the same movable, resizable window as desktop. It opens at 300x380, keeps its
+   * own remembered layout, and stays non-modal so the player and workspace remain usable.
    */
-  describe('narrow-screen sheet', () => {
-    it('hands its geometry to CSS instead of writing an inline window box', () => {
-      setViewport(375, 667)
-      const wrapper = mountWindow()
+  describe('phone window', () => {
+    function stubVisualViewport(value: { width: number; height: number; offsetTop?: number; offsetLeft?: number }) {
+      const original = Object.getOwnPropertyDescriptor(window, 'visualViewport')
+      const visual = Object.assign(new EventTarget(), { offsetTop: 0, offsetLeft: 0, ...value })
+      Object.defineProperty(window, 'visualViewport', { configurable: true, value: visual })
+      return {
+        visual,
+        restore() {
+          if (original) Object.defineProperty(window, 'visualViewport', original)
+          else Reflect.deleteProperty(window, 'visualViewport')
+        },
+      }
+    }
+
+    it('opens a 300x380 non-modal window clear of the player controls', async () => {
+      setViewport(375, 812)
+      const outside = document.createElement('button')
+      document.body.append(outside)
+      const player = { x: 0, y: 600, width: 375, height: 212 }
+      const wrapper = mountWindow(() => player)
+      await wrapper.vm.$nextTick()
       const chat = wrapper.get<HTMLElement>('[data-floating-chat]')
+      const box = geometry(chat.element)
 
       expect(chat.attributes('data-chat-narrow')).toBe('true')
-      // No inline transform or size: a fixed sheet cannot be expressed as a clamped
-      // window box, and leaving both here would let the two fight over placement.
-      expect(chat.element.style.transform).toBe('')
-      expect(chat.element.style.width).toBe('')
-      expect(chat.element.style.height).toBe('')
-      // The parts that must survive the switch.
-      expect(wrapper.find('[data-floating-chat-close]').exists()).toBe(true)
-      expect(wrapper.find('[data-chat-slot]').exists()).toBe(true)
-      expect(wrapper.find('[data-floating-chat-resize]').exists()).toBe(false)
-      expect(wrapper.find('.chat-window__grip').exists()).toBe(false)
+      expect(box).toMatchObject({ width: 300, height: 380 })
+      expect(box.y + box.height).toBeLessThanOrEqual(player.y)
+      expect(chat.attributes('role')).toBeUndefined()
+      expect(chat.attributes('aria-modal')).toBeUndefined()
+      expect(wrapper.find('[data-floating-chat-resize]').exists()).toBe(true)
+      // Focus is not trapped: the player outside the window stays reachable.
+      outside.focus()
+      expect(document.activeElement).toBe(outside)
+      await chat.trigger('keydown', { key: 'Escape' })
+      expect(wrapper.emitted('close')).toHaveLength(1)
     })
 
-    it('never overwrites the remembered desktop layout with sheet geometry', async () => {
-      const saved = serialiseChatLayout({ x: 900, y: 220, width: 420, height: 500 })
-      window.localStorage.setItem(CHAT_LAYOUT_STORAGE_KEY, saved)
-      setViewport(1440, 900)
+    it('drags and resizes on a phone and remembers it apart from the desktop layout', async () => {
+      const desktop = serialiseChatLayout({ x: 900, y: 220, width: 420, height: 500 })
+      window.localStorage.setItem(CHAT_LAYOUT_STORAGE_KEY, desktop)
+      setViewport(375, 812)
       const wrapper = mountWindow()
+      const chat = wrapper.get<HTMLElement>('[data-floating-chat]').element
+      const handle = wrapper.get('[data-floating-chat-handle]').element
+      const before = geometry(chat)
+      expect(before).toMatchObject({ width: 300, height: 380 })
 
-      setViewport(375, 667)
-      window.dispatchEvent(new Event('resize'))
+      handle.dispatchEvent(pointer('pointerdown', { clientX: 200, clientY: 500 }))
+      handle.dispatchEvent(pointer('pointermove', { clientX: 170, clientY: 300 }))
+      handle.dispatchEvent(pointer('pointerup', { clientX: 170, clientY: 300 }))
       await wrapper.vm.$nextTick()
-      expect(wrapper.get('[data-floating-chat]').attributes('data-chat-narrow')).toBe('true')
-      expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(saved)
+      const moved = geometry(chat)
+      expect(moved).toMatchObject({ x: before.x - 30, y: before.y - 200 })
 
-      // Landscape on the same phone is still narrow, and still must not touch the record.
-      setViewport(667, 375)
-      window.dispatchEvent(new Event('resize'))
+      const grip = wrapper.get('[data-floating-chat-resize]').element
+      grip.dispatchEvent(pointer('pointerdown', { clientX: 300, clientY: 500 }))
+      grip.dispatchEvent(pointer('pointermove', { clientX: 300, clientY: 560 }))
+      grip.dispatchEvent(pointer('pointerup', { clientX: 300, clientY: 560 }))
       await wrapper.vm.$nextTick()
-      expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(saved)
+      expect(geometry(chat)).toMatchObject({ width: 300, height: 440 })
 
-      // Back to the monitor: the layout the user chose there, unchanged.
+      expect(parseChatLayout(window.localStorage.getItem(CHAT_NARROW_LAYOUT_STORAGE_KEY))).toEqual(geometry(chat))
+      expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(desktop)
+
+      // Back on a wide screen the desktop layout returns unchanged.
       setViewport(1440, 900)
       window.dispatchEvent(new Event('resize'))
       await wrapper.vm.$nextTick()
-      expect(wrapper.get('[data-floating-chat]').attributes('data-chat-narrow')).toBe('false')
-      expect(geometry(wrapper.get<HTMLElement>('[data-floating-chat]').element))
-        .toEqual({ x: 900, y: 220, width: 420, height: 500 })
-      expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(saved)
+      expect(geometry(chat)).toEqual({ x: 900, y: 220, width: 420, height: 500 })
+      expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(desktop)
     })
 
-    /**
-     * The concession the sheet has to make, and the order it makes it in. A landscape phone
-     * gives the player most of the viewport, so clearing the whole player card would leave
-     * the sheet a header with no body. The player offers weaker claims for exactly this,
-     * and the strongest one that still leaves a usable sheet is the one that wins.
-     */
-    it('gives up the player card for its transport rather than becoming a slit', async () => {
-      setViewport(667, 375)
-      // The whole card is preferred; only the lower rectangle is protected: the
-      // transport. 375 - 105 = 270px of a 375px viewport for the card, which cannot be
-      // cleared and leave 140px; the transport at 223 can.
-      const wrapper = mountWindow(() => ({ x: 0, y: 105, width: 667, height: 270 }) as never)
-      await wrapper.vm.$nextTick()
-      const slit = wrapper.get<HTMLElement>('[data-floating-chat]').element
-      const band = (element: HTMLElement) => Number.parseFloat(element.style.getPropertyValue('--chat-sheet-block-end'))
-      // One region only, so there is nothing weaker to fall back to and the sheet takes it.
-      expect(band(slit)).toBe(375 - 105 + CHAT_SAFE_MARGIN)
-      wrapper.unmount()
+    it('fits above the on-screen keyboard and grows back without forgetting the chosen size', async () => {
+      setViewport(375, 812)
+      const saved = { x: 30, y: 300, width: 320, height: 460 }
+      window.localStorage.setItem(CHAT_NARROW_LAYOUT_STORAGE_KEY, serialiseChatLayout(saved))
+      const { visual, restore } = stubVisualViewport({ width: 375, height: 812 })
+      const wrapper = mountWindow()
+      try {
+        await wrapper.vm.$nextTick()
+        const chat = wrapper.get<HTMLElement>('[data-floating-chat]').element
+        expect(geometry(chat)).toEqual(saved)
 
-      const laddered = mount(FloatingChatWindow, {
-        attachTo: document.body,
-        props: {
-          reserved: () => [
-            { x: 0, y: 105, width: 667, height: 270 },
-            { x: 0, y: 223, width: 667, height: 152 },
-          ],
-        },
-        slots: { default: '<p data-chat-slot>chat body</p>' },
-      })
-      await laddered.vm.$nextTick()
-      const sheet = laddered.get<HTMLElement>('[data-floating-chat]').element
-      // The transport's claim, not the card's: 375 - 223 + 16 = 168, which leaves
-      // 375 - 16 - 168 = 191px of room -- above the 140px floor a sheet needs.
-      expect(band(sheet)).toBe(375 - 223 + CHAT_SAFE_MARGIN)
-      expect(375 - CHAT_SAFE_MARGIN - band(sheet)).toBeGreaterThanOrEqual(MIN_DERIVED_CHAT_HEIGHT)
-      laddered.unmount()
+        // The keyboard takes the lower half and the page pans by 40px.
+        Object.assign(visual, { height: 420, offsetTop: 40 })
+        visual.dispatchEvent(new Event('resize'))
+        await wrapper.vm.$nextTick()
+        const squeezed = geometry(chat)
+        expect(squeezed.height).toBeLessThanOrEqual(420 - 2 * CHAT_SAFE_MARGIN)
+        // The transform includes the visual viewport offset, so the window stays in view.
+        expect(squeezed.y - 40 + squeezed.height).toBeLessThanOrEqual(420 - CHAT_SAFE_MARGIN)
+        expect(parseChatLayout(window.localStorage.getItem(CHAT_NARROW_LAYOUT_STORAGE_KEY))).toEqual(saved)
+
+        Object.assign(visual, { height: 812, offsetTop: 0 })
+        visual.dispatchEvent(new Event('resize'))
+        await wrapper.vm.$nextTick()
+        expect(geometry(chat)).toEqual(saved)
+      } finally {
+        wrapper.unmount()
+        restore()
+      }
     })
 
-    it('reloading while narrow keeps the desktop layout to come back to', () => {
-      const saved = serialiseChatLayout({ x: 900, y: 220, width: 420, height: 500 })
-      window.localStorage.setItem(CHAT_LAYOUT_STORAGE_KEY, saved)
-      setViewport(375, 667)
-      const narrow = mountWindow()
-      expect(window.localStorage.getItem(CHAT_LAYOUT_STORAGE_KEY)).toBe(saved)
-      narrow.unmount()
+    it('a move while the keyboard squeezes the window keeps the chosen size', async () => {
+      setViewport(375, 812)
+      const saved = { x: 30, y: 300, width: 320, height: 460 }
+      window.localStorage.setItem(CHAT_NARROW_LAYOUT_STORAGE_KEY, serialiseChatLayout(saved))
+      const { visual, restore } = stubVisualViewport({ width: 375, height: 812 })
+      const wrapper = mountWindow()
+      try {
+        await wrapper.vm.$nextTick()
+        Object.assign(visual, { height: 420 })
+        visual.dispatchEvent(new Event('resize'))
+        await wrapper.vm.$nextTick()
+        const chat = wrapper.get<HTMLElement>('[data-floating-chat]').element
+        const squeezed = geometry(chat)
+        expect(squeezed.height).toBeLessThan(saved.height)
+        const handle = wrapper.get('[data-floating-chat-handle]').element
+        handle.dispatchEvent(pointer('pointerdown', { clientX: 200, clientY: 100 }))
+        handle.dispatchEvent(pointer('pointermove', { clientX: 190, clientY: 100 }))
+        handle.dispatchEvent(pointer('pointerup', { clientX: 190, clientY: 100 }))
+        await wrapper.vm.$nextTick()
+        const stored = parseChatLayout(window.localStorage.getItem(CHAT_NARROW_LAYOUT_STORAGE_KEY))!
+        expect(stored).toMatchObject({ x: squeezed.x - 10, width: 320, height: 460 })
 
-      setViewport(1440, 900)
-      const wide = mountWindow()
-      expect(geometry(wide.get<HTMLElement>('[data-floating-chat]').element))
-        .toEqual({ x: 900, y: 220, width: 420, height: 500 })
+        Object.assign(visual, { height: 812 })
+        visual.dispatchEvent(new Event('resize'))
+        await wrapper.vm.$nextTick()
+        expect(geometry(chat)).toMatchObject({ width: 320, height: 460 })
+      } finally {
+        wrapper.unmount()
+        restore()
+      }
+    })
+
+    it('fits a 320px phone by narrowing to the usable minimum', () => {
+      setViewport(320, 640)
+      const wrapper = mountWindow()
+      const box = geometry(wrapper.get<HTMLElement>('[data-floating-chat]').element)
+      expect(box.width).toBe(MIN_CHAT_WIDTH)
+      expect(box.x).toBeGreaterThanOrEqual(CHAT_SAFE_MARGIN)
+      expect(box.x + box.width).toBeLessThanOrEqual(320 - CHAT_SAFE_MARGIN)
     })
   })
 

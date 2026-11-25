@@ -2,7 +2,8 @@ import { beforeAll, afterAll, describe, it, expect } from 'vitest'
 import { isReviewStatus } from '../../src/shared/reviewStatus'
 import { catalogueDatabase } from './catalogue-fixture'
 import { readCatalogueSnapshot } from '../catalogue/repository'
-import { exportWorkbook, parseStaging } from '../catalogue/staging'
+import { exportWorkbook, parseStaging, SHEET_HEADERS } from '../catalogue/staging'
+import { diffStaging } from '../catalogue/diff'
 import type { CatalogueSnapshot } from '../catalogue/types'
 let fixture: Awaited<ReturnType<typeof catalogueDatabase>>, snapshot: CatalogueSnapshot
 beforeAll(async () => {
@@ -17,8 +18,117 @@ const edit = (tab: 'Tracks' | 'Sources' | 'Aliases', field: string, value: strin
   book[tab][1][book[tab][0].indexOf(field)] = value
   return book
 }
+
+describe('published stream rows', () => {
+  function legacy() {
+    const original = structuredClone(snapshot)
+    const source = {
+      ...original.sources[0],
+      source_row_id: 'synthetic-stream',
+      provider: 'chksz',
+      external_id: '12345678901234567890',
+      source_type: 'stream',
+      source_confidence: 1,
+      rights_status: 'public',
+      metadata_json: '{"contentType":"audio/mpeg","rightsStatus":"public"}',
+      evidence: 'Synthetic public evidence',
+      notes: null as string | null,
+    }
+    original.sources = [source]
+    return { original, source, otherTrack: original.tracks.find((t) => t.track_id !== source.track_id)!.track_id }
+  }
+
+  function change(row: string[], changes: Record<string, string>) {
+    for (const [field, value] of Object.entries(changes))
+      row[SHEET_HEADERS.Sources.indexOf(field)] = value
+  }
+
+  it('preserves source fields and D1 metadata with zero proposals after trailing blank truncation', () => {
+    const { original, source } = legacy()
+    const book = exportWorkbook(original)
+    book.Sources[1].pop()
+    const staged = parseStaging(book, original)
+    const { created_at: _created, updated_at: _updated, ...fields } = source
+    expect(staged.errors).toEqual([])
+    expect(staged.sources).toEqual([fields])
+    expect(diffStaging(staged, original)).toEqual([])
+  })
+
+  it('preserves literal whitespace and rejects changing it', () => {
+    const { original, source } = legacy()
+    source.notes = '  published note  '
+    const book = exportWorkbook(original)
+    const staged = parseStaging(book, original)
+    expect(staged.errors).toEqual([])
+    expect(diffStaging(staged, original)).toEqual([])
+    change(book.Sources[1], { notes: 'published note' })
+    expect(parseStaging(book, original).errors).not.toHaveLength(0)
+  })
+
+  it.each([
+    ['source_row_id', 'another-source'],
+    ['track_id', ''],
+    ['provider', 'gd-studio'],
+    ['external_id', '1234567890'],
+    ['source_type', 'audio'],
+    ['source_status', 'disabled'],
+    ['source_confidence', '1.0'],
+    ['source_confidence', '0.9'],
+    ['rights_status', 'unverified'],
+    ['evidence', 'Replacement evidence'],
+    ['notes', 'Replacement note'],
+    ['notes', ' '],
+  ])('rejects editing %s (%s)', (field, value) => {
+    const { original, otherTrack } = legacy()
+    const book = exportWorkbook(original)
+    change(book.Sources[1], { [field]: field === 'track_id' ? otherTrack : value })
+    const staged = parseStaging(book, original)
+    expect(staged.errors.some((error) => error.entityType === 'source')).toBe(true)
+    expect(diffStaging(staged, original).filter((p) => p.validationState === 'valid')).toEqual([])
+  })
+
+  it('rejects replacing an omitted stream with audio for the same track and provider', () => {
+    const { original } = legacy()
+    const book = exportWorkbook(original)
+    change(book.Sources[1], {
+      source_row_id: 'replacement-source', external_id: '2345678901', source_type: 'audio',
+    })
+    const staged = parseStaging(book, original)
+    expect(staged.errors).not.toHaveLength(0)
+    expect(diffStaging(staged, original).some((p) => p.kind === 'new_source')).toBe(false)
+  })
+
+  it('rejects duplicate rows and an audio alias of the same binding on another known track', () => {
+    const { original, otherTrack } = legacy()
+    const book = exportWorkbook(original)
+    const alias = [...book.Sources[1]]
+    book.Sources.push(alias)
+    expect(parseStaging(book, original).errors).toContainEqual({
+      entityType: 'source', key: 'synthetic-stream', code: 'duplicate_or_invalid_source_identity',
+    })
+    change(alias, { source_row_id: 'alias-source', track_id: otherTrack, source_type: 'audio' })
+    const staged = parseStaging(book, original)
+    expect(staged.errors.some((error) => error.key === 'alias-source' && error.conflict)).toBe(true)
+    expect(diffStaging(staged, original).some((p) => p.kind === 'new_source')).toBe(false)
+  })
+
+  it('rejects new stream rows and still accepts evidenced audio on another track', () => {
+    const { original, otherTrack } = legacy()
+    const book = exportWorkbook(original)
+    const row = [...book.Sources[1]]
+    change(row, { source_row_id: 'new-source', track_id: otherTrack, external_id: '3456789012' })
+    book.Sources.push(row)
+    expect(parseStaging(book, original).errors).toContainEqual({
+      entityType: 'source', key: 'new-source', code: 'invalid_source',
+    })
+    change(row, { source_type: 'audio' })
+    const staged = parseStaging(book, original)
+    expect(staged.errors).toEqual([])
+    expect(diffStaging(staged, original).map(({ kind }) => kind)).toEqual(['new_source'])
+  })
+})
 describe('bounded untrusted Sheet staging', () => {
-  it('roundtrips three synthetic trusted-source fixtures without inventing classification', () => {
+  it('roundtrips the three authorised tracks without inventing classification', () => {
     const parsed = parseStaging(exportWorkbook(snapshot), snapshot)
     expect(parsed.errors).toEqual([])
     expect(parsed.tracks).toHaveLength(3)
@@ -26,7 +136,7 @@ describe('bounded untrusted Sheet staging', () => {
   })
   it('accepts a focus track whose vocal status is vocal', () => {
     // Regression guard: `focus` and `vocal_status` are independent dimensions, so an admin may
-    // save a focus track with a vocal vocal_status.
+    // save a focus track with a vocal vocal_status (389 published rows already look like this).
     const book = exportWorkbook(snapshot)
     const headers = book.Tracks[0]
     book.Tracks[1][headers.indexOf('focus')] = 'TRUE'

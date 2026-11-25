@@ -183,6 +183,12 @@ function onKeydown(event: KeyboardEvent): void {
   }
 }
 
+function onUnfocusedKeydown(event: KeyboardEvent): void {
+  // Clear all removes its own focused button. Keep Escape available when focus
+  // falls back to the body, without taking keys from another focused surface.
+  if (!event.defaultPrevented && advancedOpen.value && event.target === document.body) onKeydown(event)
+}
+
 function onPointerDown(event: PointerEvent): void {
   if (props.modalOpen) return
   if (!(event.target instanceof Node)) return
@@ -207,11 +213,13 @@ watch(() => props.modalOpen, (modalOpen) => {
 onMounted(() => {
   timer = setInterval(() => { localTime.value = formatLocalTime() }, 60_000)
   document.addEventListener('pointerdown', onPointerDown)
+  document.addEventListener('keydown', onUnfocusedKeydown)
 })
 
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
   document.removeEventListener('pointerdown', onPointerDown)
+  document.removeEventListener('keydown', onUnfocusedKeydown)
 })
 </script>
 
@@ -219,6 +227,7 @@ onBeforeUnmount(() => {
   <section
     ref="root"
     class="focus-bar liquid-shell"
+    data-glass-hero="focus"
     :aria-label="text('workspace.focusBar')"
     @keydown="onKeydown"
     @click="onBarClick"
@@ -299,6 +308,7 @@ onBeforeUnmount(() => {
           class="focus-bar__advanced-trigger"
           data-advanced-trigger
           :data-filter-active="filtersActive"
+          :data-filter-mode="state.mode.value"
           :aria-label="filterTriggerLabel"
           :title="filterTriggerLabel"
           :aria-controls="advancedId"
@@ -307,6 +317,12 @@ onBeforeUnmount(() => {
         >
           <SlidersHorizontal :size="17" aria-hidden="true" />
           <span data-focus-filter-summary>{{ filterSummary }}</span>
+          <span
+            v-if="state.mode.value === 'vocal'"
+            class="focus-bar__vocal-badge"
+            data-focus-vocal-badge
+            aria-hidden="true"
+          >{{ text('tab.vocal') }}</span>
           <ChevronDown class="focus-bar__filter-chevron" :size="16" aria-hidden="true" />
         </button>
         <div v-if="advancedOpen" class="focus-bar__advanced-popover liquid-popover">
@@ -395,7 +411,7 @@ onBeforeUnmount(() => {
 .focus-bar__owner-dot { background: var(--colour-accent-strong); box-shadow: 0 0 0 1px var(--liquid-edge-light); }
 .focus-bar__timer { display: flex; flex: 0 1 auto; align-items: center; gap: 0.25rem; min-width: 0; padding-inline: 0.375rem; }
 .focus-bar__timer > output,
-[data-sleep-trigger] { flex: 0 0 auto; min-width: 3.25rem; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+.focus-bar__timer > [data-sleep-trigger] { flex: 0 0 auto; min-width: 3.25rem; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
 .focus-bar__toolbar .focus-bar__phase { display: flex; gap: 0.25rem; align-items: center; justify-content: center; font-size: 0.8125rem; font-weight: 650; line-height: 1.25; }
 .focus-bar__phase svg { flex: 0 0 auto; }
 .focus-bar__toolbar .focus-bar__icon-button { display: grid; flex: 0 0 44px; width: 44px; padding: 0; place-items: center; }
@@ -405,8 +421,10 @@ onBeforeUnmount(() => {
 .focus-bar__advanced-trigger span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8125rem; }
 .focus-bar__advanced-trigger svg { flex: 0 0 auto; }
 .focus-bar__advanced-trigger[aria-expanded="true"] { background: var(--liquid-selected); }
-/* All disclosures share the measured space above the entire Player. They are
-   anchored to the shell, outside the timer's flex sizing, including landscape. */
+.focus-bar__vocal-badge { display: none; }
+/* Disclosures are anchored to the shell and positioned outside the timer's flex
+   sizing. Advanced Filters stays within the measured Focus-to-Player band, with
+   its contents scrolling inside that bound at short heights and enlarged text. */
 .focus-bar__phase-menu,
 .focus-bar__sleep-popover,
 .focus-bar__advanced-popover {
@@ -422,7 +440,17 @@ onBeforeUnmount(() => {
 .focus-bar__phase-menu { left: 0; right: auto; display: grid; gap: 0.25rem; width: max-content; min-width: min(12rem, 100%); padding: 0.5rem; overflow: auto; }
 .focus-bar__phase-menu button { width: 100%; text-align: start; border-radius: var(--liquid-radius-control); }
 .focus-bar__sleep-popover { width: min(24rem, calc(100vw - 2 * var(--workspace-edge-inset))); overflow: auto; }
-.focus-bar__advanced-popover { width: min(26rem, calc(100vw - 2 * var(--workspace-edge-inset))); overflow: hidden; }
+.focus-bar__advanced-popover {
+  width: min(26rem, calc(100vw - 2 * var(--workspace-edge-inset)));
+  /* Keep the disclosure above the full Player. At enlarged text sizes, cap the
+     panel to the real measured band and let its existing body scroll. A small
+     buffer keeps rounded landscape coordinates from touching the Player. */
+  max-height: min(
+    33rem,
+    max(0px, calc(min(100dvh - var(--workspace-edge-inset), var(--workspace-player-top, var(--workspace-player-controls-top))) - var(--workspace-focus-bottom) - 1.25rem))
+  );
+  overflow: hidden;
+}
 .focus-bar__advanced-popover :deep(.advanced-filters) { max-height: inherit; height: auto; background: transparent; border: 0; box-shadow: none; backdrop-filter: none; }
 
 @media (max-width: 47.99rem) {
@@ -442,6 +470,25 @@ onBeforeUnmount(() => {
   .focus-bar__toolbar .focus-bar__advanced-trigger { width: 44px; height: 44px; padding: 0; }
   .focus-bar__advanced-trigger [data-focus-filter-summary],
   .focus-bar__filter-chevron { display: none; }
+  .focus-bar__advanced-trigger[data-filter-mode="vocal"] .focus-bar__vocal-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    bottom: 2px;
+    left: 50%;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    max-width: 36px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 0.5625rem;
+    padding: 0 0.25rem;
+    border-radius: 999px;
+    background: var(--liquid-selected);
+    color: var(--liquid-text-primary);
+    pointer-events: none;
+  }
   .focus-bar__advanced-trigger[data-filter-active="true"]::after { content: ''; position: absolute; top: 0.5rem; right: 0.5rem; width: 0.25rem; height: 0.25rem; border-radius: 50%; background: var(--colour-accent); }
   .focus-bar__advanced-popover,
   .focus-bar__sleep-popover { left: 0; right: 0; width: auto; }

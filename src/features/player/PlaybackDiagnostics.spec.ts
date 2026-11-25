@@ -82,6 +82,8 @@ async function collectLxAttempts(
 ): Promise<ProviderAttempt[]> {
   const attempts: ProviderAttempt[] = []
   const provider = createLxUserProvider({
+    // H-01: the fixture media host is listed explicitly, standing in for an operator allow-list.
+    cspSources: { connect: [], media: ['https://media.example.com'] },
     sourceRepository: createLxRepository(sources),
     runtimeClientFactory: () => client as LxRuntimeClient,
     qualityStore: { lxQuality: () => 'standard' },
@@ -97,7 +99,7 @@ async function collectLxAttempts(
  * The store's `resolve` seam is used to inject a fixed attempt trace so this spec pins the
  * rendering contract independently of resolution timing; the records fed in here are the real
  * provider's own output, captured by `collectLxAttempts`. The end-to-end coverage that the
- * production registry forwards the composite provider's `onSubAttempt` sink into
+ * resolver context forwards the composite provider's `onSubAttempt` sink into
  * `store.attempts` lives in `lxSubAttemptDiagnostics.spec.ts`.
  */
 function mountWithAttempts(attempts: ProviderAttempt[]) {
@@ -223,7 +225,7 @@ describe('PlaybackDiagnostics', () => {
         },
         {
           provider: {
-            id: 'jellyfin',
+            id: 'gd-studio',
             async resolve() {
               return { kind: 'audio' as const, url: 'https://media.example.com/a.mp3', mimeType: 'audio/mpeg' }
             },
@@ -239,7 +241,7 @@ describe('PlaybackDiagnostics', () => {
       sources: [
         { provider: 'chksz', externalId: '3334421408' },
         { provider: 'lx', externalId: 'wy:2100334024' },
-        { provider: 'jellyfin', externalId: '1234567890abcdef1234567890abcdef' },
+        { provider: 'gd-studio', externalId: 'netease:123456:320' },
       ],
     }
     const wrapper = mount(PlaybackDiagnostics, { props: { player } })
@@ -247,7 +249,7 @@ describe('PlaybackDiagnostics', () => {
     await player.playNow(multiProviderTrack)
     await flushPromises()
 
-    expect(attemptLabels(wrapper)).toEqual(['ChKSz BYOK', 'LX Music', 'Jellyfin'])
+    expect(attemptLabels(wrapper)).toEqual(['ChKSz BYOK', 'LX Music', 'GD Studio'])
 
     wrapper.unmount()
   })
@@ -255,7 +257,7 @@ describe('PlaybackDiagnostics', () => {
   it('labels each LX sub-attempt with its source name', async () => {
     const attempts = await collectLxAttempts(
       [
-        createLxSource('synthetic-pinned-source', 'Synthetic Pinned Source', 10, '// built-in'),
+        createLxSource('builtin-sample-source', 'Built-in Sample', 10, '// built-in'),
         createLxSource('custom-1', 'My Source', 20, '// custom'),
       ],
       {
@@ -270,7 +272,7 @@ describe('PlaybackDiagnostics', () => {
     await player.playNow(lxTrack)
     await flushPromises()
 
-    expect(attemptLabels(wrapper)).toEqual(['LX / Synthetic Pinned Source', 'LX / My Source'])
+    expect(attemptLabels(wrapper)).toEqual(['LX / Built-in Sample', 'LX / My Source'])
 
     wrapper.unmount()
   })
@@ -389,10 +391,10 @@ describe('PlaybackDiagnostics', () => {
     const attempts = await collectLxAttempts(
       [
         createLxSource(
-          'synthetic-pinned-source',
-          'Synthetic Pinned Source',
+          'builtin-sample-source',
+          'Sample Source',
           10,
-          `/* ${SENTINEL_LX_SCRIPT_BODY} */\n// @name Synthetic Pinned Source`,
+          `/* ${SENTINEL_LX_SCRIPT_BODY} */\n// @name Sample Source`,
         ),
       ],
       {
@@ -408,7 +410,7 @@ describe('PlaybackDiagnostics', () => {
 
     expect(JSON.stringify(attempts)).not.toContain(SENTINEL_LX_SCRIPT_BODY)
     const diagnostics = wrapper.get('[data-playback-diagnostics]').text()
-    expect(diagnostics).toContain('LX / Synthetic Pinned Source')
+    expect(diagnostics).toContain('LX / Sample Source')
     expect(diagnostics).not.toContain(SENTINEL_LX_SCRIPT_BODY)
 
     wrapper.unmount()
@@ -442,4 +444,13 @@ describe('PlaybackDiagnostics', () => {
 
     wrapper.unmount()
   })
+})
+
+
+it('shows source attempts without debug-log export controls on the playback panel', () => {
+ const player=createPlaybackStore()
+ const wrapper=mount(PlaybackDiagnostics,{props:{player}})
+ expect(wrapper.find('[data-debug-log-export]').exists()).toBe(false)
+ expect(wrapper.find('[data-debug-log-clear]').exists()).toBe(false)
+ wrapper.unmount();player.dispose()
 })

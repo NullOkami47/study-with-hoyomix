@@ -540,7 +540,7 @@ export function createBackgroundRoutes(env: BackgroundEnv, options: BackgroundRo
     const expected: BackgroundStatus = action === 'publish' ? 'draft' : action === 'archive' ? 'published' : 'archived'
     const next: BackgroundStatus = action === 'archive' ? 'archived' : 'published'
     if (row.status !== expected) return json({ error: 'invalid_background_transition' }, 409)
-
+    
     // FINDING 2 FIX: Prevent lifecycle transitions when purge recovery is active
     if (row.purgeStartedAt !== null || row.purgeFinalisingAt !== null) {
       // Background is in purge recovery state - no ordinary transitions allowed
@@ -559,7 +559,7 @@ export function createBackgroundRoutes(env: BackgroundEnv, options: BackgroundRo
     const changedAt = options.now()
     const publishedAt = next === 'published' ? changedAt : row.publishedAt
     const archivedAt = next === 'archived' ? changedAt : null
-
+    
     // Wrap batch in try-catch for defensive error handling
     let results
     try {

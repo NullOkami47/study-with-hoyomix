@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, onScopeDispose, watch } from 'vue'
 import { Music2, Pause, Play, SkipBack, SkipForward } from 'lucide-vue-next'
 import { translate, type TranslationKey } from '../../i18n'
 import { usePreferences } from '../../stores/preferences'
@@ -7,11 +7,19 @@ import { resolveDisplayTitle } from '../catalog/displayTitle'
 import type { PlaybackStore } from './store'
 import { playbackCommands } from './commands'
 import { formatPlaybackTime, playbackPresentationFor } from './presentation'
+import { sharedArtworkCache } from '../library/artworkCache'
 
 const props = defineProps<{ store: PlaybackStore }>()
 const { locale } = usePreferences()
 const text = (key: TranslationKey) => translate(locale.value, key)
 const presentation = computed(() => playbackPresentationFor(props.store))
+let releaseArtwork: (() => void) | undefined
+watch(() => presentation.value.artworkUrl.value, url => {
+  const previous = releaseArtwork
+  releaseArtwork = url ? sharedArtworkCache.retain(url) : undefined
+  if (previous) void nextTick(previous)
+}, { immediate: true, flush: 'sync' })
+onScopeDispose(() => { const previous = releaseArtwork; releaseArtwork = undefined; if (previous) void nextTick(previous) })
 const title = computed(() => resolveDisplayTitle(props.store.currentTrack.value, locale.value, text('player.noTrack')))
 const details = computed(() => [
   props.store.currentTrack.value?.album,
@@ -27,9 +35,11 @@ const status = computed(() => {
 })
 function toggle(): void {
   if (props.store.playable.value?.kind === 'youtube') return
-  if (props.store.playbackIntent.value === 'playing') playbackCommands.pause()
+  if (transportPlaying.value) playbackCommands.pause()
   else playbackCommands.play()
 }
+const transportPlaying = computed(() => props.store.playbackIntent.value === 'playing' &&
+  ['playing', 'buffering', 'resolving', 'ready'].includes(props.store.status.value))
 let seekGesture: { generation: number; trackId?: string } | undefined
 function beginSeek(event: Event): void {
   if (event instanceof KeyboardEvent && event.repeat) return
@@ -63,8 +73,8 @@ const seekHandler = computed(() => {
     </div>
     <div class="compact-playback__transport">
       <button type="button" data-compact-previous :aria-label="text('player.previous')" @click="playbackCommands.previous?.()"><SkipBack :size="20" aria-hidden="true" /></button>
-      <button type="button" data-compact-play :disabled="store.playable.value?.kind === 'youtube'" :aria-label="text(store.playbackIntent.value === 'playing' ? 'player.pause' : 'player.play')" @click="toggle">
-        <Pause v-if="store.playbackIntent.value === 'playing'" :size="24" aria-hidden="true" /><Play v-else :size="24" aria-hidden="true" />
+      <button type="button" data-compact-play :disabled="store.playable.value?.kind === 'youtube'" :aria-label="text(transportPlaying ? 'player.pause' : 'player.play')" @click="toggle">
+        <Pause v-if="transportPlaying" :size="24" aria-hidden="true" /><Play v-else :size="24" aria-hidden="true" />
       </button>
       <button type="button" data-compact-next :aria-label="text('player.next')" @click="playbackCommands.next?.()"><SkipForward :size="20" aria-hidden="true" /></button>
     </div>

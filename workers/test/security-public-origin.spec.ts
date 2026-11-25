@@ -45,8 +45,8 @@ describe('PUBLIC_ORIGIN validation and redirect safety', () => {
       expect(() => createAuthHandler({ ...minimalEnv, PUBLIC_ORIGIN: 'https://staging.app.example.com' })).not.toThrow()
     })
 
-    it('accepts the canonical Study with HOYO-MiX Workers.dev origin', () => {
-      const workersDevOrigin = 'https://backend.example.invalid'
+    it('accepts a valid Workers.dev origin', () => {
+      const workersDevOrigin = 'https://app.example.workers.dev'
       expect(() => createAuthHandler({
         ...minimalEnv,
         PUBLIC_ORIGIN: workersDevOrigin,

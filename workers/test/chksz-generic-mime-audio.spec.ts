@@ -345,4 +345,97 @@ describe('the corrected content-type never invents a value', () => {
     expect(served.length).toBe(1024)
     expect(Array.from(served.slice(0, 4))).toEqual([0x66, 0x4c, 0x61, 0x43])
   })
+
+  it('serves a follow-up mid-stream range after byte-0 proves FLAC over application/octet-stream while rejecting cold mid-stream ranges', async () => {
+    const path = `/api/providers/chksz/media/${EXTERNAL_ID}/${NONCE}`
+
+    // Cold non-zero range without prior byte-0 verification must still fail closed.
+    const coldCache = new MemoryCache()
+    const coldSubject = createTransientMedia({
+      externalIdPattern: /^[0-9]{1,20}$/,
+      providerId: 'chksz',
+      publicOrigin: PUBLIC_ORIGIN,
+      validateUrl: mediaUrl,
+      allowGenericAudioTypes: true,
+    }, {
+      cache: coldCache as unknown as Pick<Cache, 'match' | 'put'>,
+      crypto: deterministicCrypto,
+      fetch: (async () => new Response(new Uint8Array([0x11, 0x22, 0x33, 0x44]), {
+        status: 206,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-range': 'bytes 500000-500003/18054862',
+          'content-length': '4',
+        },
+      })) as unknown as typeof fetch,
+      now: () => 1_000_000,
+    })
+    await coldSubject.prepare({
+      externalId: EXTERNAL_ID,
+      validatedUrl: new URL('https://media.example/song'),
+      mimeType: 'audio/mpeg',
+    })
+    const coldRes = await coldSubject.serve(
+      new Request(new URL(path, PUBLIC_ORIGIN), { method: 'GET', headers: { range: 'bytes=500000-500003' } }),
+      new URL(path, PUBLIC_ORIGIN),
+    )
+    expect(coldRes.status).toBe(502)
+
+    // Warm session: byte-0 first, then non-zero range with matching metadata.
+    const warmCache = new MemoryCache()
+    let step = 0
+    const warmSubject = createTransientMedia({
+      externalIdPattern: /^[0-9]{1,20}$/,
+      providerId: 'chksz',
+      publicOrigin: PUBLIC_ORIGIN,
+      validateUrl: mediaUrl,
+      allowGenericAudioTypes: true,
+    }, {
+      cache: warmCache as unknown as Pick<Cache, 'match' | 'put'>,
+      crypto: deterministicCrypto,
+      fetch: (async () => {
+        step += 1
+        if (step === 1) {
+          return new Response(new Uint8Array(FLAC_PREFIX), {
+            status: 206,
+            headers: {
+              'content-type': 'application/octet-stream',
+              'content-range': 'bytes 0-7/18054862',
+              'content-length': String(FLAC_PREFIX.length),
+              etag: '"chksz-flac"',
+            },
+          })
+        }
+        return new Response(new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]), {
+          status: 206,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-range': 'bytes 500000-500003/18054862',
+            'content-length': '4',
+            etag: '"chksz-flac"',
+          },
+        })
+      }) as unknown as typeof fetch,
+      now: () => 1_000_000,
+    })
+    await warmSubject.prepare({
+      externalId: EXTERNAL_ID,
+      validatedUrl: new URL('https://media.example/song'),
+      mimeType: 'audio/mpeg',
+    })
+    const first = await warmSubject.serve(
+      new Request(new URL(path, PUBLIC_ORIGIN), { method: 'GET', headers: { range: 'bytes=0-7' } }),
+      new URL(path, PUBLIC_ORIGIN),
+    )
+    expect(first.status).toBe(206)
+    expect(first.headers.get('content-type')).toBe('audio/flac')
+
+    const second = await warmSubject.serve(
+      new Request(new URL(path, PUBLIC_ORIGIN), { method: 'GET', headers: { range: 'bytes=500000-500003' } }),
+      new URL(path, PUBLIC_ORIGIN),
+    )
+    expect(second.status).toBe(206)
+    expect(second.headers.get('content-type')).toBe('audio/flac')
+    expect(Array.from(new Uint8Array(await second.arrayBuffer()))).toEqual([0xaa, 0xbb, 0xcc, 0xdd])
+  })
 })

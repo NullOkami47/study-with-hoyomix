@@ -10,7 +10,7 @@ import type { PlaybackStore } from './store'
 
 type QueueStore = Pick<PlaybackStore,
   'currentIndex' | 'playQueueIndex' | 'queue' | 'removeQueueIndex' | 'moveQueueItem' | 'playNext' | 'clearUpcomingQueue'
-> & Partial<Pick<PlaybackStore, 'shuffle' | 'repeatMode' | 'setShuffle' | 'cycleRepeatMode'>>
+> & Partial<Pick<PlaybackStore, 'filteredHistoryIds' | 'shuffle' | 'repeatMode' | 'setShuffle' | 'cycleRepeatMode'>>
 
 const props = defineProps<{ store: QueueStore }>()
 const { locale } = usePreferences()
@@ -31,7 +31,10 @@ const currentEntry = computed(() => {
 
 const upcomingEntries = computed(() => {
   const start = Math.max(0, props.store.currentIndex.value + 1)
-  return props.store.queue.value.slice(start).map((track, offset) => ({ track, queueIndex: start + offset }))
+  return props.store.queue.value
+    .slice(start)
+    .map((track, offset) => ({ track, queueIndex: start + offset }))
+    .filter(({ track }) => !props.store.filteredHistoryIds?.value.has(track.id))
 })
 const historyEntries = computed(() => props.store.queue.value.slice(0, Math.max(0, props.store.currentIndex.value))
   .map((track, queueIndex) => ({ track, queueIndex })))
@@ -281,7 +284,7 @@ onBeforeUnmount(releaseDragCapture)
       <h3>{{ text('queue.upNext') }} ({{ upcomingEntries.length }})</h3>
       <div v-if="upcomingEntries.length" ref="upcomingViewport" class="queue-panel__viewport" data-queue-viewport @scroll="upcomingScroll = ($event.target as HTMLElement).scrollTop">
       <ol class="queue-panel__list" :style="{ paddingTop: `${upcomingStart * rowHeight}px`, paddingBottom: `${(upcomingEntries.length - upcomingEnd) * rowHeight}px` }">
-        <li v-for="(entry, localIndex) in visibleUpcoming" :key="entry.track.id" class="queue-panel__row" :style="{ height: `${rowHeight}px` }" data-queue-up-next :data-queue-track="entry.track.id" :data-queue-dragging="draggingId === entry.track.id ? 'true' : 'false'" :aria-posinset="entry.queueIndex - Math.max(0, props.store.currentIndex.value + 1) + 1" :aria-setsize="upcomingEntries.length">
+        <li v-for="(entry, localIndex) in visibleUpcoming" :key="entry.track.id" class="queue-panel__row" :style="{ height: `${rowHeight}px` }" data-queue-up-next :data-queue-track="entry.track.id" :data-queue-dragging="draggingId === entry.track.id ? 'true' : 'false'" :aria-posinset="upcomingStart + localIndex + 1" :aria-setsize="upcomingEntries.length">
           <button type="button" class="queue-panel__drag-handle" data-queue-drag-handle :aria-label="`${text('queue.drag')}: ${label(entry.track)}`" :aria-grabbed="draggingId === entry.track.id ? 'true' : 'false'" @pointerdown="startDrag($event, entry.track.id)"><span aria-hidden="true">⋮⋮</span></button>
           <button type="button" class="queue-panel__track" data-queue-track-button @keydown="navigateRows($event, entry.queueIndex)" :aria-label="text('queue.playFrom').replace('{title}', label(entry.track))" @click="props.store.playQueueIndex(entry.queueIndex)">{{ label(entry.track) }}</button>
           <div class="queue-panel__actions">

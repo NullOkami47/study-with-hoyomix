@@ -1,4 +1,11 @@
-import type { CatalogueSnapshot, StagedTrack, StagedSource, StagingData, StageError } from './types'
+import type {
+  CatalogueSnapshot,
+  SourceRow,
+  StagedTrack,
+  StagedSource,
+  StagingData,
+  StageError,
+} from './types'
 import { SHEET_LIMITS, type Workbook, type SheetTab } from './googleSheets'
 import { canonicalId, relationId, validConfidence, validDate, validSourceId } from './validation'
 import { isStagingReviewStatus, needsClassification } from '../../src/shared/reviewStatus'
@@ -49,6 +56,19 @@ export const WORKBOOK_INSTRUCTIONS = [
   'ChatGPT/Gemini may propose staging edits only, without Admin cookies or production database credentials.',
 ]
 const blank = (v: string) => v || null
+const value = (v: unknown) => (v === null || v === undefined ? '' : String(v))
+const sourceCells = (s: SourceRow) => [
+  s.source_row_id,
+  s.track_id,
+  s.provider,
+  s.external_id,
+  s.source_type,
+  s.source_status,
+  value(s.source_confidence),
+  s.rights_status,
+  value(s.evidence),
+  value(s.notes),
+]
 const list = (v: string) =>
   v
     .split(',')
@@ -56,7 +76,7 @@ const list = (v: string) =>
     .filter(Boolean)
 export function parseStaging(book: Workbook, published: CatalogueSnapshot): StagingData {
   const result: StagingData = { tracks: [], sources: [], aliases: [], errors: [] }
-  function rows(tab: SheetTab): Record<string, string>[] {
+  function rows(tab: SheetTab, trim = true): Record<string, string>[] {
     const values = book[tab],
       limit = SHEET_LIMITS[tab],
       headers = SHEET_HEADERS[tab]
@@ -81,10 +101,17 @@ export function parseStaging(book: Workbook, published: CatalogueSnapshot): Stag
     return values
       .slice(1)
       .filter((row) => row.some((c) => c.trim()))
-      .map((row) => Object.fromEntries(headers.map((h, i) => [h, (row[i] ?? '').trim()])))
+      .map((row) =>
+        Object.fromEntries(
+          headers.map((h, i) => {
+            const cell = row[i] ?? ''
+            return [h, trim ? cell.trim() : cell]
+          }),
+        ),
+      )
   }
   const trackRows = rows('Tracks'),
-    sourceRows = rows('Sources'),
+    sourceRows = rows('Sources', false),
     aliasRows = rows('Aliases')
   rows('Instructions')
   const error = (
@@ -156,7 +183,13 @@ export function parseStaging(book: Workbook, published: CatalogueSnapshot): Stag
   const seenSources = new Set<string>(),
     bindings = new Set<string>(),
     trackProviders = new Set<string>()
-  for (const r of sourceRows) {
+  const publishedStreamSlots = new Set(
+    published.sources
+      .filter((s) => s.source_type === 'stream')
+      .map((s) => s.track_id + ':' + s.provider),
+  )
+  for (const raw of sourceRows) {
+    const r = Object.fromEntries(Object.entries(raw).map(([field, cell]) => [field, cell.trim()]))
     const key = r.source_row_id || 'row-' + result.sources.length,
       binding = r.provider + ':' + r.external_id,
       trackProvider = r.track_id + ':' + r.provider
@@ -171,14 +204,6 @@ export function parseStaging(book: Workbook, published: CatalogueSnapshot): Stag
     bindings.add(binding)
     trackProviders.add(trackProvider)
     if (!knownTracks.has(r.track_id)) error('source', key, 'unknown_track')
-    if (
-      !validSourceId(r.provider, r.external_id) ||
-      r.source_type !== 'audio' ||
-      !['active', 'disabled'].includes(r.source_status) ||
-      !['unverified', 'owner-authorised', 'public', 'licensed'].includes(r.rights_status) ||
-      !validConfidence(r.source_confidence)
-    )
-      error('source', key, 'invalid_source')
     const existing = published.sources.find((s) => s.source_row_id === r.source_row_id)
     const owner = published.sources.find(
       (s) => s.provider === r.provider && s.external_id === r.external_id,
@@ -189,6 +214,27 @@ export function parseStaging(book: Workbook, published: CatalogueSnapshot): Stag
       (owner && owner.source_row_id !== r.source_row_id)
     )
       error('source', key, 'source_identity_conflict', true)
+    // Preserve an existing stream as opaque catalogue data. Only the literal exported row
+    // qualifies; a replacement row cannot claim the same track/provider slot either.
+    if (existing?.source_type === 'stream') {
+      const cells = sourceCells(existing)
+      if (SHEET_HEADERS.Sources.every((field, i) => raw[field] === cells[i])) {
+        const { created_at: _created, updated_at: _updated, ...source } = existing
+        result.sources.push(source)
+        continue
+      }
+      error('source', key, 'legacy_source_requires_review')
+    } else if (publishedStreamSlots.has(trackProvider)) {
+      error('source', key, 'source_identity_conflict', true)
+    }
+    if (
+      !validSourceId(r.provider, r.external_id) ||
+      r.source_type !== 'audio' ||
+      !['active', 'disabled'].includes(r.source_status) ||
+      !['unverified', 'owner-authorised', 'public', 'licensed'].includes(r.rights_status) ||
+      !validConfidence(r.source_confidence)
+    )
+      error('source', key, 'invalid_source')
     const unchanged =
       !!existing &&
       existing.provider === r.provider &&
@@ -229,7 +275,6 @@ export function parseStaging(book: Workbook, published: CatalogueSnapshot): Stag
   return result
 }
 export function exportWorkbook(snapshot: CatalogueSnapshot): Workbook {
-  const value = (v: unknown) => (v === null || v === undefined ? '' : String(v))
   // Each tab's header row is a **copy** of the shared `SHEET_HEADERS` entry, never the entry
   // itself. Returning the shared array would let a caller that mutates the workbook it was handed
   // (a staging round-trip test does exactly that) permanently rewrite the module-level headers,
@@ -259,21 +304,7 @@ export function exportWorkbook(snapshot: CatalogueSnapshot): Workbook {
         value(t.notes),
       ]),
     ],
-    Sources: [
-      [...SHEET_HEADERS.Sources],
-      ...snapshot.sources.map((s) => [
-        s.source_row_id,
-        s.track_id,
-        s.provider,
-        s.external_id,
-        s.source_type,
-        s.source_status,
-        value(s.source_confidence),
-        s.rights_status,
-        value(s.evidence),
-        value(s.notes),
-      ]),
-    ],
+    Sources: [[...SHEET_HEADERS.Sources], ...snapshot.sources.map(sourceCells)],
     Aliases: [
       [...SHEET_HEADERS.Aliases],
       ...snapshot.aliases.map((a) => [a.track_id, a.locale, a.alias]),

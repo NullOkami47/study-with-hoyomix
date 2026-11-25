@@ -3,7 +3,16 @@ import { exchangeGitHubCode } from './github'
 import { exchangeGoogleCode } from './google'
 import { exchangeLinuxDoCode, LINUXDO_AUTH_URL } from './linuxdo'
 import type { AuthProvider, ProviderIdentity } from './types'
-import { consumeOAuthFlow, registerOAuthFlow } from './flow'
+import { claimOAuthFlow } from './flow'
+import {
+  clientAddress,
+  InMemoryRateLimiter,
+  rateLimitedResponse,
+  rateLimitKey,
+  selectRateLimiter,
+  type RateLimitBinding,
+  type RateLimiter,
+} from '../rateLimit'
 import { findIdentityOwner, linkIdentity as persistIdentityLink, unlinkIdentity } from './linking'
 import { initialRoleForIdentity } from './ownerBootstrap'
 import {
@@ -29,13 +38,30 @@ export interface AuthEnv extends Env {
   LINUXDO_CLIENT_SECRET?: string
   OWNER_PROVIDER?: AuthProvider
   OWNER_SUBJECT?: string
+  /** Workers Rate Limiting binding for OAuth start (`[[ratelimits]]`, decision D2). Optional. */
+  AUTH_START_LIMITER?: RateLimitBinding
 }
 
 export interface AuthOptions {
   fetch?: typeof fetch
   crypto?: Crypto
   now?: () => number
+  /** Limits `GET /api/auth/{provider}/start` per client. Omitted: start is not limited. */
+  startLimiter?: RateLimiter
 }
+
+// D2 budget: 20 starts per 10 minutes per client address. The module-scope limiter enforces it
+// exactly per isolate; it is the fallback when the binding is absent or fails (fail-open), so a
+// limiter outage never blocks login. The binding's period can only be 10 or 60 seconds, so its
+// committed configuration (wrangler.toml) is an approximation of this budget per location.
+export const AUTH_START_LIMIT = 20
+export const AUTH_START_PERIOD_MS = 10 * 60 * 1000
+export const AUTH_START_BINDING_PERIOD_SECONDS = 60
+const authStartFallback = new InMemoryRateLimiter({ limit: AUTH_START_LIMIT, periodMs: AUTH_START_PERIOD_MS })
+
+/** The OAuth start limiter the Worker entry point uses: the binding when configured, else the isolate. */
+export const authStartRateLimiter = (env: Pick<AuthEnv, 'AUTH_START_LIMITER'>): RateLimiter =>
+  selectRateLimiter(env.AUTH_START_LIMITER, AUTH_START_BINDING_PERIOD_SECONDS, authStartFallback)
 
 interface OAuthFlow {
   provider: AuthProvider
@@ -123,6 +149,13 @@ const redirectWithCookies = (location: string, cookies: string[]) => {
   return new Response(null, { status: 302, headers })
 }
 
+/**
+ * The fixed set of codes an OAuth callback navigation may put in `?auth_error=` (M-09). The URL
+ * only ever carries one of these literals, never provider or exception text.
+ */
+export const OAUTH_NAVIGATION_ERRORS = ['collision', 'provider_already_linked', 'unauthorized', 'oauth_callback_failed'] as const
+export type OAuthNavigationError = typeof OAUTH_NAVIGATION_ERRORS[number]
+
 const validatePublicOrigin = (value: string) => {
   let parsed: URL
   try {
@@ -157,13 +190,23 @@ export function createAuthHandler(env: AuthEnv, options: AuthOptions = {}) {
     return json({ ok: true }, status, { 'set-cookie': sessionCookie(issued.token) })
   }
 
+  // M-09: callbacks are top-level navigations, so every link outcome and every callback failure
+  // returns the browser to the app with exactly one allow-listed query parameter.
+  const appRedirect = (parameter: ['account', 'linked'] | ['auth_error', OAuthNavigationError], cookies: string[]) => {
+    const location = new URL(`${publicOrigin}/`)
+    location.searchParams.set(parameter[0], parameter[1])
+    return redirectWithCookies(location.toString(), cookies)
+  }
+
   const completeIdentity = async (identity: ProviderIdentity, flow: OAuthFlow, request: Request) => {
     const current = await currentSession(request)
     if (flow.intent === 'link') {
-      if (!current.session || current.session.userId !== flow.linkUserId) return json({ error: 'authentication_required' }, 401)
+      if (!current.session || current.session.userId !== flow.linkUserId) return appRedirect(['auth_error', 'unauthorized'], [])
       const result = await persistIdentityLink(env.DB, current.session.userId, identity, now(), cryptoApi)
-      if (result === 'collision' || result === 'provider_already_linked') return json({ error: result }, 409)
-      return respondWithRotatedSession(current.session.userId, current.session.id)
+      if (result === 'collision' || result === 'provider_already_linked') return appRedirect(['auth_error', result], [])
+      await revokeSession(env.DB, current.session.id, now())
+      const issued = await issueForUser(current.session.userId)
+      return appRedirect(['account', 'linked'], [sessionCookie(issued.token)])
     }
 
     let userId = (await findIdentityOwner(env.DB, identity))?.userId
@@ -191,6 +234,11 @@ export function createAuthHandler(env: AuthEnv, options: AuthOptions = {}) {
 
   const startOAuth = async (provider: AuthProvider, request: Request) => {
     if (!availableProviders()[provider]) return json({ error: 'provider_unavailable' }, 503)
+    if (options.startLimiter) {
+      // Checked before any D1 access, including the session read of a link start.
+      const decision = await options.startLimiter.limit(await rateLimitKey('auth-start', clientAddress(request), cryptoApi))
+      if (!decision.success) return rateLimitedResponse(decision.retryAfter, AUTH_START_BINDING_PERIOD_SECONDS)
+    }
     const url = new URL(request.url)
     const intent = url.searchParams.get('intent') === 'link' ? 'link' as const : 'login' as const
     const current = intent === 'link' ? await currentSession(request) : null
@@ -206,13 +254,8 @@ export function createAuthHandler(env: AuthEnv, options: AuthOptions = {}) {
       createdAt: now(),
       linkUserId: current?.session?.userId,
     }
-    await registerOAuthFlow(env.DB, {
-      state: flow.state,
-      provider,
-      intent,
-      createdAt: flow.createdAt,
-      expiresAt: flow.createdAt + OAUTH_LIFETIME_MS,
-    }, env.OAUTH_STATE_SECRET, cryptoApi)
+    // No D1 write here (H-04): the sealed __Host-oauth cookie carries the whole flow, and the
+    // callback records the state as consumed (claimOAuthFlow), which enforces single use.
     const callback = `${publicOrigin}/api/auth/${provider}/callback`
     let destination: URL
     if (provider === 'google') {
@@ -249,9 +292,15 @@ export function createAuthHandler(env: AuthEnv, options: AuthOptions = {}) {
       if (!code || !state || flow.provider !== provider || flow.state !== state || now() - flow.createdAt > OAUTH_LIFETIME_MS || flow.createdAt > now()) {
         return json({ error: 'invalid_oauth_state' }, 400, { 'set-cookie': expiredOauthCookie() })
       }
-      const consumed = await consumeOAuthFlow(
+      const consumed = await claimOAuthFlow(
         env.DB,
-        { state: flow.state, provider, intent: flow.intent },
+        {
+          state: flow.state,
+          provider,
+          intent: flow.intent,
+          createdAt: flow.createdAt,
+          expiresAt: flow.createdAt + OAUTH_LIFETIME_MS,
+        },
         env.OAUTH_STATE_SECRET,
         now(),
         cryptoApi,
@@ -279,7 +328,8 @@ export function createAuthHandler(env: AuthEnv, options: AuthOptions = {}) {
       response.headers.append('set-cookie', expiredOauthCookie())
       return response
     } catch {
-      return json({ error: 'oauth_callback_failed' }, 401, { 'set-cookie': expiredOauthCookie() })
+      // Exception text is deliberately discarded; the URL carries only the fixed code.
+      return appRedirect(['auth_error', 'oauth_callback_failed'], [expiredOauthCookie()])
     }
   }
 

@@ -7,6 +7,19 @@ const response = (body: unknown, status = 200) => new Response(
   { status, headers: { 'content-type': 'application/json' } },
 )
 
+describe('LX import errors', () => {
+  it('preserves the rejection code and reason instead of only reporting admin_422', async () => {
+    const repo = createAdminRepository({ fetch: vi.fn(async () => response({
+      error: 'embedded_credentials', message: 'Script embeds credential-shaped values (token)',
+    }, 422)) })
+    await expect(repo.previewLxSource({ script: 'candidate' })).rejects.toThrow('embedded_credentials: Script embeds credential-shaped values (token)')
+  })
+  it('keeps a safe HTTP fallback for non-JSON error responses', async () => {
+    const repo = createAdminRepository({ fetch: vi.fn(async () => response('<html>upstream failed</html>', 502)) })
+    await expect(repo.previewLxSource({ script: 'candidate' })).rejects.toThrow('admin_502')
+  })
+})
+
 describe('admin repository session result', () => {
   it('reports an authorised admin or owner session', async () => {
     for (const role of ['admin', 'owner'] as const) {

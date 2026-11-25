@@ -31,7 +31,7 @@ function validTrack(overrides: Record<string, unknown> = {}): Record<string, unk
 }
 
 describe('parseCatalog', () => {
-  it('keeps the checked-in sample catalogue inside the runtime contract', () => {
+  it('keeps the checked-in sample catalogue empty and valid inside the runtime contract', () => {
     const sampleCatalog = JSON.parse(
       readFileSync(resolve(process.cwd(), 'src/features/catalog/catalog.sample.json'), 'utf8'),
     ) as unknown

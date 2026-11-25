@@ -1,9 +1,19 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Track } from '../../catalog/types'
 import type { LxSourceRecord, LxSourceRepository } from '../lx/types'
+import type { LxGlobalSourceRepository } from '../lx/globalSourceRepository'
+import { playbackLog } from '../playbackLog'
 import type { LxRuntimeClient } from '../lx/runtime/client'
+import { QuickJsLxHost } from '../lx/runtime/quickjsHost'
 import type { ProviderAttempt } from './types'
-import { createLxUserProvider } from './lxUser'
+import { createLxUserProvider as createProvider, mergeLxSourceChain, type LxUserProviderOptions } from './lxUser'
+
+// H-01: returned media URLs are checked against the build's media-src. These cases exercise the
+// source loop with fixture media hosts under example.com, so they inject a media list naming that
+// family instead of relying on the build. lxCspBlocked.spec.ts covers the refusal itself.
+const FIXTURE_CSP = { connect: [], media: ['https://*.example.com'] }
+const createLxUserProvider = (options: LxUserProviderOptions = {}) =>
+  createProvider({ cspSources: FIXTURE_CSP, ...options })
 
 function createTrack(sources: Track['sources'], extra: Partial<Track> = {}): Track {
   return {
@@ -389,6 +399,36 @@ describe('createLxUserProvider', () => {
       })
     })
 
+    it('maps the sandbox invalid_response refusal (M-11) to invalid_response and continues chain', async () => {
+      const source1 = createMockSource('s1', 'Refused Source', 10, true)
+      const source2 = createMockSource('s2', 'Clean URL Source', 20, true)
+      const attempts: ProviderAttempt[] = []
+      let currentScript = ''
+      const mockClient: Partial<LxRuntimeClient> = {
+        loadSource: vi.fn().mockImplementation(async (script: string) => {
+          currentScript = script
+          return { initedMeta: undefined }
+        }),
+        callMusicUrl: vi.fn().mockImplementation(async () => {
+          if (currentScript.includes('Refused')) {
+            throw new Error('invalid_response: plaintext http: media URL is not playable')
+          }
+          return { url: 'https://clean.example.com/audio.mp3' }
+        }),
+        dispose: vi.fn().mockResolvedValue(undefined) as any,
+      }
+      const provider = createLxUserProvider({
+        sourceRepository: createMockRepository([source1, source2]),
+        runtimeClientFactory: () => mockClient as LxRuntimeClient,
+        onSubAttempt: (attempt) => attempts.push(attempt),
+      })
+
+      const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+
+      expect(result).toMatchObject({ kind: 'audio', url: 'https://clean.example.com/audio.mp3' })
+      expect(attempts.map((a) => [a.sourceId, a.code ?? 'ok'])).toEqual([['s1', 'invalid_response'], ['s2', 'ok']])
+    })
+
     it('falls back to next source when loadSource or callMusicUrl fails', async () => {
       const source1 = createMockSource('s1', 'Broken Source', 10, true)
       const source2 = createMockSource('s2', 'Working Source', 20, true)
@@ -480,6 +520,56 @@ describe('createLxUserProvider', () => {
     })
   })
 
+  describe('network-level lx.request failures (task 41.7)', () => {
+    const attemptsFor = async (errors: string[]): Promise<ProviderAttempt[]> => {
+      let call = 0
+      const mockClient: Partial<LxRuntimeClient> = {
+        loadSource: vi.fn().mockResolvedValue({ initedMeta: undefined }),
+        callMusicUrl: vi.fn().mockImplementation(async () => {
+          throw new Error(errors[Math.min(call++, errors.length - 1)])
+        }),
+        dispose: vi.fn().mockResolvedValue(undefined) as any,
+      }
+      const attempts: ProviderAttempt[] = []
+      const provider = createLxUserProvider({
+        sourceRepository: createMockRepository([createMockSource('s1', 'Only Source', 10, true)]),
+        runtimeClientFactory: () => mockClient as LxRuntimeClient,
+        qualityStore: { lxQuality: () => 'high' },
+        onSubAttempt: (attempt) => attempts.push(attempt),
+      })
+      expect(await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)).toBeNull()
+      return attempts
+    }
+
+    it('marks a network_error refusal as a transient unavailable sub-source attempt', async () => {
+      const attempts = await attemptsFor(['LX musicUrl rejected: network_error: Failed to fetch'])
+      expect(attempts).toEqual([expect.objectContaining({ sourceId: 's1', ok: false, code: 'unavailable', transient: true })])
+    })
+
+    it('maps the sandbox request timeout to timeout without the transient marker', async () => {
+      const attempts = await attemptsFor(['LX musicUrl rejected: HTTP request timed out after 4000ms'])
+      expect(attempts).toHaveLength(1)
+      expect(attempts[0]).toMatchObject({ code: 'timeout' })
+      expect(attempts[0].transient).toBeUndefined()
+    })
+
+    it('keeps a generic script failure permanent', async () => {
+      const attempts = await attemptsFor(['LX musicUrl rejected: song not found'])
+      expect(attempts[0]).toMatchObject({ code: 'unavailable' })
+      expect(attempts[0].transient).toBeUndefined()
+    })
+
+    it('keeps an earlier csp_blocked sticky over a later network_error', async () => {
+      const attempts = await attemptsFor([
+        'LX musicUrl rejected: csp_blocked: https://x.example is not permitted',
+        'LX musicUrl rejected: network_error: Failed to fetch',
+      ])
+      expect(attempts).toHaveLength(1)
+      expect(attempts[0]).toMatchObject({ code: 'csp_blocked' })
+      expect(attempts[0].transient).toBeUndefined()
+    })
+  })
+
   /**
    * The deployment's CSP allows `media-src` only from `'self'`, the R2 origin and
    * `https://*.music.126.net`. Every bundled/candidate LX source currently resolves to plaintext
@@ -488,7 +578,10 @@ describe('createLxUserProvider', () => {
    * instead of surfacing as an opaque `unavailable` after the browser has already blocked it.
    */
   describe('media transport policy', () => {
-    const resolveWith = async (urls: (string | undefined)[]) => {
+    const resolveWith = async (
+      urls: (string | undefined)[],
+      extra: { mediaProbe?: (url: string) => Promise<boolean>; cspSources?: { connect: readonly string[]; media: readonly string[] } } = {},
+    ) => {
       const sources = urls.map((_url, index) =>
         createMockSource(`s${index + 1}`, `Source ${index + 1}`, (index + 1) * 10, true),
       )
@@ -505,6 +598,8 @@ describe('createLxUserProvider', () => {
         runtimeClientFactory: () => mockClient as LxRuntimeClient,
         qualityStore: { lxQuality: () => 'standard' },
         onSubAttempt: (attempt) => attempts.push(attempt),
+        mediaProbe: extra.mediaProbe ?? (async () => true),
+        ...(extra.cspSources ? { cspSources: extra.cspSources } : {}),
       })
       const track = createTrack([{ provider: 'chksz', externalId: '123' }])
       const result = await provider.resolve(track, new AbortController().signal)
@@ -523,11 +618,11 @@ describe('createLxUserProvider', () => {
       ])
     })
 
-    it('refuses plaintext http media and reports the source as invalid_response', async () => {
+    it('reports a plaintext URL on a non-promotable host as media_insecure', async () => {
       const { result, attempts } = await resolveWith(['http://insecure.example.com/a.mp3'])
       expect(result).toBeNull()
       expect(attempts).toEqual([
-        expect.objectContaining({ providerId: 'lx', sourceId: 's1', ok: false, code: 'invalid_response' }),
+        expect.objectContaining({ providerId: 'lx', sourceId: 's1', ok: false, code: 'media_insecure' }),
       ])
     })
 
@@ -542,9 +637,70 @@ describe('createLxUserProvider', () => {
         mimeType: 'audio/mpeg',
       })
       expect(attempts).toEqual([
-        expect.objectContaining({ providerId: 'lx', sourceId: 's1', ok: false, code: 'invalid_response' }),
+        expect.objectContaining({ providerId: 'lx', sourceId: 's1', ok: false, code: 'media_insecure' }),
         expect.objectContaining({ providerId: 'lx', sourceId: 's2', ok: true }),
       ])
+    })
+
+    it('promotes plaintext media on a trusted host to HTTPS once the probe confirms it plays', async () => {
+      const probed: string[] = []
+      const { result, attempts } = await resolveWith(
+        ['http://m801.music.126.net/2026/signed/song.mp3?authSecret=abc&x=1'],
+        {
+          cspSources: { connect: [], media: ['https://*.music.126.net'] },
+          mediaProbe: async (url) => {
+            probed.push(url)
+            return true
+          },
+        },
+      )
+      expect(probed).toEqual(['https://m801.music.126.net/2026/signed/song.mp3?authSecret=abc&x=1'])
+      expect(result).toEqual({
+        kind: 'audio',
+        url: 'https://m801.music.126.net/2026/signed/song.mp3?authSecret=abc&x=1',
+        mimeType: 'audio/mpeg',
+      })
+      expect(attempts).toEqual([
+        expect.objectContaining({ providerId: 'lx', sourceId: 's1', ok: true }),
+      ])
+    })
+
+    it('falls through to the next source when the promoted URL does not load', async () => {
+      const { result, attempts } = await resolveWith(
+        [
+          'http://m801.music.126.net/dead/song.mp3',
+          'https://secure.example.com/b.mp3',
+        ],
+        {
+          cspSources: { connect: [], media: ['https://*.music.126.net', 'https://*.example.com'] },
+          mediaProbe: async (url) => url === 'https://secure.example.com/b.mp3',
+        },
+      )
+      expect(result).toEqual({
+        kind: 'audio',
+        url: 'https://secure.example.com/b.mp3',
+        mimeType: 'audio/mpeg',
+      })
+      expect(attempts).toEqual([
+        expect.objectContaining({ providerId: 'lx', sourceId: 's1', ok: false, code: 'media_insecure' }),
+        expect.objectContaining({ providerId: 'lx', sourceId: 's2', ok: true }),
+      ])
+    })
+
+    it('never promotes a host outside the trusted media family', async () => {
+      const probed: string[] = []
+      const { result } = await resolveWith(
+        ['http://music.126.net.attacker.example/a.mp3', 'http://m801.music.126.net.evil.example/b.mp3'],
+        {
+          cspSources: { connect: [], media: ['https://*.music.126.net'] },
+          mediaProbe: async (url) => {
+            probed.push(url)
+            return true
+          },
+        },
+      )
+      expect(result).toBeNull()
+      expect(probed).toEqual([])
     })
 
     it('refuses non-http(s) schemes as well', async () => {
@@ -555,8 +711,9 @@ describe('createLxUserProvider', () => {
     })
 
     it('never silently accepts http by widening the accepted set', async () => {
-      // Every source yields http: the aggregate outcome must be a truthful failure, and each
-      // source must carry the precise code rather than a generic 'unavailable'.
+      // Every source yields http on a host that cannot be promoted: the aggregate outcome must be a
+      // truthful failure, and each source must carry the precise code rather than a generic
+      // 'unavailable'. Promotion is never a licence to play plaintext.
       const { result, attempts } = await resolveWith([
         'http://insecure.example.com/a.mp3',
         'http://insecure.example.com/b.mp3',
@@ -564,7 +721,7 @@ describe('createLxUserProvider', () => {
       expect(result).toBeNull()
       expect(attempts).toHaveLength(2)
       for (const attempt of attempts) {
-        expect(attempt).toMatchObject({ ok: false, code: 'invalid_response' })
+        expect(attempt).toMatchObject({ ok: false, code: 'media_insecure' })
       }
     })
   })
@@ -578,4 +735,519 @@ it('does not execute custom LX scripts after withdrawal', async () => {
     await expect(provider.resolve(createTrack([{ provider: 'chksz', externalId: '123456' }]), new AbortController().signal)).resolves.toBeNull()
     expect(runtimeClientFactory).not.toHaveBeenCalled()
   } finally { localStorage.clear() }
+})
+
+// The published global registry is a third input to the same chain. These cases exist because the
+// feature's real risk is not the registry itself but the chain: an empty registry must leave the
+// personal sources exactly as they were, and a populated one must not silently shadow a user's own
+// decision.
+describe('mergeLxSourceChain', () => {
+  it('returns the personal chain unchanged when nothing is published', () => {
+    const personal = [
+      createMockSource('builtin-a', 'Built-in A', 10),
+      createMockSource('user-b', 'User B', 20),
+      createMockSource('builtin-c', 'Built-in C', 30),
+    ]
+    const merged = mergeLxSourceChain(personal, [])
+    expect(merged.map((source) => source.id)).toEqual(['builtin-a', 'builtin-c', 'user-b'])
+  })
+
+  it('places a published source after the built-ins and before the user imports', () => {
+    const personal = [createMockSource('builtin-a', 'Built-in A', 10), createMockSource('user-b', 'User B', 20)]
+    const published = [{ ...createMockSource('global:c', 'Published C', 15), builtIn: false }]
+    const merged = mergeLxSourceChain(personal, published)
+    expect(merged.map((source) => source.id)).toEqual(['builtin-a', 'global:c', 'user-b'])
+  })
+
+  it('runs a script once even when the same digest is both imported and published', () => {
+    const personal = [createMockSource('user-b', 'User B', 20)]
+    const published = [{ ...personal[0]!, id: 'global:b' }]
+    const merged = mergeLxSourceChain(personal, published)
+    expect(merged).toHaveLength(1)
+    // The published copy comes first in the chain, so it is the one that runs — same bytes either way.
+    expect(merged[0]?.id).toBe('global:b')
+  })
+
+  it('lets a user disabling their own copy suppress the published copy of the same script', () => {
+    const personal = [createMockSource('user-b', 'User B', 20, false)]
+    const published = [{ ...personal[0]!, id: 'global:b', enabled: true }]
+    expect(mergeLxSourceChain(personal, published)).toEqual([])
+  })
+
+  it('keeps a disabled published source out of the enabled set without touching the chain', () => {
+    const published = [{ ...createMockSource('global:c', 'Published C', 15), enabled: false }]
+    const merged = mergeLxSourceChain([], published)
+    expect(merged).toHaveLength(1)
+    expect(merged[0]?.enabled).toBe(false)
+  })
+
+  it('orders published sources by their own priority', () => {
+    const published = [
+      { ...createMockSource('global:z', 'Z', 90), builtIn: false },
+      { ...createMockSource('global:a', 'A', 5), builtIn: false },
+    ]
+    expect(mergeLxSourceChain([], published).map((source) => source.id)).toEqual(['global:a', 'global:z'])
+  })
+})
+
+// The provider is where the registry actually has to work. An empty registry is the state every
+// deployment starts in, so it must cost nothing but a cached request and must not change the result;
+// a populated one must be used exactly like a personal source.
+describe('createLxUserProvider with a global registry', () => {
+  const globalRepository = (records: LxSourceRecord[] | (() => never)): LxGlobalSourceRepository => ({
+    list: typeof records === 'function' ? records : async () => records,
+    revision: () => 1,
+    pendingApproval: () => [],
+    invalidate: () => undefined,
+  })
+
+  const runtimeClient = (url: string) => {
+    const loadSource = vi.fn().mockResolvedValue({ initedMeta: { sources: { wy: { qualitys: ['128k'] } } } })
+    const callMusicUrl = vi.fn().mockResolvedValue({ url })
+    return {
+      client: { loadSource, callMusicUrl, dispose: vi.fn().mockResolvedValue(undefined) } as unknown as LxRuntimeClient,
+      loadSource,
+      callMusicUrl,
+    }
+  }
+
+  it('resolves through the personal chain when the registry publishes nothing', async () => {
+    const repo = createMockRepository([createMockSource('s1', 'Source 1', 10, true)])
+    const { client, callMusicUrl } = runtimeClient('https://media.example.com/a.mp3')
+    const provider = createLxUserProvider({
+      sourceRepository: repo,
+      globalSourceRepository: globalRepository([]),
+      runtimeClientFactory: () => client,
+      qualityStore: { lxQuality: () => 'standard' },
+    })
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123456' }]), new AbortController().signal)
+    expect(result).not.toBeNull()
+    expect(callMusicUrl).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses a published source when the user has none', async () => {
+    const published: LxSourceRecord = {
+      ...createMockSource('global:g1', 'Published', 5, true),
+      builtIn: false,
+    }
+    const { client, callMusicUrl } = runtimeClient('https://media.example.com/b.mp3')
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository([]),
+      globalSourceRepository: globalRepository([published]),
+      runtimeClientFactory: () => client,
+      qualityStore: { lxQuality: () => 'standard' },
+    })
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123456' }]), new AbortController().signal)
+    expect(result).not.toBeNull()
+    expect(callMusicUrl).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats an unreachable registry as empty rather than failing the resolve', async () => {
+    const repo = createMockRepository([createMockSource('s1', 'Source 1', 10, true)])
+    const { client, callMusicUrl } = runtimeClient('https://media.example.com/c.mp3')
+    const provider = createLxUserProvider({
+      sourceRepository: repo,
+      // The real repository swallows its own network errors and returns []; this is the harsher case,
+      // where the failure escapes, to prove the provider does not depend on that detail.
+      globalSourceRepository: globalRepository((() => {
+        throw new Error('registry unavailable')
+      }) as () => never),
+      runtimeClientFactory: () => client,
+      qualityStore: { lxQuality: () => 'standard' },
+    })
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123456' }]), new AbortController().signal)
+    // A broken registry must not take playback down with it.
+    expect(result).not.toBeNull()
+    expect(callMusicUrl).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('aborted LX runtime lifecycle', () => {
+  it.each(['load', 'musicUrl'] as const)(
+    'immediately aborts the runtime while %s is pending and refuses stale success',
+    async (stage) => {
+      const controller = new AbortController()
+      const source = createMockSource('builtin-test', 'Published test', 10)
+      let finish!: (value: unknown) => void
+      const pending = new Promise<unknown>((resolve) => { finish = resolve })
+      const loadSource = vi.fn(() => stage === 'load' ? pending : Promise.resolve({}))
+      const callMusicUrl = vi.fn(() => pending)
+      const abort = vi.fn()
+      const dispose = vi.fn().mockResolvedValue(undefined)
+      const onSubAttempt = vi.fn()
+      const provider = createLxUserProvider({
+        sourceRepository: createMockRepository([source]),
+        runtimeClientFactory: () => ({ loadSource, callMusicUrl, abort, dispose }) as unknown as LxRuntimeClient,
+        onSubAttempt,
+        qualityStore: { lxQuality: () => 'standard' },
+      })
+      const task = provider.resolve(createTrack([{ provider: 'chksz', externalId: '123456' }]), controller.signal)
+      try {
+        await vi.waitFor(() => expect(stage === 'load' ? loadSource : callMusicUrl).toHaveBeenCalled())
+        controller.abort()
+        expect(abort).toHaveBeenCalledTimes(1)
+      } finally {
+        finish(stage === 'load' ? {} : { url: 'https://media.example.com/stale.mp3' })
+        await task
+      }
+      expect(await task).toBeNull()
+      expect(onSubAttempt).not.toHaveBeenCalledWith(expect.objectContaining({ ok: true }))
+      expect(dispose).toHaveBeenCalledTimes(1)
+    },
+  )
+})
+
+describe('administrator-published source authority', () => {
+  it.each(['disabled', 'registry unavailable'] as const)(
+    'never restores the legacy built-in source when %s',
+    async (state) => {
+      const factory = vi.fn(() => ({
+        loadSource: vi.fn().mockResolvedValue({}),
+        callMusicUrl: vi.fn().mockResolvedValue({ url: 'https://media.example.com/bypass.mp3' }),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as LxRuntimeClient)
+      const globalSourceRepository: LxGlobalSourceRepository = {
+        managesBundledSource: true,
+        list: state === 'disabled' ? vi.fn().mockResolvedValue([]) : vi.fn().mockRejectedValue(new Error('offline')),
+        revision: () => 2,
+        pendingApproval: () => [],
+        invalidate: () => {},
+      }
+      const provider = createLxUserProvider({
+        sourceRepository: createMockRepository([createMockSource('builtin-kulao-svip', 'Sample Legacy Built-in', 10)]),
+        globalSourceRepository,
+        runtimeClientFactory: factory,
+        qualityStore: { lxQuality: () => 'standard' },
+      })
+      const signal = new AbortController().signal
+      expect(await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123456' }]), signal)).toBeNull()
+      expect(factory).not.toHaveBeenCalled()
+    },
+  )
+})
+
+describe('https: policy hardening and redacted diagnostic breadcrumbs (R1/R2)', () => {
+  it('enforces isPublicHttpsTarget for media-src when https: is active', async () => {
+    const urls = [
+      'https://127.0.0.1/private.mp3',
+      'https://169.254.169.254/meta.mp3',
+      'https://192.168.1.50/lan.mp3',
+      'https://[::1]/loopback.mp3',
+      'https://nas.local/track.mp3',
+      'https://103.79.184.97/public.mp3?token=secret123',
+    ]
+    const sources = urls.map((_u, i) => createMockSource(`s${i + 1}`, `Source ${i + 1}`, (i + 1) * 10, true))
+    let call = 0
+    const attempts: ProviderAttempt[] = []
+    playbackLog.clear()
+
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository(sources),
+      cspSources: { connect: ['https:'], media: ['https:'] },
+      selfOrigin: 'https://staging.example.invalid',
+      qualityStore: { lxQuality: () => 'standard' },
+      onSubAttempt: (attempt) => attempts.push(attempt),
+      runtimeClientFactory: () => ({
+        loadSource: vi.fn().mockResolvedValue({ initedMeta: undefined }),
+        callMusicUrl: vi.fn().mockImplementation(async () => ({ url: urls[call++] })),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as LxRuntimeClient,
+    })
+
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(result).toEqual({
+      kind: 'audio',
+      url: 'https://103.79.184.97/public.mp3?token=secret123',
+      mimeType: 'audio/mpeg',
+    })
+    expect(attempts.slice(0, 5).every((a) => a.code === 'csp_blocked')).toBe(true)
+    expect(attempts[5]?.ok).toBe(true)
+
+    const cspLogs = playbackLog.snapshot().filter((e) => e.type === 'lx.resolve.detail' && e.code === 'csp_blocked')
+    expect(cspLogs).toHaveLength(5)
+    for (const entry of cspLogs) {
+      expect(entry).not.toHaveProperty('target')
+    }
+  })
+
+  it('promotes reviewed http music CDN URLs under https: media-src after mediaProbe succeeds', async () => {
+    const probed: string[] = []
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository([createMockSource('s1', 'Kuwo CDN', 10, true)]),
+      cspSources: { connect: ['https:'], media: ['https:'] },
+      qualityStore: { lxQuality: () => 'standard' },
+      mediaProbe: async (url) => {
+        probed.push(url)
+        return true
+      },
+      runtimeClientFactory: () => ({
+        loadSource: vi.fn().mockResolvedValue({ initedMeta: undefined }),
+        callMusicUrl: vi.fn().mockResolvedValue({ url: 'http://sycdn.kuwo.cn/resource/n1/123.mp3?sig=abc' }),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as LxRuntimeClient,
+    })
+
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(probed).toEqual(['https://sycdn.kuwo.cn/resource/n1/123.mp3?sig=abc'])
+    expect(result).toEqual({
+      kind: 'audio',
+      url: 'https://sycdn.kuwo.cn/resource/n1/123.mp3?sig=abc',
+      mimeType: 'audio/mpeg',
+    })
+  })
+
+  it('records redacted lx.resolve.detail tallies and loadError without leaking tokens or raw URLs', async () => {
+    playbackLog.clear()
+    const sources = [
+      createMockSource('s1', 'Broken Load', 10, true),
+      createMockSource('s2', 'Tally Fail', 20, true),
+      createMockSource('s3', 'Insecure Media', 30, true),
+    ]
+    let loadCount = 0
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository(sources),
+      qualityStore: { lxQuality: () => 'standard' },
+      runtimeClientFactory: () => ({
+        loadSource: vi.fn().mockImplementation(async () => {
+          loadCount++
+          if (loadCount === 1) throw new Error('paper lantern https://evil.example/a.js?apikey=123 with key chksz_SECRET999')
+          return { initedMeta: undefined }
+        }),
+        callMusicUrl: vi.fn()
+          .mockRejectedValueOnce(new Error('LX musicUrl rejected: pale linen https://api.example/x?token=SECRET_TOK requests ok=0 http_error=2 blocked=1 timeout=1'))
+          .mockResolvedValueOnce({ url: 'http://insecure.example/song.mp3?token=RAW_QUERY_SECRET' }),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as LxRuntimeClient,
+    })
+
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(result).toBeNull()
+
+    const entries = playbackLog.snapshot()
+    const serialized = JSON.stringify(entries)
+    expect(serialized).not.toContain('chksz_SECRET999')
+    expect(serialized).not.toContain('SECRET_TOK')
+    expect(serialized).not.toContain('RAW_QUERY_SECRET')
+
+    const loadErr = entries.find((e) => e.type === 'lx.source.loadError')
+    expect(loadErr).toMatchObject({ sourceId: 's1', code: 'unavailable' })
+    expect(loadErr).toMatchObject({ stage: 'load', level: 'error', requestType: 'load' })
+    expect(loadErr).not.toHaveProperty('message')
+    expect(playbackLog.exportJson()).not.toMatch(/paper lantern|pale linen|evil\.example|api\.example|insecure\.example/u)
+
+    const tallyDetail = entries.find((e) => e.type === 'lx.resolve.detail' && e.sourceId === 's2')
+    expect(tallyDetail).toMatchObject({
+      sourceId: 's2',
+      code: 'timeout',
+      reqOk: 0,
+      reqHttpErr: 2,
+      reqBlocked: 1,
+      reqTimeout: 1,
+    })
+
+    const insecureDetail = entries.find((e) => e.type === 'lx.resolve.detail' && e.sourceId === 's3')
+    expect(insecureDetail).toMatchObject({
+      sourceId: 's3',
+      code: 'media_insecure',
+      stage: 'media',
+    })
+  })
+
+  it('never leaks malformed #fragment URL secrets through QuickJsLxHost into playbackLog.exportJson()', async () => {
+    playbackLog.clear()
+    let createdHost: QuickJsLxHost | null = null
+    const attempts: ProviderAttempt[] = []
+    const customRepo = createMockRepository([{
+      ...createMockSource('s1', 'Malformed Frag', 10, true),
+      script: `lx.on(lx.EVENT_NAMES.request, function () { return 'not_a_url#secret_12345'; });`,
+    }])
+    const provider = createLxUserProvider({
+      sourceRepository: customRepo,
+      qualityStore: { lxQuality: () => 'standard' },
+      onSubAttempt: (attempt) => attempts.push(attempt),
+      runtimeClientFactory: () => ({
+        loadSource: async (script: string) => {
+          createdHost = await QuickJsLxHost.create()
+          return createdHost.loadSource(script)
+        },
+        callMusicUrl: (source: string, songInfo: Record<string, unknown>, quality: string) =>
+          createdHost!.callMusicUrl(source, songInfo, quality),
+        dispose: async () => {
+          createdHost?.dispose()
+          createdHost = null
+        },
+      }) as unknown as LxRuntimeClient,
+    })
+
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(result).toBeNull()
+    expect(attempts).toEqual([expect.objectContaining({ sourceId: 's1', ok: false, code: 'invalid_response' })])
+    const exported = playbackLog.exportJson()
+    expect(exported).not.toContain('secret_12345')
+    expect(exported).not.toContain('not_a_url')
+    expect(playbackLog.snapshot().find((e) => e.type === 'lx.resolve.detail')).toMatchObject({
+      stage: 'resolve', level: 'error', requestType: 'musicUrl', code: 'invalid_response', reason: 'malformed_url',
+      reqOk: 0, reqHttpErr: 0, reqBlocked: 0, reqTimeout: 0,
+    })
+  })
+
+  it.each([
+    ['allowed', 'https://cdn.example.com/music/private-title.mp3?note=linen', true],
+    ['off policy', 'https://other.example.org/music/private-title.mp3', false],
+    ['local self', 'https://piano.local/music/private-title.mp3', false],
+    ['malformed', 'piano notes', false],
+  ] as const)('exports only a permitted public target for custom headers (%s)', async (_label, url, visible) => {
+    playbackLog.clear()
+    const provider = createLxUserProvider({
+      cspSources: { connect: [], media: ["'self'", 'https://cdn.example.com'] },
+      selfOrigin: 'https://piano.local',
+      sourceRepository: createMockRepository([createMockSource('s1', 'Source', 1)]),
+      qualityStore: { lxQuality: () => 'standard' },
+      runtimeClientFactory: () => ({
+        loadSource: async () => ({}),
+        callMusicUrl: async () => ({ url, requestHeaders: { sample: 'paper lantern' } }),
+        dispose: async () => {},
+      }) as unknown as LxRuntimeClient,
+    })
+    expect(await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)).toBeNull()
+    const detail = playbackLog.snapshot().find((e) => e.type === 'lx.resolve.detail')
+    expect(detail).toMatchObject({ stage: 'media', reason: 'custom_headers', requestType: 'musicUrl' })
+    if (visible) expect(detail?.target).toMatch(/^https:\/\/cdn\.example\.com#[0-9a-f]{8}$/u)
+    else expect(detail).not.toHaveProperty('target')
+    expect(playbackLog.exportJson()).not.toMatch(/other\.example|piano|private-title|linen|paper lantern/u)
+  })
+
+  it.each([
+    ['media URL needs custom request headers', 'custom_headers'],
+    ['plaintext http: media URL is not playable', 'plaintext'],
+    ['paper lantern', 'invalid_result'],
+  ])('retains the bounded host refusal category %s', async (description, reason) => {
+    playbackLog.clear()
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository([createMockSource('s1', 'Source', 1)]),
+      qualityStore: { lxQuality: () => 'standard' },
+      runtimeClientFactory: () => ({
+        loadSource: async () => ({}),
+        callMusicUrl: async () => { throw new Error(`invalid_response: ${description} requests ok=3 http_error=1 blocked=0 timeout=0`) },
+        dispose: async () => {},
+      }) as unknown as LxRuntimeClient,
+    })
+    await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    const detail = playbackLog.snapshot().find((e) => e.type === 'lx.resolve.detail')
+    expect(detail).toMatchObject({ code: 'invalid_response', reason, reqOk: 3, reqHttpErr: 1, reqBlocked: 0, reqTimeout: 0 })
+    expect(playbackLog.exportJson()).not.toContain(description)
+  })
+
+  it('exports the allowed HTTPS probe target when promotion fails to play', async () => {
+    playbackLog.clear()
+    const provider = createLxUserProvider({
+      cspSources: { connect: [], media: ['https://*.music.126.net'] },
+      sourceRepository: createMockRepository([createMockSource('s1', 'Source', 1)]),
+      qualityStore: { lxQuality: () => 'standard' },
+      mediaProbe: async () => false,
+      runtimeClientFactory: () => ({
+        loadSource: async () => ({}),
+        callMusicUrl: async () => ({ url: 'http://cdn.music.126.net/private-title.mp3?note=linen' }),
+        dispose: async () => {},
+      }) as unknown as LxRuntimeClient,
+    })
+    await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(playbackLog.snapshot().find((e) => e.type === 'lx.resolve.detail')).toMatchObject({
+      target: expect.stringMatching(/^https:\/\/cdn\.music\.126\.net#[0-9a-f]{8}$/u), promoted: true, allowed: true,
+    })
+    expect(playbackLog.exportJson()).not.toMatch(/private-title|linen/u)
+  })
+
+  it('records an invalid host result and its counts even after a sticky CSP refusal', async () => {
+    playbackLog.clear()
+    const attempts: ProviderAttempt[] = []
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository([createMockSource('s1', 'Source', 1)]),
+      qualityStore: { lxQuality: () => 'high' },
+      onSubAttempt: (attempt) => attempts.push(attempt),
+      runtimeClientFactory: () => ({
+        loadSource: async () => ({}),
+        callMusicUrl: vi.fn()
+          .mockRejectedValueOnce(new Error('csp_blocked: piano notes requests ok=0 http_error=0 blocked=1 timeout=0'))
+          .mockRejectedValueOnce(new Error('invalid_response: pale linen requests ok=2 http_error=3 blocked=4 timeout=5')),
+        dispose: async () => {},
+      }) as unknown as LxRuntimeClient,
+    })
+    await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(attempts.map((a) => a.code)).toEqual(['csp_blocked'])
+    const entries = playbackLog.snapshot().filter((e) => e.type === 'lx.resolve.detail')
+    expect(entries).toMatchObject([
+      { code: 'csp_blocked', tier: '320k', reqBlocked: 1 },
+      { code: 'invalid_response', tier: '128k', reqOk: 2, reqHttpErr: 3, reqBlocked: 4, reqTimeout: 5 },
+    ])
+    expect(playbackLog.exportJson()).not.toMatch(/piano notes|pale linen/u)
+  })
+
+  it('classifies HTTP 500 tally errors as http_error (not timeout) in both onSubAttempt and lx.resolve.detail', async () => {
+    playbackLog.clear()
+    const attempts: ProviderAttempt[] = []
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository([
+        createMockSource('s-http', 'HTTP 500', 10, true),
+        createMockSource('s-timeout', 'Real Timeout', 20, true),
+      ]),
+      qualityStore: { lxQuality: () => 'standard' },
+      onSubAttempt: (attempt) => attempts.push(attempt),
+      runtimeClientFactory: () => ({
+        loadSource: vi.fn().mockResolvedValue({ initedMeta: undefined }),
+        callMusicUrl: vi.fn()
+          .mockRejectedValueOnce(new Error('LX musicUrl rejected: upstream 500 requests ok=0 http_error=1 blocked=0 timeout=0'))
+          .mockRejectedValueOnce(new Error('LX musicUrl call timed out after 30000ms requests ok=0 http_error=1 blocked=0 timeout=0')),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as LxRuntimeClient,
+    })
+
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(result).toBeNull()
+
+    expect(attempts).toHaveLength(2)
+    expect(attempts[0]).toMatchObject({ sourceId: 's-http', ok: false, code: 'http_error' })
+    expect(attempts[1]).toMatchObject({ sourceId: 's-timeout', ok: false, code: 'timeout' })
+
+    const details = playbackLog.snapshot().filter((e) => e.type === 'lx.resolve.detail')
+    expect(details.find((e) => e.sourceId === 's-http')).toMatchObject({
+      sourceId: 's-http',
+      code: 'http_error',
+      reqOk: 0,
+      reqHttpErr: 1,
+      reqBlocked: 0,
+      reqTimeout: 0,
+    })
+    expect(details.find((e) => e.sourceId === 's-timeout')).toMatchObject({
+      sourceId: 's-timeout',
+      code: 'timeout',
+      reqOk: 0,
+      reqHttpErr: 1,
+      reqBlocked: 0,
+      reqTimeout: 0,
+    })
+  })
+
+  it('blocks embedded userinfo (user:pass@) under https: media-src with csp_blocked', async () => {
+    playbackLog.clear()
+    const attempts: ProviderAttempt[] = []
+    const provider = createLxUserProvider({
+      sourceRepository: createMockRepository([createMockSource('s-auth', 'Userinfo URL', 10, true)]),
+      cspSources: { connect: ['https:'], media: ['https:'] },
+      selfOrigin: 'https://staging.example.invalid',
+      qualityStore: { lxQuality: () => 'standard' },
+      onSubAttempt: (attempt) => attempts.push(attempt),
+      runtimeClientFactory: () => ({
+        loadSource: vi.fn().mockResolvedValue({ initedMeta: undefined }),
+        callMusicUrl: vi.fn().mockResolvedValue({ url: 'https://user:pass@example.com/song.mp3' }),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      }) as unknown as LxRuntimeClient,
+    })
+
+    const result = await provider.resolve(createTrack([{ provider: 'chksz', externalId: '123' }]), new AbortController().signal)
+    expect(result).toBeNull()
+    expect(attempts).toEqual([expect.objectContaining({ sourceId: 's-auth', ok: false, code: 'csp_blocked' })])
+    const exported = playbackLog.exportJson()
+    expect(exported).not.toContain('user:pass')
+  })
 })

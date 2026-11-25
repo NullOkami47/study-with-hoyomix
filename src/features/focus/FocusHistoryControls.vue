@@ -93,6 +93,8 @@ onMounted(() => {
 <template>
   <section class="focus-history-controls" data-focus-history-controls aria-labelledby="focus-history-title">
     <h4 id="focus-history-title">{{ text('focus.history.title') }}</h4>
+    <p data-focus-history-guide>{{ text('focus.history.howTo') }}</p>
+    <p>{{ text('focus.history.counting') }}</p>
     <p>{{ text('focus.history.privacy') }}</p>
     <p data-focus-storage-status role="status">
       {{ text(storageMode === 'memory' ? 'focus.history.memory' : 'focus.history.persistent') }}

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "releases": [
+    {
+      "artistChannelId": "UCAAAAAAAAAAAAAAAAAAAAAA",
+      "albumBrowseId": "MPREb_genshin_fixture",
+      "summary": {},
+      "album": {
+        "title": "Genshin Impact - Synthetic Fixture Album",
+        "releaseDate": "2026-11-06",
+        "tracks": [
+          {
+            "videoId": "abcdefghijk",
+            "title": "Synthetic Fixture Theme",
+            "duration": "3:42"
+          },
+          {
+            "videoId": "lmnopqrstuv",
+            "title": "Synthetic Fixture Theme (Live Version)",
+            "duration_seconds": 240
+          }
+        ]
+      }
+    },
+    {
+      "artistChannelId": "UCAAAAAAAAAAAAAAAAAAAAAA",
+      "albumBrowseId": "MPREb_zzz_fixture",
+      "summary": {},
+      "album": {
+        "title": "Synthetic Fixture Album (operator game mapping)",
+        "tracks": [
+          {
+            "videoId": "0123456789_",
+            "title": "Synthetic Fixture Song",
+            "duration_seconds": 180
+          }
+        ]
+      }
+    }
+  ]
+}

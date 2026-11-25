@@ -1,11 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { resetSharedGdStudioBudget } from '../gdStudio/budget'
 import type { Track } from '../../catalog/types'
 import { createChkszProvider } from './chksz'
 import { createGdStudioProvider } from './gdStudio'
 import { createHuanyinProvider } from './huanyin'
 import { createInvidiousProvider } from './invidious'
-import { createJellyfinProvider } from './jellyfin'
 import { createMetingProvider } from './meting'
 import { createMetingAgentProvider } from './metingAgent'
 import { createPipedProvider } from './piped'
@@ -14,6 +14,9 @@ import { createQijieProvider } from './qijie'
 import { createR2Provider } from './r2'
 import { ProviderResolveError, type AudioProvider } from './types'
 import { youtubeProvider } from './youtube'
+
+beforeEach(() => resetSharedGdStudioBudget())
+afterEach(() => resetSharedGdStudioBudget())
 
 const APP_ORIGIN = window.location.origin
 const R2_ORIGIN = 'https://media.study.example'
@@ -104,11 +107,6 @@ const proxyFixtures: ProxyFixture[] = [
     route: '/api/providers/public-meting/resolve',
     create: (fetchImpl) =>
       createPublicMetingProvider({ fetch: fetchImpl }),
-  },
-  {
-    id: 'jellyfin',
-    route: '/api/providers/jellyfin/resolve',
-    create: (fetchImpl) => createJellyfinProvider({ fetch: fetchImpl }),
   },
   {
     id: 'lx-huanyin',
@@ -616,6 +614,24 @@ describe('R2 provider contract', () => {
     )
   })
 
+  it('marks a dropped request and a 5xx outage transient, and keeps 4xx and missing objects permanent (task 41.6)', async () => {
+    const signal = new AbortController().signal
+    const dropped = provider((async () => { throw new TypeError('Failed to fetch') }) as unknown as typeof fetch)
+    await expect(dropped.resolve(trackWithSource('r2'), signal)).rejects.toMatchObject({ code: 'unavailable', transient: true })
+    for (const status of [500, 502, 503, 504]) {
+      await expect(provider(stubFetch(new Response(null, { status }))).resolve(trackWithSource('r2'), signal), String(status))
+        .rejects.toMatchObject({ code: 'unavailable', transient: true })
+    }
+    for (const status of [400, 403, 307]) {
+      const error = await provider(stubFetch(new Response(null, { status }))).resolve(trackWithSource('r2'), signal).catch((caught: unknown) => caught)
+      expect(error, String(status)).toMatchObject({ code: 'unavailable' })
+      expect((error as { transient?: true }).transient, String(status)).toBeUndefined()
+    }
+    for (const status of [404, 410]) {
+      await expect(provider(stubFetch(new Response(null, { status }))).resolve(trackWithSource('r2'), signal), String(status)).resolves.toBeNull()
+    }
+  })
+
   it('rejects non-HTTPS or non-allowlisted R2 hosts before making a request', () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch
 
@@ -779,7 +795,6 @@ describe.each(proxyFixtures)('$id server-proxy adapter contract', ({ id, route, 
       'meting-agent': createMetingAgentProvider,
       'gd-studio': createGdStudioProvider,
       'public-meting': createPublicMetingProvider,
-      jellyfin: createJellyfinProvider,
       'lx-huanyin': createHuanyinProvider,
     }
     const factory = factories[id as keyof typeof factories]

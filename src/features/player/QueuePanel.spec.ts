@@ -3,6 +3,7 @@ import { nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { Track } from '../catalog/types'
+import { createCatalogFilterState } from '../catalog/filterState'
 import QueuePanel from './QueuePanel.vue'
 import { createPlaybackStore, type PlaybackStore } from './store'
 
@@ -19,6 +20,12 @@ const track = (id: string, title = id): Track => ({
   sources: [],
 })
 
+// These tracks carry no sources. A resolver that always succeeds keeps them playing, so the
+// unavailable-track skip does not move the queue while these tests inspect it.
+const playable = async () => ({
+  ok: true as const, providerId: 'jellyfin', attempts: [],
+  playable: { kind: 'audio' as const, url: '/queue.mp3', mimeType: 'audio/mpeg' },
+})
 const pointerDescriptors = [
   [Element.prototype, 'setPointerCapture', Object.getOwnPropertyDescriptor(Element.prototype, 'setPointerCapture')],
   [Element.prototype, 'releasePointerCapture', Object.getOwnPropertyDescriptor(Element.prototype, 'releasePointerCapture')],
@@ -57,9 +64,51 @@ function storeFor(queue: Track[], currentIndex: number): Pick<PlaybackStore,
 }
 
 describe('QueuePanel', () => {
+  it('hides filtered history after vocal wraparound and keeps visible positions and row actions correct', async () => {
+    const tracks = [
+      { ...track('bgm'), vocalStatus: 'instrumental' as const },
+      { ...track('song-a'), vocalStatus: 'vocal' as const },
+      { ...track('choir'), vocalStatus: 'uncertain' as const },
+      { ...track('song-b'), vocalStatus: 'vocal' as const },
+      { ...track('song-c'), vocalStatus: 'vocal' as const },
+    ]
+    const storage = { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: () => {} }
+    const filters = createCatalogFilterState(tracks, { ...storage, removeItem: () => {} })
+    const store = createPlaybackStore({ storage, resolve: async () => ({
+      ok: true, providerId: 'lx', attempts: [],
+      playable: { kind: 'audio', url: '/vocal-queue.mp3', mimeType: 'audio/mpeg' },
+    }) })
+    store.reconcileUpcomingQueue(filters.filteredTracks.value)
+    await store.playQueueIndex(4)
+    filters.setMode('vocal')
+    store.reconcileUpcomingQueue(filters.filteredTracks.value)
+    store.setRepeatMode('all')
+    await store.advanceAfterEnded()
+    const wrapper = mount(QueuePanel, { props: { store } })
+    try {
+      expect(store.currentTrack.value?.id).toBe('song-a')
+      expect(store.queue.value.map(track => track.id)).toEqual(['bgm', 'song-a', 'choir', 'song-b', 'song-c'])
+      expect(wrapper.get('[data-queue-history][data-queue-track="bgm"]').text()).toContain('bgm')
+      expect(wrapper.get('[data-queue-now-playing]').attributes('data-queue-track')).toBe('song-a')
+      const rows = wrapper.findAll('[data-queue-up-next]')
+      expect(rows.map(row => row.attributes('data-queue-track'))).toEqual(['song-b', 'song-c'])
+      expect(rows.map(row => row.attributes('aria-posinset'))).toEqual(['1', '2'])
+      expect(rows.map(row => row.attributes('aria-setsize'))).toEqual(['2', '2'])
+      expect(wrapper.findAll('[data-queue-play-now]')).toHaveLength(2)
+      expect(wrapper.find('[data-queue-up-next][data-queue-track="choir"]').exists()).toBe(false)
+      expect(wrapper.get('h3:last-of-type').text()).toContain('(2)')
+      // Visible index 0 is physical index 3: its control must select song-b.
+      await wrapper.get('[data-queue-play-now="song-b"]').trigger('click')
+      for (let i = 0; i < 30; i++) await Promise.resolve()
+      await nextTick()
+      expect(store.currentTrack.value?.id).toBe('song-b')
+      expect(wrapper.findAll('[data-queue-up-next]').map(row => row.attributes('data-queue-track'))).toEqual(['song-c'])
+    } finally { wrapper.unmount(); store.dispose() }
+  })
+
   it('exposes accessible shuffle and repeat controls backed by persisted store state', async () => {
     const storage = { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() }
-    const store = createPlaybackStore({ storage, random: () => 0 })
+    const store = createPlaybackStore({ storage, random: () => 0, resolve: playable })
     store.reconcileUpcomingQueue([track('first'), track('second'), track('third')])
     const wrapper = mount(QueuePanel, { props: { store } })
     expect(wrapper.get('[data-queue-shuffle]').attributes('aria-pressed')).toBe('false')
@@ -87,7 +136,7 @@ describe('QueuePanel', () => {
   })
 
   it('shows played history after advancing without duplicating queue tracks', async () => {
-    const store = createPlaybackStore({ storage: { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() } })
+    const store = createPlaybackStore({ resolve: playable, storage: { getItem: (key: string) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: vi.fn() } })
     store.reconcileUpcomingQueue([track('first'), track('second'), track('third')])
     await store.playQueueIndex(0)
     await store.next()
@@ -161,7 +210,7 @@ describe('QueuePanel', () => {
   })
 
   it('hands keyboard focus to the same row\'s inverse control after a move, in both directions', async () => {
-    const store = createPlaybackStore()
+    const store = createPlaybackStore({ resolve: playable })
     store.enqueue(track('first'))
     store.enqueue(track('second'))
     store.enqueue(track('third'))
@@ -260,7 +309,7 @@ describe('QueuePanel', () => {
   })
 
   it('cleans up a drag when its source row disappears so another row can start', async () => {
-    const store = createPlaybackStore()
+    const store = createPlaybackStore({ resolve: playable })
     store.enqueue(track('first'))
     store.enqueue(track('second'))
     store.enqueue(track('third'))
@@ -287,7 +336,7 @@ describe('QueuePanel', () => {
   })
 
   it('cancels a drop when its candidate becomes Now Playing before pointerup', async () => {
-    const store = createPlaybackStore()
+    const store = createPlaybackStore({ resolve: playable })
     store.enqueue(track('first'))
     store.enqueue(track('second'))
     store.enqueue(track('third'))

@@ -5,6 +5,23 @@ import en from './messages/en'
 import zhHans from './messages/zh-Hans'
 import zhHant from './messages/zh-Hant'
 
+describe('Beta playback transition disclosure', () => {
+  it.each([
+    ['en', en, 'pause', 'Off'],
+    ['zh-Hans', zhHans, '停顿', '关闭'],
+    ['zh-Hant', zhHant, '停頓', '關閉'],
+  ] as const)('labels both optional transitions and their limitations in %s', (_locale, catalogue, interruption, disable) => {
+    expect(catalogue['settings.playback.transitionCrossfade']).toContain('Beta')
+    expect(catalogue['settings.playback.transitionSmart']).toContain('Beta')
+    const help = catalogue['settings.playback.transitionHelp']
+    expect(help).toContain('Beta')
+    expect(help).toContain(interruption)
+    expect(help).toContain(disable)
+    expect(help).toContain('iPhone')
+    expect(help).toContain('iPad')
+  })
+})
+
 describe('locale resolution', () => {
   it('maps zh-TW to Traditional Chinese instead of falling back to English', () => {
     expect(mapBrowserLocale('zh-TW')).toBe('zh-Hant')
@@ -54,7 +71,7 @@ describe('translations', () => {
   })
 
   /**
-   * The three-provider Playback surface retired the legacy automatic providers. Their
+   * The canonical Playback surface retired the remaining legacy automatic providers. Their
    * labels must not linger in any catalogue: a leftover key would render as a live label
    * the moment a legacy identity reached a template again.
    */

@@ -3,6 +3,7 @@ import { onMounted, onBeforeUnmount, ref } from 'vue'
 import AppShell from './components/shell/AppShell.vue'
 import StudyWorkspace from './features/workspace/StudyWorkspace.vue'
 import AdminShell from './features/admin/AdminShell.vue'
+import AuthNoticeToast from './features/account/AuthNoticeToast.vue'
 
 const isAdmin = ref(window.location.pathname.startsWith('/admin'))
 
@@ -19,4 +20,5 @@ onBeforeUnmount(() => window.removeEventListener('popstate', onPopState))
   <AppShell v-else>
     <StudyWorkspace />
   </AppShell>
+  <AuthNoticeToast />
 </template>

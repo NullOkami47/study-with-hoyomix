@@ -14,6 +14,11 @@
 /** Namespaced, versioned: a future layout shape changes the suffix rather than
  * reinterpreting bytes written by this one. */
 export const CHAT_LAYOUT_STORAGE_KEY = 'study-with-hoyomix.floating-chat-layout.v1'
+/**
+ * Phones keep their own remembered window, so a size dragged on a monitor is never squeezed
+ * into a 375px screen and a phone placement never moves the desktop window.
+ */
+export const CHAT_NARROW_LAYOUT_STORAGE_KEY = 'study-with-hoyomix.floating-chat-layout.narrow.v1'
 
 export interface ChatLayout {
   x: number
@@ -62,6 +67,9 @@ export const MIN_DERIVED_CHAT_HEIGHT = 140
 /** Matches --workspace-chat-window-inline-size / -block-size in tokens.css. */
 export const DEFAULT_CHAT_WIDTH = 352
 export const DEFAULT_CHAT_HEIGHT = 384
+/** The phone window opens at StudyWithMiku's 300x380 and is then moved and resized by the user. */
+export const DEFAULT_NARROW_CHAT_WIDTH = 300
+export const DEFAULT_NARROW_CHAT_HEIGHT = 380
 /** Keeps a dragged window's edge clear of the viewport edge so it stays grabbable. */
 export const CHAT_SAFE_MARGIN = 16
 /**
@@ -97,8 +105,19 @@ export function maxChatSize(viewport: Viewport): { width: number; height: number
     width: Math.max(MIN_CHAT_WIDTH, viewport.width - (2 * CHAT_SAFE_MARGIN)),
     // The reserved band is not space the window can use, so the height it may reach is
     // measured from below the bar rather than from the top of the viewport.
-    height: Math.max(MIN_CHAT_HEIGHT, viewport.height - safeTop(viewport) - CHAT_SAFE_MARGIN),
+    height: Math.max(minChatHeight(viewport), viewport.height - safeTop(viewport) - CHAT_SAFE_MARGIN),
   }
+}
+
+/**
+ * The shortest window the user may resize to. Normally MIN_CHAT_HEIGHT, but a short viewport
+ * -- a phone in landscape, or one with the on-screen keyboard open -- lowers it to the band it
+ * actually has (never below MIN_DERIVED_CHAT_HEIGHT), so the composer and resize corner stay
+ * on screen instead of being pushed past the bottom edge.
+ */
+export function minChatHeight(viewport: Viewport): number {
+  const band = viewport.height - safeTop(viewport) - CHAT_SAFE_MARGIN
+  return Math.min(MIN_CHAT_HEIGHT, Math.max(MIN_DERIVED_CHAT_HEIGHT, band))
 }
 
 /**
@@ -109,7 +128,7 @@ export function maxChatSize(viewport: Viewport): { width: number; height: number
 export function clampChatLayout(layout: ChatLayout, viewport: Viewport): ChatLayout {
   const limit = maxChatSize(viewport)
   const width = clampRange(Math.round(layout.width), MIN_CHAT_WIDTH, limit.width)
-  const height = clampRange(Math.round(layout.height), MIN_CHAT_HEIGHT, limit.height)
+  const height = clampRange(Math.round(layout.height), minChatHeight(viewport), limit.height)
   return {
     width,
     height,
@@ -292,54 +311,36 @@ export function reconcileChatLayout(
  * First-visit placement starts bottom-right. The full Player card is avoided where it fits;
  * live control rectangles remain protected when a playing embed leaves less room.
  */
-export function defaultChatLayout(viewport: Viewport, reserved?: Rect | Rect[]): ChatLayout {
-  const limit = maxChatSize(viewport)
-  const bottomRight = clampChatLayout({
-    width: Math.min(DEFAULT_CHAT_WIDTH, limit.width),
-    height: Math.min(DEFAULT_CHAT_HEIGHT, limit.height),
-    x: viewport.width - Math.min(DEFAULT_CHAT_WIDTH, limit.width) - CHAT_SAFE_MARGIN,
-    y: viewport.height - Math.min(DEFAULT_CHAT_HEIGHT, limit.height) - CHAT_SAFE_MARGIN,
-  }, viewport)
-  return reconcileChatLayout(bottomRight, viewport, reserved)
-}
-
-/**
- * Geometry for the narrow bottom sheet. It uses the whole-card edge when there is room for
- * a header and scrollable body; otherwise it fits above the uppermost protected Player row.
- */
-export function resolveChatSheetLayout(
+export function defaultChatLayout(
   viewport: Viewport,
-  reserved: Rect | Rect[] | undefined,
-  headerHeight: number,
-): { blockEnd: number; availableHeight: number } {
-  const { preferred, protected: protectedRegions } = splitReserved(reserved)
-  const top = safeTop(viewport)
-  const minimumSheetHeight = Math.max(MIN_DERIVED_CHAT_HEIGHT, Math.round(headerHeight) + 64)
-  const measureAbove = (region: Rect): { blockEnd: number; availableHeight: number } => {
-    const bottom = Math.max(top, Math.min(viewport.height - CHAT_SAFE_MARGIN, Math.round(region.y) - CHAT_SAFE_MARGIN))
-    return {
-      blockEnd: Math.round(viewport.height - bottom),
-      availableHeight: Math.max(0, Math.round(bottom - top)),
-    }
-  }
-
-  const preferredRegion = preferred[0]
-  if (preferredRegion) {
-    const wholeCard = measureAbove(preferredRegion)
-    if (wholeCard.availableHeight >= minimumSheetHeight) return wholeCard
-  }
-
-  if (protectedRegions.length > 0) {
-    const highestProtected = protectedRegions.reduce((highest, region) => region.y < highest.y ? region : highest)
-    return measureAbove(highestProtected)
-  }
-  if (preferredRegion) return measureAbove(preferredRegion)
-
-  return {
-    blockEnd: CHAT_SAFE_MARGIN,
-    availableHeight: Math.max(0, viewport.height - top - (2 * CHAT_SAFE_MARGIN)),
-  }
+  reserved?: Rect | Rect[],
+  size: { width: number; height: number } = { width: DEFAULT_CHAT_WIDTH, height: DEFAULT_CHAT_HEIGHT },
+  keepSize = false,
+): ChatLayout {
+  const limit = maxChatSize(viewport)
+  const width = Math.min(size.width, limit.width)
+  const height = Math.min(size.height, limit.height)
+  const bottomRight = clampChatLayout({
+    width,
+    height,
+    x: viewport.width - width - CHAT_SAFE_MARGIN,
+    y: viewport.height - height - CHAT_SAFE_MARGIN,
+  }, viewport)
+  // `keepSize` treats the default like a user layout: move it clear of the Player where it can,
+  // protect the Player's controls, and shrink only when no same-size placement exists.
+  return reconcileChatLayout(bottomRight, viewport, reserved, keepSize)
 }
+
+/** The first-visit phone window: 300x380 at the bottom right, clear of the Player's controls. */
+export function defaultNarrowChatLayout(viewport: Viewport, reserved?: Rect | Rect[]): ChatLayout {
+  return defaultChatLayout(
+    viewport,
+    reserved,
+    { width: DEFAULT_NARROW_CHAT_WIDTH, height: DEFAULT_NARROW_CHAT_HEIGHT },
+    true,
+  )
+}
+
 /**
  * Decodes a stored layout. Anything that is not a complete, finite, positively-sized
  * record is discarded rather than repaired: a partial layout cannot be distinguished

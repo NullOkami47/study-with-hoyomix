@@ -175,3 +175,111 @@ describe('game and mode boolean composition', () => {
     expect(ids(repository.query({ games: ['genshin', 'zzz'], tabs: ['focus'], search: 'zzz' }))).toEqual(['zzz-focus'])
   })
 })
+
+describe('vocalStatus querying and indexing', () => {
+  const vocalRepoTracks: Track[] = [
+    {
+      id: 'devastation-and-redemption',
+      title: 'Devastation and Redemption',
+      aliases: { 'zh-Hans': ['神女劈观'] },
+      games: ['genshin'],
+      relationIds: ['character:yun-jin'],
+      tabs: ['focus'],
+      workGroupId: 'work-devastation',
+      vocalStatus: 'vocal',
+      needsClassification: false,
+      sources: [{ provider: 'gd', externalId: 'vocal-1' }],
+    },
+    {
+      id: 'wildfire',
+      title: 'Wildfire',
+      aliases: { 'zh-Hans': ['野火'] },
+      games: ['hsr'],
+      relationIds: ['faction:belobog'],
+      tabs: ['focus', 'chill'],
+      workGroupId: 'work-wildfire',
+      vocalStatus: 'vocal',
+      needsClassification: false,
+      sources: [{ provider: 'lx', externalId: 'vocal-2' }],
+    },
+    {
+      id: 'drowning-in-tears',
+      title: 'Drowning in Tears',
+      aliases: {},
+      games: ['zzz'],
+      relationIds: ['place:new-eridu'],
+      tabs: ['chill'],
+      workGroupId: 'work-drowning',
+      vocalStatus: 'uncertain',
+      needsClassification: false,
+      sources: [{ provider: 'chksz', externalId: 'vocal-3' }],
+    },
+    {
+      id: 'rubia',
+      title: 'Rubia',
+      aliases: {},
+      games: ['genshin'],
+      relationIds: ['place:liyue'],
+      tabs: ['sleep'],
+      workGroupId: 'work-rubia',
+      vocalStatus: 'instrumental',
+      needsClassification: false,
+      sources: [{ provider: 'gd', externalId: 'inst-1' }],
+    },
+  ]
+  const repo = new CatalogRepository(vocalRepoTracks)
+
+  it('filters strictly by vocalStatus: vocal, excluding instrumental and uncertain', () => {
+    const results = ids(repo.query({ vocalStatus: 'vocal' }))
+    expect(results).toEqual(['devastation-and-redemption', 'wildfire'])
+    expect(results).not.toContain('drowning-in-tears')
+    expect(results).not.toContain('rubia')
+  })
+
+  it('filters strictly by vocalStatus: uncertain', () => {
+    const results = ids(repo.query({ vocalStatus: 'uncertain' }))
+    expect(results).toEqual(['drowning-in-tears'])
+  })
+
+  it('filters strictly by vocalStatus: instrumental', () => {
+    const results = ids(repo.query({ vocalStatus: 'instrumental' }))
+    expect(results).toEqual(['rubia'])
+  })
+
+  it('returns all tracks when vocalStatus is undefined', () => {
+    const results = ids(repo.query({ vocalStatus: undefined }))
+    expect(results).toEqual([
+      'devastation-and-redemption',
+      'wildfire',
+      'drowning-in-tears',
+      'rubia',
+    ])
+  })
+
+  it('combines vocalStatus with games filter', () => {
+    const results = ids(repo.query({ vocalStatus: 'vocal', games: ['genshin'] }))
+    expect(results).toEqual(['devastation-and-redemption'])
+  })
+
+  it('combines vocalStatus with tabs filter', () => {
+    const results = ids(repo.query({ vocalStatus: 'vocal', tabs: ['chill'] }))
+    expect(results).toEqual(['wildfire'])
+  })
+
+  it('combines vocalStatus with search query', () => {
+    const results = ids(repo.query({ vocalStatus: 'vocal', search: '神女劈观' }))
+    expect(results).toEqual(['devastation-and-redemption'])
+  })
+
+  it('returns empty array when vocalStatus has no matching tracks for given criteria', () => {
+    const results = ids(repo.query({ vocalStatus: 'vocal', games: ['zzz'] }))
+    expect(results).toEqual([])
+  })
+
+  it('does not mutate or rely on track.tabs', () => {
+    for (const track of vocalRepoTracks) {
+      expect((track.tabs as string[])).not.toContain('vocal')
+      expect(track.tabs.every((tab) => ['sleep', 'focus', 'chill'].includes(tab))).toBe(true)
+    }
+  })
+})

@@ -8,9 +8,7 @@
  * marked all 3004 canonical tracks as needing classification and made the dataset unable to
  * round-trip through the Sheets staging path. One definition removes that whole failure mode.
  *
- * Provenance of the three values:
- * - `the original development notes`
- * - `the original development notes`
+ * The three canonical values align with the Worker enforcement layer:
  * - `workers/catalogue/staging.ts` (the enforcing layer)
  *
  * `verified` is deliberately **not** a member. It was invented by the catalogue generator and is

@@ -74,7 +74,7 @@ const overview: AdminOverview = {
   providers: [
     makeProvider({ key: 'chksz', priority: 10, status: 'healthy', failureClass: null, latencyMs: 40, checkedAt: 1000, updatedAt: 2000 }),
     makeProvider({
-      key: 'jellyfin', adminEnabled: false, deploymentAvailable: false, effectiveEnabled: false,
+      key: 'gd-studio', adminEnabled: false, deploymentAvailable: false, effectiveEnabled: false,
       priority: 30, status: 'unknown', failureClass: null, latencyMs: null, checkedAt: null, updatedAt: 3000,
     }),
   ],
@@ -200,7 +200,7 @@ describe('AdminShell', () => {
     expect(chksz.attributes('data-provider-status')).toBe('healthy')
     const toggle = wrapper.find('[data-provider-controls] [data-provider-toggle="chksz"]')
     expect((toggle.element as HTMLInputElement).checked).toBe(true)
-    expect(wrapper.find('[data-provider-controls] [data-provider-key="jellyfin"]').text())
+    expect(wrapper.find('[data-provider-controls] [data-provider-key="gd-studio"]').text())
       .toContain('Unavailable in this deployment')
   })
 
@@ -269,7 +269,7 @@ describe('AdminShell', () => {
       providers: [
         makeProvider({ key: 'chksz', status: 'healthy', latencyMs: 40 }),
         makeProvider({ key: 'lx', status: 'degraded', failureClass: 'timeout', latencyMs: 900 }),
-        makeProvider({ key: 'jellyfin', status: 'unavailable', failureClass: 'dns', latencyMs: null }),
+        makeProvider({ key: 'gd-studio', status: 'unavailable', failureClass: 'dns', latencyMs: null }),
       ],
       activeNoticeCount: 0,
     })
@@ -289,7 +289,7 @@ describe('AdminShell', () => {
     expect(degradedDot.classes()).toContain('provider-health__dot--degraded')
     expect(wrapper.find('[data-provider-health-card] [data-provider-key="lx"] [data-provider-failure]').attributes('data-provider-failure')).toBe('timeout')
 
-    const unavailableDot = wrapper.find('[data-provider-health-card] [data-provider-key="jellyfin"] .provider-health__dot')
+    const unavailableDot = wrapper.find('[data-provider-health-card] [data-provider-key="gd-studio"] .provider-health__dot')
     expect(unavailableDot.classes()).toContain('provider-health__dot--unavailable')
   })
 
@@ -307,7 +307,7 @@ describe('AdminShell', () => {
     await flushPromises()
 
     await show(wrapper, 'providers')
-    expect(wrapper.find('[data-provider-health-card] [data-provider-key="jellyfin"]').exists()).toBe(true)
+    expect(wrapper.find('[data-provider-health-card] [data-provider-key="gd-studio"]').exists()).toBe(true)
     const action = wrapper.find('[data-provider-check-health]')
     expect(action.text()).not.toMatch(/health check/i)
     expect(action.text()).toContain('Refresh status')
@@ -316,7 +316,7 @@ describe('AdminShell', () => {
 
     expect(getOverview).toHaveBeenCalledTimes(2)
     expect(wrapper.text()).not.toContain('Health check failed.')
-    expect(wrapper.find('[data-provider-health-card] [data-provider-key="jellyfin"]').exists()).toBe(false)
+    expect(wrapper.find('[data-provider-health-card] [data-provider-key="gd-studio"]').exists()).toBe(false)
     expect(wrapper.find('[data-provider-health-card] [data-provider-key="chksz"]').attributes('data-provider-status')).toBe('degraded')
   })
 
@@ -325,24 +325,24 @@ describe('AdminShell', () => {
     vi.spyOn(repo, 'checkSession').mockResolvedValue({ status: 'authorised', role: 'admin' })
     vi.spyOn(repo, 'getOverview').mockResolvedValue({
       ...overview,
-      providers: overview.providers.map((provider) => provider.key === 'jellyfin'
+      providers: overview.providers.map((provider) => provider.key === 'gd-studio'
         ? { ...provider, deploymentAvailable: true }
         : provider),
     })
     const updateProvider = vi.spyOn(repo, 'updateProvider').mockResolvedValue(
-      makeProvider({ key: 'jellyfin', priority: 30, status: 'unknown' }),
+      makeProvider({ key: 'gd-studio', priority: 30, status: 'unknown' }),
     )
     const wrapper = mountAdmin(repo)
     await flushPromises()
 
     await show(wrapper, 'providers')
-    const toggle = wrapper.find('[data-provider-controls] [data-provider-toggle="jellyfin"]')
+    const toggle = wrapper.find('[data-provider-controls] [data-provider-toggle="gd-studio"]')
     expect((toggle.element as HTMLInputElement).checked).toBe(false)
     await toggle.setValue(true)
     await flushPromises()
 
-    expect(updateProvider).toHaveBeenCalledWith('jellyfin', { enabled: true })
-    expect((wrapper.find('[data-provider-controls] [data-provider-toggle="jellyfin"]').element as HTMLInputElement).checked).toBe(true)
+    expect(updateProvider).toHaveBeenCalledWith('gd-studio', { enabled: true })
+    expect((wrapper.find('[data-provider-controls] [data-provider-toggle="gd-studio"]').element as HTMLInputElement).checked).toBe(true)
   })
 
   it('restores authoritative provider state and shows a localised error after a failed save', async () => {
@@ -498,12 +498,12 @@ describe('AdminShell', () => {
         providers: [
           makeProvider({ key: 'chksz', priority: 10 }),
           makeProvider({ key: 'lx', priority: 20 }),
-          makeProvider({ key: 'jellyfin', priority: 30 }),
+          makeProvider({ key: 'gd-studio', priority: 30 }),
         ],
         activeNoticeCount: 0,
       })
       const reordered: AdminProvider[] = [
-        makeProvider({ key: 'jellyfin', priority: 10 }),
+        makeProvider({ key: 'gd-studio', priority: 10 }),
         makeProvider({ key: 'chksz', priority: 20 }),
         makeProvider({ key: 'lx', priority: 30 }),
       ]
@@ -514,12 +514,12 @@ describe('AdminShell', () => {
       await show(wrapper, 'providers')
 
       const providerControls = wrapper.findComponent({ name: 'ProviderControls' })
-      providerControls.vm.$emit('order', ['jellyfin', 'chksz', 'lx'])
+      providerControls.vm.$emit('order', ['gd-studio', 'chksz', 'lx'])
       await flushPromises()
 
-      expect(updateOrderSpy).toHaveBeenCalledWith(['jellyfin', 'chksz', 'lx'])
+      expect(updateOrderSpy).toHaveBeenCalledWith(['gd-studio', 'chksz', 'lx'])
       const renderedKeys = wrapper.findAll('[data-provider-key]').map((el) => el.attributes('data-provider-key'))
-      expect(renderedKeys).toEqual(['jellyfin', 'chksz', 'lx'])
+      expect(renderedKeys).toEqual(['gd-studio', 'chksz', 'lx'])
     })
 
     it('prevents overlapping reorder mutations while one is in-flight', async () => {
@@ -529,7 +529,7 @@ describe('AdminShell', () => {
         providers: [
           makeProvider({ key: 'chksz', priority: 10 }),
           makeProvider({ key: 'lx', priority: 20 }),
-          makeProvider({ key: 'jellyfin', priority: 30 }),
+          makeProvider({ key: 'gd-studio', priority: 30 }),
         ],
         activeNoticeCount: 0,
       })
@@ -545,17 +545,17 @@ describe('AdminShell', () => {
 
       const providerControls = wrapper.findComponent({ name: 'ProviderControls' })
       // First reorder request
-      providerControls.vm.$emit('order', ['lx', 'chksz', 'jellyfin'])
+      providerControls.vm.$emit('order', ['lx', 'chksz', 'gd-studio'])
       // Second overlapping reorder request
-      providerControls.vm.$emit('order', ['jellyfin', 'lx', 'chksz'])
+      providerControls.vm.$emit('order', ['gd-studio', 'lx', 'chksz'])
 
       expect(updateOrderSpy).toHaveBeenCalledTimes(1)
-      expect(updateOrderSpy).toHaveBeenCalledWith(['lx', 'chksz', 'jellyfin'])
+      expect(updateOrderSpy).toHaveBeenCalledWith(['lx', 'chksz', 'gd-studio'])
 
       resolveOrder([
         makeProvider({ key: 'lx', priority: 10 }),
         makeProvider({ key: 'chksz', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
       await flushPromises()
     })
@@ -912,7 +912,8 @@ describe('AdminShell sections', () => {
     const nav = wrapper.get('[data-admin-sidebar] nav')
     expect(nav.attributes('aria-label')).toBeTruthy()
     const links = wrapper.findAll('[data-admin-sidebar] a')
-    expect(links).toHaveLength(6)
+    expect(links).toHaveLength(7)
+    expect(wrapper.find('[data-admin-nav-chat]').attributes('href')).toBe('#admin-chat')
     for (const link of links) {
       expect(link.attributes('href')).toMatch(/^#admin-[a-z]+$/u)
       expect(link.attributes('aria-controls')).toMatch(/^admin-[a-z]+$/u)

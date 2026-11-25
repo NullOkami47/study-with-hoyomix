@@ -1,11 +1,14 @@
 Study with HOYO-MiX - local development
 
-Requirements: Node.js 22.18 or newer (Node.js 24 LTS recommended), npm, Git.
-Install exactly the lockfile: npm ci
+Requirements: Node.js 22 (22.18+ tested in CI; newer LTS also supported), npm, Git.
+(Optional for `tools/catalog-sync`: Python 3.10+.)
+
+Install exactly the lockfile: npm ci --no-audit --no-fund
 Check types: npm run typecheck
 Frontend tests: npm test
-Worker tests: npm run test:workers
-Build the app and PWA: npm run build
+Worker tests: npm run test:workers -- --maxWorkers=2
+Build the app and PWA (local/bundle mode, works without R2): npm run build
+Release build (production mode; strict CSP requires both RESPONSE_POLICY_PUBLIC_ORIGIN and RESPONSE_POLICY_R2_BASE_URL as valid HTTPS URLs): npm run build:release
 Preview frontend only: npm run preview
 Edit frontend: npm run dev
 
@@ -13,7 +16,8 @@ For a complete local Worker + frontend environment:
 1. Copy .dev.vars.example to .dev.vars (ignored by Git).
 2. Generate independent SESSION_HMAC_SECRET and OAUTH_STATE_SECRET values,
    each at least 32 random bytes. Never use client-side VITE_ variables for secrets.
-3. Run npm run d1:migrate:local to initialise an empty, local D1 database.
+3. Run npm run d1:migrate:local to initialise an empty, local D1 database
+   (applies migrations 0001 through 0033).
 4. Run npm run build, then npm run dev:worker, and open http://localhost:8787.
    The checked-in Wrangler configuration identifies local resources only.
    No deploy scripts, account IDs or remote bindings are supplied. Public GitHub
@@ -22,36 +26,43 @@ For a complete local Worker + frontend environment:
 The public release deliberately includes no music library, copyrighted artwork,
 video library, user records, default music-source script or live service credentials.
 Its initial catalogue and shipped background list are empty. The study timer,
-player, queue, custom-source sandbox, background upload/conversion, admin, account
-and provider integration source remain available. An empty library is expected;
+player, queue, custom-source sandbox, community chat, background upload/conversion,
+admin and provider integration source remain available. An empty library is expected;
 external integrations require your own services and redistribution permissions.
 
-OAuth is optional. Configure your own applications and callback URLs through the
-optional provider fields in workers/auth/types.ts and workers/index.ts; leave them
-unset to keep sign-in providers disabled. Owner provisioning is explicit through
-OWNER_PROVIDER and OWNER_SUBJECT; no public release identity receives ownership.
+OAuth is optional. Configure your own applications and callback URLs via
+.dev.vars or Cloudflare Worker secrets matching AuthEnv in workers/auth/routes.ts;
+leave them unset to keep sign-in providers disabled. Owner provisioning is
+explicit through OWNER_PROVIDER (github or linuxdo; google excluded) and
+OWNER_SUBJECT; no public release identity receives ownership.
 Production cookies require HTTPS, so test actual OAuth on an origin you control.
 
-Music providers are opt-in, server-side configuration: see workers/providers/registry.ts,
-workers/providers/config.ts and workers/index.ts. Configure your own R2 or
-supported resolver resources. Do not point development at another person's
-infrastructure. The browser uses same-origin /api/*; unavailable services produce
-bounded errors and the empty catalogue. Never embed provider secrets in a bundle.
+Active canonical playback providers are ChKSz BYOK, LX Music (global or
+user-imported sandboxed scripts), and GD Studio (opt-in Worker configuration).
+Jellyfin and Vkeys are completely retired (excluded from runtime, configuration,
+and user preferences; routes return 404). Inert opt-in legacy proxy/discovery
+adapters (meting, piped, invidious, lx-huanyin, lx-huibq, lx-ikun, r2) are not
+mounted in the default playback chain unless explicitly configured and remain for
+security-contract tests and catalogue discovery compatibility. Never embed
+provider secrets in a bundle.
 
-Catalogue administration and optional Google Sheets import use workers/catalogue/.
-Only import media and catalogue information you have permission to use. Uploaded
-backgrounds require an explicitly configured BACKGROUND_BUCKET and rights review.
+Catalogue administration, optional discovery review, and optional Google Sheets
+staging use workers/catalogue/. Self-contained Python metadata discovery helpers
+live in tools/catalog-sync/. Only import media and metadata you have permission to use.
+Uploaded backgrounds require an explicitly configured BACKGROUND_BUCKET and rights review.
 To add your own redistributable static backgrounds, update staticDefinitions.ts
 and add the referenced files under public/. No remote bucket is enabled by default.
 
 The scripts/generate-test-video-fixtures.mjs utility regenerates tiny original
 solid-colour test fixtures using FFmpeg and Mediabunny. Fixtures are already
 included for tests; FFmpeg is not needed for normal installs or builds.
+Glass refraction tiles under public/glass/refraction/ are verified in sync with:
+node scripts/generate-glass-refraction-tiles.mjs --check
 
 See LICENSE, NOTICE, docs/THIRD_PARTY_NOTICES.md and docs/licenses/ for licensing.
 README.md provides the project overview and CI instructions. This fan-made project
-is not affiliated with or
-endorsed by HoYoverse. The GPL applies to code; it grants no rights to game media.
+is not affiliated with or endorsed by HoYoverse. The GPL applies to code; it grants
+no rights to game media.
 
 To regenerate the optional catalogue Han folding table after adding catalogue text:
 node scripts/generate-han-fold-table.mjs

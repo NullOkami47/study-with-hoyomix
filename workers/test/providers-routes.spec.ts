@@ -6,7 +6,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import worker from '../index'
 import type { D1Database } from '../env'
 import type { ProviderEnv } from '../providers/config'
-import { createProviderHandler } from '../providers/routes'
+import { CHKSZ_OWNER_LIMIT, createProviderHandler } from '../providers/routes'
+import { issueSession } from '../auth/session'
+import { InMemoryRateLimiter, type RateLimiter } from '../rateLimit'
 
 const MIGRATIONS_DIRECTORY = resolve(process.cwd(), 'migrations')
 
@@ -201,7 +203,7 @@ describe('public runtime provider configuration', () => {
           userKeySupported: true, ownerFallbackAvailable: false,
         },
         { id: 'lx', available: true, enabled: true, automaticEligible: true, priority: 20 },
-        { id: 'jellyfin', available: false, enabled: false, automaticEligible: false, priority: 30 },
+        { id: 'gd-studio', available: false, enabled: false, automaticEligible: false, priority: 40 },
       ],
     })
     expect(JSON.stringify(body)).not.toContain('test-secret-value')
@@ -373,6 +375,9 @@ describe('public runtime provider configuration', () => {
         crypto: nonce.crypto,
         fetch: fetchImpl,
         now,
+        // Shared by every handler built in one test (as the module-scope fallback is shared by
+        // every `worker.fetch`), fresh for each test so budgets never leak between tests.
+        chkszOwnerLimiter: ownerLimiter,
       }
       return {
         cache,
@@ -386,6 +391,26 @@ describe('public runtime provider configuration', () => {
       VALUES ('provider.chksz.ownerKeyFallback', ?, NULL, 0)
       ON CONFLICT(setting_key) DO UPDATE SET setting_json = excluded.setting_json
     `).bind(JSON.stringify({ enabled })).run()
+
+    // Wave F deliberate update (M-05, decision D4): the owner key is spent only for a signed-in
+    // session, so every owner-fallback request below carries a fresh listener's session cookie.
+    // Requests without a session are covered by the M-05 block (401 chksz_key_required).
+    let ownerCookie = ''
+    let ownerLimiter: RateLimiter = new InMemoryRateLimiter({ limit: CHKSZ_OWNER_LIMIT, periodMs: 60_000 })
+    beforeEach(async () => {
+      ownerLimiter = new InMemoryRateLimiter({ limit: CHKSZ_OWNER_LIMIT, periodMs: 60_000 })
+      const userId = `owner-fallback-listener-${crypto.randomUUID()}`
+      await database.prepare(`
+        INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES (?, ?, 'user', 0, 0)
+      `).bind(userId, userId).run()
+      const issued = await issueSession(database as never, userId,
+        'session-secret-at-least-thirty-two-bytes', Date.now(), crypto)
+      ownerCookie = `__Host-session=${issued.token}`
+    })
+    const signedInResolveRequest = (body: BodyInit = JSON.stringify({ externalId: CHKSZ_ID })) => resolveRequest(
+      body,
+      { 'content-type': 'application/json', origin: 'https://study.example', cookie: ownerCookie },
+    )
 
     const resolveWithUserKey = (key = CHKSZ_USER_KEY) => resolveRequest(
       JSON.stringify({ externalId: CHKSZ_ID }),
@@ -404,7 +429,7 @@ describe('public runtime provider configuration', () => {
       const ownerKeyRead = vi.fn(() => CHKSZ_KEY)
       Object.defineProperty(env, 'CHKSZ_API_KEY', { configurable: true, get: ownerKeyRead })
       const { createProviderHandler } = await import('../providers/routes')
-      const response = await createProviderHandler(env, { fetch: fetchImpl }).fetch(resolveRequest())
+      const response = await createProviderHandler(env, { fetch: fetchImpl }).fetch(signedInResolveRequest())
 
       expect(response.status).toBe(503)
       expect(await response.clone().json()).toEqual({ error: 'credential_required' })
@@ -440,12 +465,12 @@ describe('public runtime provider configuration', () => {
       await noSensitiveData(response)
     })
 
-    it('uses the Owner key only when fallback is enabled and no user key exists', async () => {
+    it('uses the Owner key only when fallback is enabled, no user key exists and the caller is signed in', async () => {
       await seedProvider(database, 'chksz', 1, 20)
       await setOwnerFallback(true)
       const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse())) as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(200)
       const upstreamUrl = new URL(String(vi.mocked(fetchImpl).mock.calls[0]?.[0]))
@@ -453,6 +478,54 @@ describe('public runtime provider configuration', () => {
       await noSensitiveData(response)
     })
 
+    // Wave F exploration (task 21, design Property 8, M-05, decision D4). Expected to FAIL on the
+    // unfixed tree: the owner key is spent for any caller that copies the public Origin.
+    describe('M-05 owner-key fallback requires a session and is rate limited (Property 8)', () => {
+      const signedInCookie = async (userId: string) => {
+        const { issueSession } = await import('../auth/session')
+        await database.prepare(`
+          INSERT INTO users (id, display_name, role, created_at, updated_at)
+          VALUES (?, ?, 'user', 0, 0) ON CONFLICT(id) DO NOTHING
+        `).bind(userId, userId).run()
+        const issued = await issueSession(database as never, userId,
+          'session-secret-at-least-thirty-two-bytes', Date.now(), crypto)
+        return `__Host-session=${issued.token}`
+      }
+      it('gives a forged-Origin request without a session no owner key (401 chksz_key_required)', async () => {
+        await seedProvider(database, 'chksz', 1, 20)
+        const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse())) as unknown as typeof fetch
+        const { handler } = await createHandler(fetchImpl)
+        // A non-browser client can set any Origin header; it carries no session cookie.
+        const response = await handler.fetch(resolveRequest())
+        expect(response.status).toBe(401)
+        expect(await response.clone().json()).toEqual({ error: 'chksz_key_required' })
+        expect(fetchImpl).not.toHaveBeenCalled()
+        await noSensitiveData(response)
+      })
+      it('limits a signed-in user across freshly built handlers with 429 and Retry-After', async () => {
+        await seedProvider(database, 'chksz', 1, 20)
+        const cookie = await signedInCookie('m05-user')
+        const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse())) as unknown as typeof fetch
+        const statuses: number[] = []
+        let limited: Response | null = null
+        for (let attempt = 0; attempt < 30; attempt++) {
+          // `worker.fetch` builds a new provider handler for every request; so does this loop.
+          const { handler } = await createHandler(fetchImpl)
+          const response = await handler.fetch(resolveRequest(JSON.stringify({ externalId: CHKSZ_ID }), {
+            'content-type': 'application/json',
+            origin: 'https://study.example',
+            cookie,
+            'cf-connecting-ip': '203.0.113.5',
+          }))
+          statuses.push(response.status)
+          if (response.status === 429 && !limited) limited = response
+        }
+        expect(statuses, `statuses=${statuses.join(',')}`).toContain(429)
+        expect(limited?.headers.get('retry-after') ?? '').toMatch(/^[0-9]+$/)
+        // The ChKSz contract is 20 per minute; the per-session limiter may not let more through.
+        expect(vi.mocked(fetchImpl).mock.calls.length).toBeLessThanOrEqual(20)
+      })
+    })
     it.each(['', '   ', 'x'.repeat(513)])('rejects an invalid user key before upstream access', async (key) => {
       await seedProvider(database, 'chksz', 1, 20)
       const fetchImpl = vi.fn() as unknown as typeof fetch
@@ -471,7 +544,7 @@ describe('public runtime provider configuration', () => {
       await seedProvider(database, 'chksz', 1, 20)
       const fetchImpl = vi.fn() as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl, undefined, { CHKSZ_API_KEY: key })
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(503)
       expect(await response.clone().json()).toEqual({ error: 'credential_required' })
@@ -483,7 +556,7 @@ describe('public runtime provider configuration', () => {
       await seedProvider(database, 'chksz', 0, 20)
       const fetchImpl = vi.fn() as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(503)
       expect(await response.clone().json()).toEqual({ error: 'unavailable' })
@@ -524,10 +597,7 @@ describe('public runtime provider configuration', () => {
         'standard', 'exhigh', 'lossless', 'hires', 'jyeffect', 'sky', 'jymaster',
       ] as const
 
-      const resolveWithLevel = (body: unknown) => resolveRequest(
-        JSON.stringify(body),
-        { 'content-type': 'application/json', origin: 'https://study.example' },
-      )
+      const resolveWithLevel = (body: unknown) => signedInResolveRequest(JSON.stringify(body))
 
       // A. Every selectable level must be accepted and forwarded byte-for-byte.
       it.each(CHKSZ_LEVELS)('forwards the selected level %s to ChKSz unchanged', async (level) => {
@@ -635,7 +705,7 @@ describe('public runtime provider configuration', () => {
           officialChkszResponse({ level: 'standard' }),
         )) as unknown as typeof fetch
         const { handler } = await createHandler(fetchImpl)
-        const response = await handler.fetch(resolveRequest())
+        const response = await handler.fetch(signedInResolveRequest())
 
         expect(response.status).toBe(200)
         const upstreamUrl = new URL(String(vi.mocked(fetchImpl).mock.calls[0]?.[0]))
@@ -755,7 +825,7 @@ describe('public runtime provider configuration', () => {
       await seedProvider(database, 'chksz', 1, 20)
       const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse())) as unknown as typeof fetch
       const { cache, handler, nonce } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
       const body = await response.clone().json() as { mimeType: string; url: string }
 
       expect(response.status).toBe(200)
@@ -789,7 +859,7 @@ describe('public runtime provider configuration', () => {
       const cached = cache.putCalls[0]!
       expect(cached.request.method).toBe('GET')
       expect(cached.request.url).toBe(`https://study.example${body.url}`)
-      expect(cached.response.headers.get('cache-control')).toBe('max-age=30')
+      expect(cached.response.headers.get('cache-control')).toBe('max-age=120')
       expect(cached.response.headers.get('content-type')).toContain('application/json')
       const cachedBody = await cached.response.json()
       expect(cachedBody).toEqual({
@@ -798,7 +868,7 @@ describe('public runtime provider configuration', () => {
         nonce: CHKSZ_NONCE,
         validatedUrl: CHKSZ_TEMPORARY_URL,
         mimeType: 'audio/mpeg',
-        expiresAt: 31_000,
+        expiresAt: 121_000,
       })
       expect(JSON.stringify(cachedBody)).not.toContain('fixture-md5')
       expect(JSON.stringify(cachedBody)).not.toContain('p1.music.126.net')
@@ -817,7 +887,7 @@ describe('public runtime provider configuration', () => {
         { 'content-type': 'application/json; charset=utf-8' },
       )) as unknown as typeof fetch
       const { cache, handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(200)
       expect(await response.clone().json()).toEqual({
@@ -849,7 +919,7 @@ describe('public runtime provider configuration', () => {
         },
       })) as unknown as typeof fetch
       const { cache, handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
       const body = await response.clone().json()
 
       expect(response.status).toBe(200)
@@ -869,7 +939,7 @@ describe('public runtime provider configuration', () => {
         nonce: CHKSZ_NONCE,
         validatedUrl: CHKSZ_TEMPORARY_URL,
         mimeType: 'audio/mpeg',
-        expiresAt: 31_000,
+        expiresAt: 121_000,
       })
       expect(JSON.stringify(body)).not.toContain('future')
       expect(JSON.stringify(cachedBody)).not.toContain('must-not-persist')
@@ -883,7 +953,7 @@ describe('public runtime provider configuration', () => {
         { status: 429, headers: { 'content-type': 'text/plain' } },
       )) as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(429)
       expect(await response.clone().json()).toEqual({ error: 'rate_limited' })
@@ -905,7 +975,7 @@ describe('public runtime provider configuration', () => {
         await seedProvider(database, 'chksz', 1, 20)
         const fetchImpl = vi.fn(async () => new Response('', { status })) as unknown as typeof fetch
         const { handler } = await createHandler(fetchImpl)
-        const response = await handler.fetch(resolveRequest())
+        const response = await handler.fetch(signedInResolveRequest())
 
         // 429 keeps its transport meaning; every other upstream failure travels as 502 carrying
         // the truthful code, so the client reads the code rather than treating 404 as no mapping.
@@ -940,7 +1010,7 @@ describe('public runtime provider configuration', () => {
       await seedProvider(database, 'chksz', 1, 20)
       const fetchImpl = vi.fn(async () => upstreamResponse) as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(502)
       expect(await response.clone().json()).toEqual({ error: 'invalid_response' })
@@ -955,7 +1025,7 @@ describe('public runtime provider configuration', () => {
         id: Number(unsafeId),
       }))) as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest(
+      const response = await handler.fetch(signedInResolveRequest(
         JSON.stringify({ externalId: unsafeId }),
       ))
 
@@ -988,7 +1058,7 @@ describe('public runtime provider configuration', () => {
       await seedProvider(database, 'chksz', 1, 20)
       const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse({ url: upstreamUrl }))) as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(502)
       expect(await response.clone().json()).toEqual({ error: 'invalid_response' })
@@ -1001,7 +1071,7 @@ describe('public runtime provider configuration', () => {
       const acceptedUrl = 'HtTpS://m801.music.126.net/audio'
       const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse({ url: acceptedUrl }))) as unknown as typeof fetch
       const { cache, handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(200)
       expect(cache.putCalls).toHaveLength(1)
@@ -1011,7 +1081,7 @@ describe('public runtime provider configuration', () => {
         nonce: CHKSZ_NONCE,
         validatedUrl: 'https://m801.music.126.net/audio',
         mimeType: 'audio/mpeg',
-        expiresAt: 31_000,
+        expiresAt: 121_000,
       })
       await noSensitiveData(response)
     })
@@ -1026,7 +1096,7 @@ describe('public runtime provider configuration', () => {
         return outcome
       }) as unknown as typeof fetch
       const { handler } = await createHandler(fetchImpl)
-      const response = await handler.fetch(resolveRequest())
+      const response = await handler.fetch(signedInResolveRequest())
 
       expect(response.status).toBe(status)
       expect(await response.clone().json()).toEqual({ error })
@@ -1047,7 +1117,7 @@ describe('public runtime provider configuration', () => {
           })
         }) as unknown as typeof fetch
         const { handler } = await createHandler(fetchImpl)
-        const pending = handler.fetch(resolveRequest())
+        const pending = handler.fetch(signedInResolveRequest())
 
         await fetchStarted
         await vi.advanceTimersByTimeAsync(3_999)
@@ -1072,7 +1142,7 @@ describe('public runtime provider configuration', () => {
         vi.spyOn(console, name as 'log').mockImplementation(() => undefined))
       try {
         const { handler } = await createHandler(fetchImpl, cache)
-        const response = await handler.fetch(resolveRequest())
+        const response = await handler.fetch(signedInResolveRequest())
 
         expect(response.status).toBe(503)
         expect(await response.clone().json()).toEqual({ error: 'unavailable' })
@@ -1087,14 +1157,14 @@ describe('public runtime provider configuration', () => {
 
     it('routes ChKSz requests before the authentication fallback', async () => {
       await seedProvider(database, 'chksz', 1, 20)
-      const response = await worker.fetch(resolveRequest(), providerEnv({ CHKSZ_API_KEY: undefined }))
+      const response = await worker.fetch(signedInResolveRequest(), providerEnv({ CHKSZ_API_KEY: undefined }))
 
       expect(response.status).toBe(503)
       expect(await response.json()).toEqual({ error: 'credential_required' })
     })
 
     describe('prepared media streaming', () => {
-      it('rejects a cached preparation after its explicit 30-second expiry', async () => {
+      it('rejects a cached preparation after its explicit 120-second expiry', async () => {
         await seedProvider(database, 'chksz', 1, 20)
         let currentTime = 1_000
         const fetchImpl = vi.fn(async (input: RequestInfo | URL) =>
@@ -1107,9 +1177,9 @@ describe('public runtime provider configuration', () => {
           { CHKSZ_API_KEY: CHKSZ_KEY },
           () => currentTime,
         )
-        const prepared = await handler.fetch(resolveRequest())
+        const prepared = await handler.fetch(signedInResolveRequest())
         const { url } = await prepared.json() as { url: string }
-        currentTime = 31_001
+        currentTime = 121_001
 
         const response = await handler.fetch(new Request(`https://study.example${url}`))
 
@@ -1125,7 +1195,7 @@ describe('public runtime provider configuration', () => {
         id = CHKSZ_ID,
         pathId = CHKSZ_ID,
         nonce = CHKSZ_NONCE,
-        headers: HeadersInit = { 'cache-control': 'max-age=30', 'content-type': 'application/json' },
+        headers: HeadersInit = { 'cache-control': 'max-age=120', 'content-type': 'application/json' },
       ) => {
         await cache.put(
           new Request(mediaUrl(pathId, nonce), { method: 'GET' }),
@@ -1135,7 +1205,7 @@ describe('public runtime provider configuration', () => {
             nonce,
             validatedUrl,
             mimeType: 'audio/mpeg',
-            expiresAt: 31_000,
+            expiresAt: 121_000,
           }), { headers }),
         )
       }
@@ -1258,9 +1328,9 @@ describe('public runtime provider configuration', () => {
       })
 
       it.each([
-        ['a mismatched cached ID', CHKSZ_TEMPORARY_URL, '1315196859', { 'cache-control': 'max-age=30', 'content-type': 'application/json' }],
-        ['an unsafe cached URL', 'https://attacker.example/audio', CHKSZ_ID, { 'cache-control': 'max-age=30', 'content-type': 'application/json' }],
-        ['a non-JSON cache entry', CHKSZ_TEMPORARY_URL, CHKSZ_ID, { 'cache-control': 'max-age=30', 'content-type': 'text/plain' }],
+        ['a mismatched cached ID', CHKSZ_TEMPORARY_URL, '1315196859', { 'cache-control': 'max-age=120', 'content-type': 'application/json' }],
+        ['an unsafe cached URL', 'https://attacker.example/audio', CHKSZ_ID, { 'cache-control': 'max-age=120', 'content-type': 'application/json' }],
+        ['a non-JSON cache entry', CHKSZ_TEMPORARY_URL, CHKSZ_ID, { 'cache-control': 'max-age=120', 'content-type': 'text/plain' }],
       ])('rejects %s before fetching media', async (_label, cachedUrl, cachedId, headers) => {
         const cache = new FakePreparationCache()
         await cacheMetadata(cache, cachedUrl, cachedId, CHKSZ_ID, CHKSZ_NONCE, headers)
@@ -1553,7 +1623,7 @@ describe('public runtime provider configuration', () => {
         const cache = new FakePreparationCache()
         const fetchImpl = vi.fn(async () => upstreamJson(officialChkszResponse())) as unknown as typeof fetch
         const { handler } = await enabledMediaHandler(fetchImpl, cache)
-        const prepared = await handler.fetch(resolveRequest())
+        const prepared = await handler.fetch(signedInResolveRequest())
         const body = await prepared.json() as { url: string }
         cache.clear()
 
@@ -1596,8 +1666,8 @@ describe('public runtime provider configuration', () => {
     expect(await mediaResponse.json()).toEqual({ error: 'invalid_response' })
   })
 
-  it('routes Jellyfin, GD Studio, and HuanYin resolve and media paths before authentication fallback', async () => {
-    for (const id of ['jellyfin', 'gd-studio', 'lx-huanyin'] as const) {
+  it('routes GD Studio and HuanYin resolve and media paths before authentication fallback', async () => {
+    for (const id of ['gd-studio', 'lx-huanyin'] as const) {
       const resolveResponse = await worker.fetch(new Request(
         `https://study.example/api/providers/${id}/resolve`,
         {
@@ -1769,283 +1839,34 @@ describe('public runtime provider configuration', () => {
       })
     })
 
-    describe('Jellyfin artwork proxy', () => {
+    describe('Retired Jellyfin routes', () => {
       const jellyfinEnv = (overrides: Partial<ProviderEnv> = {}) => providerEnv({
         JELLYFIN_BASE_URL: 'https://jellyfin.example',
         JELLYFIN_API_TOKEN: 'secret-jellyfin-token',
         JELLYFIN_USER_ID: '0123456789abcdef0123456789abcdef',
         ...overrides,
-      })
+      } as Partial<ProviderEnv>)
 
-      it('rejects invalid or path-traversal external IDs', async () => {
-        const handler = createProviderHandler(jellyfinEnv())
-        for (const badId of ['..%2Fetc%2Fpasswd', 'not-hex', '123', 'a'.repeat(33)]) {
-          const response = await handler.fetch(new Request(
-            `https://study.example/api/providers/jellyfin/artwork/${badId}`,
-          ))
-          expect(response.status).toBe(400)
-          expect(await response.json()).toEqual({ error: 'invalid_response' })
+      it('returns 404 for retired Jellyfin artwork and resolve endpoints without leaking legacy config', async () => {
+        await seedProvider(database, 'jellyfin', 1, 30)
+        const fetchImpl = vi.fn() as unknown as typeof fetch
+        const handler = createProviderHandler(jellyfinEnv(), { fetch: fetchImpl })
+        for (const req of [
+          new Request('https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef'),
+          new Request('https://study.example/api/providers/jellyfin/resolve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', origin: 'https://study.example' },
+            body: JSON.stringify({ externalId: '0123456789abcdef0123456789abcdef' }),
+          }),
+        ]) {
+          const response = await handler.fetch(req)
+          expect(response.status).toBe(404)
+          expect(await response.clone().json()).toEqual({ error: 'not_found' })
+          const serialized = JSON.stringify([...response.headers]) + await response.text()
+          expect(serialized).not.toContain('secret-jellyfin-token')
+          expect(serialized).not.toContain('https://jellyfin.example')
         }
-      })
-
-      it('rejects query parameters or hash on the artwork URL', async () => {
-        const handler = createProviderHandler(jellyfinEnv())
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef?foo=bar',
-        ))
-        expect(response.status).toBe(400)
-        expect(await response.json()).toEqual({ error: 'invalid_response' })
-      })
-
-      it('fetches primary image from Jellyfin origin with auth headers and without leaking credentials', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const sampleImage = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
-        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-          expect(String(input)).toBe('https://jellyfin.example/Items/0123456789abcdef0123456789abcdef/Images/Primary?maxWidth=512&maxHeight=512')
-          const headers = new Headers(init?.headers)
-          expect(headers.get('authorization')).toBe('MediaBrowser Token="secret-jellyfin-token"')
-          return new Response(sampleImage, {
-            status: 200,
-            headers: {
-              'content-type': 'image/png',
-              'content-length': '4',
-            },
-          })
-        }) as unknown as typeof fetch
-
-        const handler = createProviderHandler(jellyfinEnv(), { fetch: fetchImpl })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef',
-        ))
-
-        expect(response.status).toBe(200)
-        expect(response.headers.get('content-type')).toBe('image/png')
-        expect(response.headers.get('x-content-type-options')).toBe('nosniff')
-        expect(response.headers.get('cache-control')).toBe('public, max-age=3600')
-        expect(new Uint8Array(await response.arrayBuffer())).toEqual(sampleImage)
-
-        // Verify no credentials leaked to client
-        const serializedHeaders = JSON.stringify([...response.headers])
-        expect(serializedHeaders).not.toContain('secret-jellyfin-token')
-        expect(serializedHeaders).not.toContain('https://jellyfin.example')
-      })
-
-      it('returns 404 when item image is not found upstream', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const fetchImpl = vi.fn(async () => new Response('Item not found', { status: 404 })) as unknown as typeof fetch
-
-        const handler = createProviderHandler(jellyfinEnv(), { fetch: fetchImpl })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef',
-        ))
-
-        expect(response.status).toBe(404)
-        expect(await response.json()).toEqual({ error: 'not_found' })
-      })
-
-      it('returns 503 when jellyfin provider is disabled', async () => {
-        await seedProvider(database, 'jellyfin', 0, 30)
-        const handler = createProviderHandler(jellyfinEnv())
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef',
-        ))
-
-        expect(response.status).toBe(503)
-        expect(await response.json()).toEqual({ error: 'unavailable' })
-      })
-
-      it('answers HEAD requests cleanly with 200 and no body', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const fetchImpl = vi.fn(async () => new Response(null, {
-          status: 200,
-          headers: {
-            'content-type': 'image/png',
-            'content-length': '5678',
-          },
-        })) as unknown as typeof fetch
-
-        const handler = createProviderHandler(jellyfinEnv(), { fetch: fetchImpl })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef',
-          { method: 'HEAD' },
-        ))
-
-        expect(response.status).toBe(200)
-        expect(response.headers.get('content-type')).toBe('image/png')
-        expect(response.headers.get('content-length')).toBe('5678')
-        expect(response.headers.get('cache-control')).toBe('public, max-age=3600')
-        expect(response.body).toBeNull()
-      })
-
-      it('rejects non-image MIME types from upstream Jellyfin', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const fetchImpl = vi.fn(async () => new Response('<html>not an image</html>', {
-          status: 200,
-          headers: { 'content-type': 'text/html' },
-        })) as unknown as typeof fetch
-
-        const handler = createProviderHandler(jellyfinEnv(), { fetch: fetchImpl })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef',
-        ))
-
-        expect(response.status).toBe(502)
-        expect(await response.json()).toEqual({ error: 'invalid_response' })
-      })
-
-      it('rejects oversized artwork exceeding limit from upstream Jellyfin', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const fetchImpl = vi.fn(async () => new Response('large', {
-          status: 200,
-          headers: {
-            'content-type': 'image/jpeg',
-            'content-length': '6000000',
-          },
-        })) as unknown as typeof fetch
-
-        const handler = createProviderHandler(jellyfinEnv(), { fetch: fetchImpl })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/artwork/0123456789abcdef0123456789abcdef',
-        ))
-
-        expect(response.status).toBe(502)
-        expect(await response.json()).toEqual({ error: 'invalid_response' })
-      })
-    })
-
-    describe('Jellyfin resolve artwork metadata', () => {
-      const jellyfinEnv = (overrides: Partial<ProviderEnv> = {}) => providerEnv({
-        JELLYFIN_BASE_URL: 'https://jellyfin.example',
-        JELLYFIN_API_TOKEN: 'secret-jellyfin-token',
-        JELLYFIN_USER_ID: '0123456789abcdef0123456789abcdef',
-        ...overrides,
-      })
-
-      it('returns same-origin artworkUrl when resolving Jellyfin item with primary image', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const jellyfinItemId = '0123456789abcdef0123456789abcdef'
-        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-          const urlStr = String(input)
-          if (urlStr.includes(`/Items/${jellyfinItemId}`)) {
-            return new Response(JSON.stringify({
-              Id: jellyfinItemId,
-              Type: 'Audio',
-              MediaType: 'Audio',
-              Container: 'flac',
-              ImageTags: { Primary: 'tag-primary-1' },
-            }), {
-              status: 200,
-              headers: { 'content-type': 'application/json' },
-            })
-          }
-          return new Response('not found', { status: 404 })
-        }) as unknown as typeof fetch
-
-        const cache = new FakePreparationCache()
-        const handler = createProviderHandler(jellyfinEnv(), {
-          fetch: fetchImpl,
-          cache: cache as unknown as Pick<Cache, 'match' | 'put'>,
-        })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/resolve',
-          {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              origin: 'https://study.example',
-            },
-            body: JSON.stringify({ externalId: jellyfinItemId }),
-          },
-        ))
-
-        expect(response.status).toBe(200)
-        const data = await response.json() as any
-        expect(data.metadata.artworkUrl).toBe(`/api/providers/jellyfin/artwork/${jellyfinItemId}`)
-      })
-
-      it('returns album artworkUrl when item only has album image', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const jellyfinItemId = '0123456789abcdef0123456789abcdef'
-        const albumId = 'fedcba9876543210fedcba9876543210'
-        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-          const urlStr = String(input)
-          if (urlStr.includes(`/Items/${jellyfinItemId}`)) {
-            return new Response(JSON.stringify({
-              Id: jellyfinItemId,
-              Type: 'Audio',
-              MediaType: 'Audio',
-              Container: 'flac',
-              AlbumId: albumId,
-              AlbumPrimaryImageTag: 'album-tag-1',
-            }), {
-              status: 200,
-              headers: { 'content-type': 'application/json' },
-            })
-          }
-          return new Response('not found', { status: 404 })
-        }) as unknown as typeof fetch
-
-        const cache = new FakePreparationCache()
-        const handler = createProviderHandler(jellyfinEnv(), {
-          fetch: fetchImpl,
-          cache: cache as unknown as Pick<Cache, 'match' | 'put'>,
-        })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/resolve',
-          {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              origin: 'https://study.example',
-            },
-            body: JSON.stringify({ externalId: jellyfinItemId }),
-          },
-        ))
-
-        expect(response.status).toBe(200)
-        const data = await response.json() as any
-        expect(data.metadata.artworkUrl).toBe(`/api/providers/jellyfin/artwork/${albumId}`)
-      })
-
-      it('omits artworkUrl when item has no primary or album image', async () => {
-        await seedProvider(database, 'jellyfin', 1, 30)
-        const jellyfinItemId = '0123456789abcdef0123456789abcdef'
-        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-          const urlStr = String(input)
-          if (urlStr.includes(`/Items/${jellyfinItemId}`)) {
-            return new Response(JSON.stringify({
-              Id: jellyfinItemId,
-              Type: 'Audio',
-              MediaType: 'Audio',
-              Container: 'flac',
-            }), {
-              status: 200,
-              headers: { 'content-type': 'application/json' },
-            })
-          }
-          return new Response('not found', { status: 404 })
-        }) as unknown as typeof fetch
-
-        const cache = new FakePreparationCache()
-        const handler = createProviderHandler(jellyfinEnv(), {
-          fetch: fetchImpl,
-          cache: cache as unknown as Pick<Cache, 'match' | 'put'>,
-        })
-        const response = await handler.fetch(new Request(
-          'https://study.example/api/providers/jellyfin/resolve',
-          {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              origin: 'https://study.example',
-            },
-            body: JSON.stringify({ externalId: jellyfinItemId }),
-          },
-        ))
-
-        expect(response.status).toBe(200)
-        const data = await response.json() as any
-        expect(data.metadata.artworkUrl).toBeUndefined()
+        expect(fetchImpl).not.toHaveBeenCalled()
       })
     })
   })
@@ -2235,5 +2056,42 @@ describe('public runtime provider configuration', () => {
         warn.mockRestore()
       }
     })
+
+    it('keeps GD Studio media policy exact-host while blocking sibling and off-policy hosts', async () => {
+      await database.prepare('DELETE FROM provider_health WHERE provider_key = ?').bind('gd-studio').run()
+      await seedProvider(database, 'gd-studio', 1, 2)
+
+      const makeHandler = (fetchImpl: typeof fetch) => createProviderHandler(
+        providerEnv({
+          GD_STUDIO_API_BASE_URL: 'https://music-api.gdstudio.xyz',
+          GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES: 'm901.music.126.net',
+        }),
+        { fetch: fetchImpl, cache: new FakePreparationCache() as unknown as Pick<Cache, 'match' | 'put'> },
+      )
+
+      const allowedFetch = vi.fn(async () => new Response(
+        JSON.stringify({ url: 'https://m901.music.126.net/shard/song.mp3?token=t', br: 320, size: 1234 }),
+        { headers: { 'content-type': 'application/json' } },
+      )) as unknown as typeof fetch
+      const allowedResp = await makeHandler(allowedFetch).fetch(gdRequest())
+      expect(allowedResp.status).toBe(200)
+      const allowedBody = await allowedResp.json() as { url?: string }
+      expect(allowedBody.url).toMatch(/^\/api\/providers\/gd-studio\/media\//u)
+
+      for (const badUrl of [
+        'https://music.126.net/apex.mp3',
+        'https://m902.music.126.net/sibling.mp3',
+        'https://evil.example/a.mp3',
+      ]) {
+        const badFetch = vi.fn(async () => new Response(
+          JSON.stringify({ url: badUrl, br: 320, size: 1234 }),
+          { headers: { 'content-type': 'application/json' } },
+        )) as unknown as typeof fetch
+        const badResp = await makeHandler(badFetch).fetch(gdRequest())
+        expect(badResp.status).toBe(502)
+        expect(await badResp.json()).toEqual({ error: 'invalid_response', code: 'gd_media_url_policy' })
+      }
+    })
   })
 })
+

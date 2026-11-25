@@ -21,6 +21,7 @@ const capability = ref<GlassCapability>('css')
 let activeCanvas: HTMLCanvasElement | null = null
 let animationFrame: number | null = null
 let disposed = false
+const initialisation = new AbortController()
 let renderer: GlassRenderer | null = null
 let resizeObserver: ResizeObserver | null = null
 let reducedMotion = false
@@ -151,7 +152,7 @@ onMounted(async () => {
     window.addEventListener('resize', onWindowResize)
   }
 
-  const initialised = await initialiseGlassRenderer(canvasRef.value)
+  const initialised = await initialiseGlassRenderer(canvasRef.value, initialisation.signal)
   if (disposed) {
     disposeRendererSafely(initialised.renderer)
     return
@@ -171,6 +172,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   disposed = true
+  initialisation.abort()
   stopAnimation()
   resizeObserver?.disconnect()
   resizeObserver = null

@@ -108,6 +108,28 @@ describe('buildCatalogueIndex — game grouping', () => {
     expect(gameTracks(index, 'zzz').map((track) => track.id)).toEqual(['zzz-tiny-giant'])
   })
 
+  it.each([
+    ['GD Studio', { provider: 'gd-studio', externalId: 'netease:2155423468:320' }],
+    ['NetEase', { provider: 'chksz', externalId: '2155423468' }],
+  ] as const)('chooses the first %s-capable track when an earlier track is YouTube-only', (_label, source) => {
+    const indexed = buildCatalogueIndex([
+      {
+        ...libraryFixtureTracks()[0]!,
+        id: 'genshin-youtube-first',
+        sources: [{ provider: 'youtube', externalId: 'youtube-only' }],
+      },
+      {
+        ...libraryFixtureTracks()[0]!,
+        id: 'genshin-artwork-second',
+        sources: [source],
+      },
+    ])
+
+    expect(indexed.games.find((game) => game.id === 'genshin')?.representativeTrack?.id).toBe(
+      'genshin-artwork-second',
+    )
+  })
+
   it('lists the games in canonical order with their counts', () => {
     expect(index.games.map((game) => game.id)).toEqual(['genshin', 'hsr', 'zzz'])
     expect(index.games.map((game) => game.trackCount)).toEqual([5, 2, 1])

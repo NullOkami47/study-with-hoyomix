@@ -14,7 +14,7 @@
  * catches the whole class.
  *
  * IMPORTANT: `lxUser.ts` is deliberately EXEMPT. It builds a provider request
- * payload (`musicInfo.name` / `musicInfo.title`) sent to the LX 褲佬 playback
+ * payload (`musicInfo.name` / `musicInfo.title`) sent to the LX playback
  * service. That payload must carry the canonical recording title — localising it
  * would push a display string into the playback path and break the identity
  * invariance contract that `localisationInvariance.spec.ts` protects.

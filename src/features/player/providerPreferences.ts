@@ -6,16 +6,24 @@ const ENDPOINT = '/api/account/provider-preferences'
 
 /**
  * Top-level playback providers a user may disable for themselves.
- * Normal automatic providers are chksz, lx, and jellyfin.
+ * Retired saved IDs remain readable but are dropped on read, so they can never
+ * select or exclude a provider that no longer exists.
  * This list mirrors the Worker's `USER_TOGGLEABLE_PROVIDER_IDS`.
  */
 export const USER_TOGGLEABLE_PROVIDER_IDS = [
   'chksz',
   'lx',
-  'jellyfin',
+  'gd-studio',
 ] as const
 
 export type UserToggleableProviderId = typeof USER_TOGGLEABLE_PROVIDER_IDS[number]
+
+/**
+ * Identities retired from the runtime. A Worker from an earlier deployment
+ * window may still advertise one; it is dropped on read exactly as it is from
+ * the public provider config, so an old row cannot blank the live selection.
+ */
+export const RETIRED_PROVIDER_IDS = new Set<string>(['vkeys', 'jellyfin'])
 
 export const LEGACY_LX_IDS = [
   'lx-huibq',
@@ -69,12 +77,11 @@ const inCanonicalOrder = (ids: Iterable<string>): UserToggleableProviderId[] =>
       (CANONICAL_ORDER.get(left) ?? 0) - (CANONICAL_ORDER.get(right) ?? 0))
 
 /**
- * Pure helper to migrate legacy disabled provider IDs to the three-provider model:
+ * Pure helper to migrate legacy disabled provider IDs to the canonical provider model:
  * 1. Old chksz disabled -> new chksz disabled.
  * 2. All 8 old LX IDs disabled -> new lx disabled.
  * 3. If not all 8 old LX IDs disabled -> new lx remains enabled.
- * 4. Jellyfin absent -> remains enabled (not disabled).
- * 5. Obsolete IDs (r2, meting, piped, invidious, gd-studio, qijie, etc.) -> dropped.
+ * 5. Obsolete IDs (r2, meting, piped, invidious, qijie, etc.) -> dropped.
  * 6. Idempotent: migrating an already migrated array leaves it unchanged.
  */
 export function migrateLegacyDisabledProviderIds(
@@ -92,10 +99,11 @@ export function migrateLegacyDisabledProviderIds(
     result.push('lx')
   }
 
-  if (set.has('jellyfin')) {
-    result.push('jellyfin')
+  if (set.has('gd-studio')) {
+    result.push('gd-studio')
   }
 
+  // Retired identities, including Vkeys and Jellyfin, are intentionally dropped.
   return inCanonicalOrder(result)
 }
 
@@ -112,11 +120,17 @@ const parseRemoteSelection = (value: unknown): UserToggleableProviderId[] | null
   const keys = Object.keys(value)
   if (keys.length !== 1 || keys[0] !== 'disabledProviderIds') return null
   const ids = value.disabledProviderIds
-  if (!Array.isArray(ids) || ids.length > USER_TOGGLEABLE_PROVIDER_IDS.length) return null
+  // A pre-retirement Worker can return one extra, retired id alongside the
+  // four live ones; nothing else may widen the envelope.
+  if (!Array.isArray(ids) || ids.length > USER_TOGGLEABLE_PROVIDER_IDS.length + RETIRED_PROVIDER_IDS.size) return null
 
+  const seen = new Set<string>()
   const selection = new Set<string>()
   for (const id of ids) {
-    if (typeof id !== 'string' || !TOGGLEABLE_IDS.has(id) || selection.has(id)) return null
+    if (typeof id !== 'string' || seen.has(id)) return null
+    seen.add(id)
+    if (RETIRED_PROVIDER_IDS.has(id)) continue
+    if (!TOGGLEABLE_IDS.has(id)) return null
     selection.add(id)
   }
   return inCanonicalOrder(selection)

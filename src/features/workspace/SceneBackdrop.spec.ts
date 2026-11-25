@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { createBackgroundStore } from '../backgrounds/store'
 import type { PublicBackground } from '../backgrounds/types'
 import SceneBackdrop from './SceneBackdrop.vue'
+import { createPublicBackground } from '../../test/fixtures/publicBackgrounds'
 const background = (id: string): PublicBackground => ({
   id, revision: 1, status: 'published', kind: 'video', contentType: 'video/mp4', byteSize: 100, width: 3840, height: 2160, durationMs: 10_000,
   mediaUrl: `/backgrounds/${id}.mp4`, posterUrl: `/backgrounds/${id}.jpg`, rightsStatus: 'not-reviewed', createdAt: 1, updatedAt: 1, publishedAt: 1, archivedAt: null,
@@ -21,6 +22,77 @@ async function setup(ids = ['belle', 'ellen'], props = {}, entries = ids.map(bac
   wrappers.push(wrapper); await flushPromises(); return { store, wrapper }
 }
 describe('SceneBackdrop video background', () => {
+  it.each([
+    { event: 'waiting', seeking: true },
+    { event: 'waiting', seeking: false },
+    { event: 'stalled', seeking: false },
+  ])('retains the visible video frame during a same-source loop $event interval (seeking=$seeking)', async ({ event, seeking }) => {
+    const { wrapper, store } = await setup(['belle'])
+    const video = wrapper.get('video')
+    Object.defineProperty(video.element, 'readyState', { value: 4, configurable: true })
+    Object.defineProperty(video.element, 'currentSrc', { value: '/backgrounds/belle.mp4', configurable: true })
+    ;(video.element as HTMLVideoElement).currentTime = 9.99
+    await video.trigger('playing')
+    const visible = () => video.classes().includes('scene-backdrop__video--active')
+    const visibility = [visible()]
+    const load = vi.mocked(HTMLMediaElement.prototype.load)
+    const loadsBeforeLoop = load.mock.calls.length
+    Object.defineProperty(video.element, 'readyState', { value: 1, configurable: true })
+    Object.defineProperty(video.element, 'seeking', { value: seeking, configurable: true })
+    ;(video.element as HTMLVideoElement).currentTime = 0
+    await video.trigger(event)
+    visibility.push(visible())
+    expect(store.current.value?.id).toBe('belle')
+    expect(video.attributes('src')).toBe('/backgrounds/belle.mp4')
+    expect(wrapper.get('picture img').attributes('src')).toBe('/backgrounds/belle.jpg')
+    expect(load.mock.calls.length).toBe(loadsBeforeLoop)
+    Object.defineProperty(video.element, 'readyState', { value: 4, configurable: true })
+    Object.defineProperty(video.element, 'seeking', { value: false, configurable: true })
+    await video.trigger('playing')
+    visibility.push(visible())
+    expect(visibility).toEqual([true, true, true])
+  })
+  it('does not reveal an initial seek before any video frame has been presented', async () => {
+    const { wrapper } = await setup(['belle'])
+    const video = wrapper.get('video')
+    Object.defineProperty(video.element, 'readyState', { value: 1, configurable: true })
+    Object.defineProperty(video.element, 'seeking', { value: true, configurable: true })
+    await video.trigger('waiting')
+    expect(video.classes()).not.toContain('scene-backdrop__video--active')
+  })
+  it('reveals the poster when a metadata-only stall reaches recovery and retains the retry limit', async () => {
+    const { wrapper, store } = await setup(['belle'])
+    const video = wrapper.get('video')
+    Object.defineProperty(video.element, 'readyState', { value: 4, configurable: true })
+    await video.trigger('playing')
+    const load = vi.mocked(HTMLMediaElement.prototype.load)
+    const loadsBeforeStall = load.mock.calls.length
+    Object.defineProperty(video.element, 'readyState', { value: 1, configurable: true })
+    await video.trigger('waiting')
+    await vi.advanceTimersByTimeAsync(7_999)
+    expect(video.classes()).toContain('scene-backdrop__video--active')
+    expect(load.mock.calls.length).toBe(loadsBeforeStall)
+    await vi.advanceTimersByTimeAsync(1); await flushPromises()
+    expect(video.classes()).not.toContain('scene-backdrop__video--active')
+    expect(wrapper.get('picture img').attributes('src')).toBe('/backgrounds/belle.jpg')
+    expect(load.mock.calls.length).toBe(loadsBeforeStall + 1)
+    await vi.advanceTimersByTimeAsync(8_000); await flushPromises()
+    expect(wrapper.find('video').exists()).toBe(false)
+    expect(store.current.value?.id).toBe('belle')
+    expect(wrapper.get('picture img').attributes('data-background-active')).toBe('true')
+  })
+  it.each(['waiting', 'stalled', 'error'])('reveals the poster for an empty decoder or error during %s', async event => {
+    const { wrapper } = await setup(['belle'])
+    const video = wrapper.get('video')
+    Object.defineProperty(video.element, 'readyState', { value: 4, configurable: true })
+    await video.trigger('playing')
+    expect(video.classes()).toContain('scene-backdrop__video--active')
+    Object.defineProperty(video.element, 'seeking', { value: true, configurable: true })
+    if (event === 'error') Object.defineProperty(video.element, 'error', { value: { code: 3 }, configurable: true })
+    else Object.defineProperty(video.element, 'readyState', { value: 0, configurable: true })
+    await video.trigger(event)
+    expect(video.classes()).not.toContain('scene-backdrop__video--active')
+  })
   it('keeps the selected poster visible during startup and terminal video failure', async () => {
     const { wrapper, store } = await setup(['belle'])
     expect(wrapper.get('picture img').attributes('src')).toBe('/backgrounds/belle.jpg')
@@ -154,17 +226,19 @@ describe('SceneBackdrop video background', () => {
   })
   it('resolves reduced motion before first render without starting any video', async () => {
     vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true, addEventListener() {}, removeEventListener() {} })))
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ backgrounds: [] }))))
+    const choice = createPublicBackground()
     const store = createBackgroundStore({
-      repository: { list: async () => [background('synthetic')], getAccountSelection: async () => null, saveAccountSelection: async selection => selection },
+      repository: { list: async () => [choice], getAccountSelection: async () => null, saveAccountSelection: async selection => selection },
       storage: { getItem: () => null, setItem: () => undefined },
     })
-    await store.load()
     stores.push(store)
+    // Make a real choice available before the first component render, so this
+    // guards reduced motion rather than merely rendering an empty catalogue.
+    await store.load()
     const wrapper = mount(SceneBackdrop, { props: { mode: 'ambient', lowPower: false, store } })
     wrappers.push(wrapper); await flushPromises()
     expect(wrapper.find('video').exists()).toBe(false)
-    expect(wrapper.get('img').attributes('src')).toBe('/backgrounds/synthetic.jpg')
+    expect(wrapper.get('img').attributes('src')).toBe(choice.posterUrl)
     expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled()
     expect(HTMLMediaElement.prototype.load).not.toHaveBeenCalled()
   })

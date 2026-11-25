@@ -60,9 +60,17 @@ uses the browser's WebCodecs implementation, in an admin-only dedicated Worker.
 - Licence texts: [MIT](licenses/opencc-js-MIT.txt) and
   [upstream third-party notices / Apache 2.0](licenses/opencc-js-THIRD-PARTY.txt).
 
+## Acorn
+
+- Package: `acorn`, pinned to `8.15.0`, by Marijn Haverbeke and contributors.
+- Upstream: <https://github.com/acornjs/acorn>
+- Licence: MIT License
+- Usage: server-side lexical tokenisation (`tokenizer`) in `workers/lx/globalSources.ts` to extract and validate declared global LX script metadata headers safely without executing user JavaScript in the Worker isolate.
+- Licence text: [MIT](licenses/acorn-8.15.0.txt).
+
 ## Public source edition
 
-Modified on 2026-10-16 for a standalone public source distribution; see the root
+Modified on 2026-10-16 (synchronised 2026-11-25) for a standalone public source distribution; see the root
 NOTICE for upstream attribution and modification information. No soundtrack,
 artwork or game wallpaper is included. Media integration code is supplied for
 operators to use only with content and services they are entitled to use.
@@ -70,11 +78,13 @@ operators to use only with content and services they are entitled to use.
 The search-fold mapping in `src/features/catalog/hanFold.ts` is generated using
 OpenCC over fixed public Unicode BMP CJK ranges, independently of any catalogue. The OpenCC MIT and Apache 2.0 dictionary notices above also apply to that
 mapping. Its generator is a maintenance aid rather than a media dataset.
+
 ## Locked runtime dependency notices
 
 Complete MIT, ISC, BSD and MPL texts for the installed direct and transitive
-runtime packages are preserved in [runtime-dependencies.txt](licenses/runtime-dependencies.txt).
-This includes Vue/VueUse, Lucide (ISC and Feather-derived MIT portions), QuickJS
+runtime packages are preserved in [runtime-dependencies.txt](licenses/runtime-dependencies.txt)
+and [acorn-8.15.0.txt](licenses/acorn-8.15.0.txt).
+This includes Vue, Lucide (ISC and Feather-derived MIT portions), Acorn, QuickJS
 and quickjs-emscripten, Mediabunny, and the supporting runtime packages. OpenCC
 Apache dictionary terms are additionally retained in the separate notice above.
 These notices retain upstream authorship information required by their licences.

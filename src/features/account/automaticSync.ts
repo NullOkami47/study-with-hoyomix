@@ -1,8 +1,13 @@
 import { ref, watch, type Ref } from 'vue'
+import { classifySyncError, traceSync } from './syncTrace'
 
 export type AutomaticSyncStatus = 'local' | 'restoring' | 'pending' | 'syncing' | 'synced' | 'failed'
 export const automaticSyncStatus = ref<AutomaticSyncStatus>('local')
 export interface SyncChannel<T extends object> {
+  /** Fixed label for the debug-log trace (preferences, backgrounds, focus); never user data. */
+  name?: string
+  /** Counts and booleans only, added to the sync.state entry written when sync gives up. */
+  diagnostics?(): Record<string, number | boolean | string | null>
   persistPending?: boolean
   /** Catalogue hydration is not a user edit. Real controls remain tracked. */
   isLocalChange?(): boolean
@@ -34,6 +39,30 @@ export function createAutomaticSync<T extends object>(options: {
   let timer: ReturnType<typeof setTimeout> | undefined
   let needsPull = true
   let retryNotBefore = 0, terminal = false
+  const labelOf = (index: number) => states[index].channel.name ?? `channel${index}`
+  let lastFailure: { channel: string; phase: string } | null = null
+  const stopTrace = watch(status, (to, from) => traceSync('status', { from, to }), { flush: 'sync' })
+  const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now())
+  /** One entry when sync gives up: counts and booleans only, never stored values. */
+  function traceFailureState(error: unknown) {
+    try {
+      const fields: Record<string, unknown> = {
+        failedChannel: lastFailure?.channel ?? null, failedPhase: lastFailure?.phase ?? null, ...classifySyncError(error),
+        failures, online: typeof navigator === 'undefined' ? null : navigator.onLine,
+        visibility: typeof document === 'undefined' ? null : document.visibilityState,
+      }
+      states.forEach((state, index) => {
+        let present = false, bytes = 0
+        try { const raw = options.pendingStorage?.getItem(pendingKey(index)); present = raw != null; bytes = raw?.length ?? 0 } catch { /* unreadable store */ }
+        const label = labelOf(index)
+        fields[`${label}.pendingPresent`] = present
+        fields[`${label}.pendingBytes`] = bytes
+        fields[`${label}.dirtyCount`] = state.dirty.size
+        for (const [key, value] of Object.entries(state.channel.diagnostics?.() ?? {})) fields[`${label}.${key}`] = value
+      })
+      traceSync('state', fields)
+    } catch { /* Tracing never affects sync. */ }
+  }
   const pendingKey = (index: number) => `study-with-hoyomix.sync-pending.v1.${encodeURIComponent(activeIdentity!)}.${index}`
   function persistPending(index: number) {
     const state = states[index]
@@ -85,19 +114,30 @@ export function createAutomaticSync<T extends object>(options: {
     if (changed && options.userId.value) { status.value = 'pending'; schedule() }
   }, { deep: true, flush: 'sync' }))
 
+  function traceChannel(index: number, phase: string, started: number, error?: unknown) {
+    traceSync('channel', {
+      channel: labelOf(index), phase, ok: error === undefined, durationMs: Math.round(nowMs() - started),
+      ...(error === undefined ? {} : classifySyncError(error)),
+    })
+  }
   async function run() {
     if (running || destroyed || terminal || !options.userId.value) return
     running = true; requested = false
     const token = generation, pull = needsPull
     needsPull = false
+    traceSync('run.start', { pull, failures })
     try {
       let channelError: unknown
       for (const [index, state] of states.entries()) {
         if (!current(token)) return
+        let phase = 'merge'
         try {
           if (!state.ready || pull) {
             status.value = 'restoring'
-            const remote = await state.channel.load()
+            const loadStarted = nowMs()
+            let remote: T | null
+            try { remote = await state.channel.load() } catch (error) { phase = 'load'; traceChannel(index, 'load', loadStarted, error); throw error }
+            traceChannel(index, 'load', loadStarted)
             if (!current(token)) return
             if (remote !== null) {
               const local = state.channel.capture(), merged = { ...remote } as T
@@ -112,7 +152,10 @@ export function createAutomaticSync<T extends object>(options: {
           const snapshot = state.channel.capture()
           if (equal(snapshot, state.base)) { state.dirty.clear(); persistPending(index); continue }
           status.value = 'syncing'
-          const saved = await state.channel.save(snapshot)
+          const saveStarted = nowMs()
+          let saved: T
+          try { saved = await state.channel.save(snapshot) } catch (error) { phase = 'save'; traceChannel(index, 'save', saveStarted, error); throw error }
+          traceChannel(index, 'save', saveStarted)
           if (!current(token)) return
           state.base = saved
           const latest = state.channel.capture()
@@ -121,7 +164,7 @@ export function createAutomaticSync<T extends object>(options: {
           if (!equal(latest, state.base)) requested = true
         } catch (error) {
           const priority = (value: unknown) => [401, 403].includes(httpStatus(value)) ? 3 : httpStatus(value) === 429 ? 2 : 1
-          if (!channelError || priority(error) > priority(channelError)) channelError = error
+          if (!channelError || priority(error) > priority(channelError)) { channelError = error; lastFailure = { channel: labelOf(index), phase } }
           if (httpStatus(error) === 401 || httpStatus(error) === 403) break
         }
       }
@@ -132,19 +175,27 @@ export function createAutomaticSync<T extends object>(options: {
     } catch (error) {
       if (!current(token)) return
       failures += 1
-      if (failures >= 3) status.value = 'failed'
       const code = httpStatus(error)
+      // The banner means sync has stopped: it is shown only when no retry is scheduled.
       // Never treat an unauthorised/failed read as an empty remote profile.
       if (code === 401 || code === 403) {
         status.value = 'failed'; requested = false; terminal = true
+        traceSync('terminal', { reason: `http_${code}` })
+        traceFailureState(error)
         if (timer !== undefined) clearTimeout(timer)
         timer = undefined
       }
-      else if ((!code || code === 409 || code === 429 || code >= 500) && failures < 5) {
+      // 412 is the stale-revision status once the preferences Worker enforces If-Match (L-24, D9).
+      else if ((!code || code === 409 || code === 412 || code === 429 || code >= 500) && failures < 5) {
         needsPull = true
         retryNotBefore = Date.now() + (code === 429 ? 60_000 : Math.min(30_000, 1000 * 2 ** (failures - 1)))
+        traceSync('retry', { failures, delayMs: Math.max(0, retryNotBefore - Date.now()), ...classifySyncError(error) })
         schedule(0)
-      } else { status.value = 'failed'; requested = false }
+      } else {
+        status.value = 'failed'; requested = false
+        traceSync(failures >= 5 ? 'exhausted' : 'terminal', { failures, ...classifySyncError(error) })
+        traceFailureState(error)
+      }
     } finally {
       running = false
       if (token !== generation && options.userId.value) schedule(0)
@@ -186,6 +237,6 @@ export function createAutomaticSync<T extends object>(options: {
   return {
     status,
     refresh() { if (options.userId.value) { needsPull = true; failures = 0; terminal = false; schedule(0) } },
-    destroy() { destroyed = true; generation++; stopIdentity(); stops.forEach(stop => stop()); if (timer !== undefined) clearTimeout(timer) },
+    destroy() { destroyed = true; generation++; stopIdentity(); stopTrace(); stops.forEach(stop => stop()); if (timer !== undefined) clearTimeout(timer) },
   }
 }

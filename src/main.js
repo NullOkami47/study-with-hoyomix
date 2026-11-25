@@ -1,3 +1,7 @@
+// Debug log capture (task 41.8). Imported first so it is installed before the app's modules
+// evaluate: errors, console output and failed API calls from startup are in the exported log
+// even if the player never renders.
+import './features/player/debugLogStartup'
 import { createApp } from 'vue'
 import App from './App.vue'
 import { registerPwa } from './pwa/register'

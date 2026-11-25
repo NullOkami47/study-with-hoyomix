@@ -1,10 +1,48 @@
-# Copy to .dev.vars. Integrations stay disabled until configured.
+# Copy to .dev.vars for local `wrangler dev --local`. Never commit `.dev.vars`.
+# Optional integrations stay disabled until explicitly configured.
+
+# Canonical public HTTPS origin (http://localhost:8787 is allowed for local dev)
 PUBLIC_ORIGIN=http://localhost:8787
+
+# Generate independent random secrets (at least 32 bytes each), e.g. via `openssl rand -hex 32`
 SESSION_HMAC_SECRET=
 OAUTH_STATE_SECRET=
-# Generate separate random values of at least 32 bytes for the two secrets.
-# Optional OAuth, provider, R2 and Sheets variables are described by workers/index.ts.
-# Optional authenticated reverse proxy. Leave unset for same-origin local use.
-BACKEND_ORIGIN=
-PROXY_FRONTEND_ORIGIN=
-API_PROXY_SECRET=
+
+# Optional WebSocket presence secret (if set, used by /api/presence; generate a strong random value)
+# PRESENCE_SECRET=
+
+# Optional OAuth / OIDC login providers (leave unset to keep login providers disabled)
+# GOOGLE_CLIENT_ID=
+# GOOGLE_CLIENT_SECRET=
+# GITHUB_CLIENT_ID=
+# GITHUB_CLIENT_SECRET=
+# LINUXDO_CLIENT_ID=
+# LINUXDO_CLIENT_SECRET=
+
+# Optional explicit Owner bootstrap (requires both OWNER_PROVIDER and OWNER_SUBJECT; supports github or linuxdo, excludes google)
+# OWNER_PROVIDER=
+# OWNER_SUBJECT=
+
+# Optional music provider configuration (server-side only; never place in VITE_* variables)
+# CHKSZ_API_KEY=
+# GD_STUDIO_API_BASE_URL=https://music-api.gdstudio.xyz
+# GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES=m701.music.126.net,m801.music.126.net
+# LX_ALLOWED_ORIGINS=
+
+# Optional authenticated reverse proxy (leave unset for direct same-origin deployments)
+# BACKEND_ORIGIN=
+# PROXY_FRONTEND_ORIGIN=
+# API_PROXY_SECRET=
+
+# Optional self-hosted R2 background media delivery (requires matching BACKGROUND_BUCKET R2 binding)
+# R2_BASE_URL=
+# R2_ALLOWED_HOSTNAMES=
+
+# Optional Google Sheets catalogue review/staging integration
+# CATALOGUE_SHEET_ID=
+# GOOGLE_SHEETS_SERVICE_ACCOUNT_EMAIL=
+# GOOGLE_SHEETS_PRIVATE_KEY=
+
+# Optional Cloudflare D1 write-quota preflight for automated catalogue discovery publishing
+# CATALOGUE_DISCOVERY_CF_ACCOUNT_ID=
+# CATALOGUE_DISCOVERY_QUOTA_API_TOKEN=

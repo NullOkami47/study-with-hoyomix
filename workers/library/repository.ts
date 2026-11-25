@@ -361,6 +361,19 @@ export async function exportAccountData(database: Database, userId: string) {
       proposed_value_json AS proposedValueJson, note, status, created_at AS createdAt, updated_at AS updatedAt
     FROM catalog_reports WHERE reporter_user_id = ? ORDER BY created_at, id
   `).bind(userId).all<ReportRow>()
+  // L-21 (D7): the account's own chat messages, including hidden ones, with their edit history.
+  // Other users' messages and moderation records (reports, actions) are not the account's data.
+  const chatMessages = await database.prepare(`
+    SELECT id, room_id AS roomId, message_type AS type, content, sticker_id AS stickerId,
+      track_id AS trackId, coarse_location AS location, created_at AS createdAt,
+      updated_at AS updatedAt, deleted_at AS deletedAt, expires_at AS expiresAt
+    FROM chat_messages WHERE user_id = ? ORDER BY created_at, id
+  `).bind(userId).all<ChatExportRow>()
+  const chatVersions = await database.prepare(`
+    SELECT v.id, v.message_id AS messageId, v.original_content AS originalContent, v.created_at AS createdAt
+    FROM chat_message_versions v JOIN chat_messages m ON m.id = v.message_id
+    WHERE m.user_id = ? ORDER BY v.created_at, v.id
+  `).bind(userId).all<{ id: string; messageId: string; originalContent: string; createdAt: number }>()
   return {
     schemaVersion: 1,
     favourites: library.favourites,
@@ -387,7 +400,37 @@ export async function exportAccountData(database: Database, userId: string) {
       createdAt: iso(report.createdAt),
       updatedAt: iso(report.updatedAt),
     })),
+    chatMessages: chatMessages.results.map((message) => ({
+      id: message.id,
+      roomId: message.roomId,
+      type: message.type,
+      content: message.content,
+      stickerId: message.stickerId,
+      trackId: message.trackId,
+      location: message.location,
+      createdAt: iso(message.createdAt),
+      updatedAt: message.updatedAt === null ? null : iso(message.updatedAt),
+      deletedAt: message.deletedAt === null ? null : iso(message.deletedAt),
+      expiresAt: iso(message.expiresAt),
+      versions: chatVersions.results
+        .filter((version) => version.messageId === message.id)
+        .map((version) => ({ id: version.id, originalContent: version.originalContent, createdAt: iso(version.createdAt) })),
+    })),
   }
+}
+
+interface ChatExportRow {
+  id: string
+  roomId: string
+  type: string
+  content: string
+  stickerId: string | null
+  trackId: string | null
+  location: string | null
+  createdAt: number
+  updatedAt: number | null
+  deletedAt: number | null
+  expiresAt: number
 }
 
 export interface AvatarDeletionEvent {
@@ -401,11 +444,14 @@ export async function deleteAccount(
   userId: string,
   now: number,
   eventId: string,
+  // L-15 (D8): the avatar outbox row is only written when a caller can act on it (an avatar
+  // storage binding exists). Without one, nothing would ever process it.
+  recordAvatarDeletion = false,
 ): Promise<AvatarDeletionEvent | null> {
   const user = await database.prepare('SELECT avatar_url AS avatarUrl FROM users WHERE id = ? AND deleted_at IS NULL')
     .bind(userId).first<{ avatarUrl: string | null }>()
   if (!user) throw new Error('account_not_found')
-  const objectKey = user.avatarUrl?.startsWith(`avatars/${userId}/`) ? user.avatarUrl : null
+  const objectKey = recordAvatarDeletion && user.avatarUrl?.startsWith(`avatars/${userId}/`) ? user.avatarUrl : null
   const statements = [
     database.prepare(`
       UPDATE catalog_reports SET status = 'withdrawn', updated_at = ?
@@ -416,7 +462,24 @@ export async function deleteAccount(
       WHERE reporter_user_id = ? AND status = 'pending'
     `).bind(userId),
     database.prepare(`
-      UPDATE chat_messages SET user_id = NULL, author_display_name = 'Deleted user'
+      DELETE FROM chat_message_versions
+      WHERE message_id IN (SELECT id FROM chat_messages WHERE user_id = ?)
+    `).bind(userId),
+    database.prepare(`
+      UPDATE moderation_actions SET reason = NULL
+      WHERE target_user_id = ? OR actor_user_id = ?
+        OR target_message_id IN (SELECT id FROM chat_messages WHERE user_id = ?)
+    `).bind(userId, userId, userId),
+    database.prepare(`
+      UPDATE chat_reports SET reason = 'Report retained after account deletion', resolution_note = NULL
+      WHERE reporter_user_id = ?
+        OR message_id IN (SELECT id FROM chat_messages WHERE user_id = ?)
+    `).bind(userId, userId),
+    // L-21 (D7): retained rows keep their position and metadata until normal expiry, but lose the
+    // author and the text. An empty content is the tombstone (sticker/track rows already use '').
+    database.prepare(`
+      UPDATE chat_messages SET user_id = NULL, author_display_name = 'Deleted user', coarse_location = NULL,
+        content = ''
       WHERE user_id = ?
     `).bind(userId),
   ]

@@ -1,11 +1,10 @@
+import { ARTWORK_TIMEOUT_MS, MAX_ARTWORK_DIMENSION, MAX_ARTWORK_BYTES, normaliseImageMime, isPublicArtworkResponse, readArtworkBytes } from './artworkIngress'
+import { createNeteaseArtworkHandler } from './neteaseArtwork'
 import {
   configuredGdStudioMediaHostnames,
   configuredGdStudioOrigin,
   configuredHuanyinMediaHostnames,
   configuredHuanyinOrigin,
-  configuredJellyfinApiToken,
-  configuredJellyfinOrigin,
-  configuredJellyfinUserId,
   configuredLxMediaHostnames,
   configuredLxOrigin,
   configuredLxRequestKey,
@@ -21,7 +20,20 @@ import {
   type PlaybackProviderId,
   type ProviderEnv,
 } from './config'
-import { readChkszOwnerFallbackEnabled, selectChkszCredential } from './chkszCredentials'
+import {
+  readChkszOwnerFallbackEnabled,
+  selectChkszCredential,
+  type ChkszCredentialSelection,
+} from './chkszCredentials'
+import { findSession, readCookie, SESSION_COOKIE } from '../auth/session'
+import {
+  clientAddress,
+  InMemoryRateLimiter,
+  rateLimitedResponse,
+  rateLimitKey,
+  selectRateLimiter,
+  type RateLimiter,
+} from '../rateLimit'
 import {
   resolveGdStudioMetadata,
   GD_STUDIO_EXTERNAL_ID_PATTERN,
@@ -32,12 +44,6 @@ import {
   HUANYIN_EXTERNAL_ID_PATTERN,
 } from './huanyin'
 import { resolveInvidiousMetadata } from './invidious'
-import {
-  jellyfinAuthHeaders,
-  parseJellyfinExternalId,
-  resolveJellyfinMetadata,
-  JELLYFIN_ITEM_ID_PATTERN,
-} from './jellyfin'
 import { createHuibqDescriptor } from './lx/huibq'
 import { createIkunDescriptor } from './lx/ikun'
 import { createLxTransientMedia, resolveLxMetadata } from './lx/shared'
@@ -85,7 +91,30 @@ export interface ProviderHandlerOptions {
   cache?: Pick<Cache, 'match' | 'put'>
   crypto?: Crypto
   now?: () => number
+  /**
+   * Limits owner-key ChKSz resolve/discover per signed-in account and per client address (M-05).
+   * Omitted: the shared `[[ratelimits]]` binding when configured, else the module-scope fallback.
+   */
+  chkszOwnerLimiter?: RateLimiter
 }
+
+// M-05 budget: the ChKSz contract allows 20 upstream calls per minute per key, so one account and
+// one client address may each spend the owner key at most 20 times per 60 s. This deliberately
+// equals the committed `AUTH_START_LIMITER` binding configuration (`simple = { limit = 20,
+// period = 60 }`): that binding is reused with route-prefixed hashed keys, which keeps every
+// counter independent and needs no new deploy-time provisioning. The module-scope fallback
+// survives the fresh handler `worker.fetch` builds per request; it is per isolate (best effort)
+// and is used when the binding is absent or fails.
+export const CHKSZ_OWNER_LIMIT = 20
+export const CHKSZ_OWNER_PERIOD_SECONDS = 60
+const chkszOwnerFallback = new InMemoryRateLimiter({
+  limit: CHKSZ_OWNER_LIMIT,
+  periodMs: CHKSZ_OWNER_PERIOD_SECONDS * 1000,
+})
+
+/** The owner-key ChKSz limiter `worker.fetch` uses: the shared binding when configured, else the isolate. */
+export const chkszOwnerRateLimiter = (env: Pick<ProviderEnv, 'AUTH_START_LIMITER'>): RateLimiter =>
+  selectRateLimiter(env.AUTH_START_LIMITER, CHKSZ_OWNER_PERIOD_SECONDS, chkszOwnerFallback)
 
 interface WorkerCacheStorage extends CacheStorage {
   default: Cache
@@ -97,42 +126,6 @@ const MAX_RESOLVE_BODY_BYTES = 1024
 // Shares the client-side ceiling so a response acceptable to one side is acceptable to both.
 const MAX_METADATA_BYTES = CHKSZ_MAX_RESPONSE_BYTES
 const METADATA_TIMEOUT_MS = 4_000
-const ARTWORK_TIMEOUT_MS = 8_000
-const MAX_ARTWORK_DIMENSION = 512
-const MAX_ARTWORK_BYTES = 5 * 1024 * 1024
-const SAFE_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
-
-function normaliseImageMime(value: string | null): string | null {
-  const match = value?.match(/^\s*(image\/(?:jpeg|jpg|png|webp|gif))(?:\s*;\s*charset\s*=\s*[a-z0-9_-]+)?\s*$/i)
-  const essence = match?.[1]?.toLowerCase()
-  if (essence === 'image/jpg') return 'image/jpeg'
-  return essence && SAFE_IMAGE_MIMES.has(essence) ? essence : null
-}
-
-async function readArtworkBytes(response: Response): Promise<Uint8Array | null> {
-  const reader = response.body?.getReader()
-  if (!reader) return null
-  const chunks: Uint8Array[] = []
-  let size = 0
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    size += value.byteLength
-    if (size > MAX_ARTWORK_BYTES) {
-      await reader.cancel()
-      return null
-    }
-    chunks.push(value)
-  }
-  if (size === 0) return null
-  const bytes = new Uint8Array(size)
-  let offset = 0
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset)
-    offset += chunk.byteLength
-  }
-  return bytes
-}
 
 const json = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) => Response.json(body, {
   status,
@@ -270,6 +263,44 @@ export function createProviderHandler(
   }
   const cacheStorage = (globalThis as typeof globalThis & { caches?: WorkerCacheStorage }).caches
   const preparationCache = () => options.cache ?? cacheStorage?.default
+  const ownerLimiter = options.chkszOwnerLimiter ?? chkszOwnerRateLimiter(env)
+
+  // Session proof for the owner key (D4). Hashing uses the platform crypto, never an injected
+  // test double that may only provide getRandomValues.
+  const sessionUserId = async (request: Request): Promise<string | null> => {
+    const token = readCookie(request, SESSION_COOKIE)
+    if (!token || !env.SESSION_HMAC_SECRET) return null
+    const session = await findSession(env.DB, token, env.SESSION_HMAC_SECRET, dependencies.now(), globalThis.crypto)
+    return session?.userId ?? null
+  }
+
+  const selectCredential = (request: Request) => selectChkszCredential(
+    request.headers,
+    env.DB,
+    () => env.CHKSZ_API_KEY,
+    () => sessionUserId(request),
+  )
+
+  const credentialFailure = (error: Extract<ChkszCredentialSelection, { ok: false }>['error']) =>
+    error === 'chksz_key_required'
+      ? json({ error }, 401)
+      : json({ error }, error === 'invalid_credential' ? 400 : 503)
+
+  /**
+   * Per-account and per-client-address limits on spending the owner key (M-05). Keys are
+   * route-prefixed SHA-256 digests; the raw user ID and address are never stored or logged.
+   * Returns a 429 response when either limit is exhausted, otherwise null.
+   */
+  const limitOwnerKeyUse = async (request: Request, userId: string): Promise<Response | null> => {
+    for (const key of [
+      await rateLimitKey('chksz-owner-user', userId, globalThis.crypto),
+      await rateLimitKey('chksz-owner-ip', clientAddress(request), globalThis.crypto),
+    ]) {
+      const decision = await ownerLimiter.limit(key)
+      if (!decision.success) return rateLimitedResponse(decision.retryAfter, CHKSZ_OWNER_PERIOD_SECONDS)
+    }
+    return null
+  }
 
   const readEffective = async (providerId: CanonicalProviderId): Promise<boolean | null> => {
     try {
@@ -423,16 +454,12 @@ export function createProviderHandler(
     const effective = await readEffective('chksz')
     if (!effective) return json({ error: 'unavailable' }, 503)
 
-    const credential = await selectChkszCredential(
-      request.headers,
-      env.DB,
-      () => env.CHKSZ_API_KEY,
-    )
-    if (!credential.ok) {
-      return json(
-        { error: credential.error },
-        credential.error === 'invalid_credential' ? 400 : 503,
-      )
+    const credential = await selectCredential(request)
+    if (!credential.ok) return credentialFailure(credential.error)
+    if (credential.source === 'owner') {
+      // Before the global D1 discovery budget, so one account cannot drain it for everyone.
+      const limited = await limitOwnerKeyUse(request, credential.userId)
+      if (limited) return limited
     }
 
     const rawMeta = body.metadata && typeof body.metadata === 'object' ? (body.metadata as Record<string, unknown>) : null
@@ -528,16 +555,11 @@ export function createProviderHandler(
     const effective = await readEffective('chksz')
 
     if (!effective) return json({ error: 'unavailable' }, 503)
-    const credential = await selectChkszCredential(
-      request.headers,
-      env.DB,
-      () => env.CHKSZ_API_KEY,
-    )
-    if (!credential.ok) {
-      return json(
-        { error: credential.error },
-        credential.error === 'invalid_credential' ? 400 : 503,
-      )
+    const credential = await selectCredential(request)
+    if (!credential.ok) return credentialFailure(credential.error)
+    if (credential.source === 'owner') {
+      const limited = await limitOwnerKeyUse(request, credential.userId)
+      if (limited) return limited
     }
     const apiKey = credential.apiKey
 
@@ -655,6 +677,11 @@ export function createProviderHandler(
       }
       if (!response.ok) {
         return json({ error: 'unavailable' }, response.status === 429 ? 429 : 502)
+      }
+
+      if (!isPublicArtworkResponse(response)) {
+        await response.body?.cancel().catch(() => {})
+        return json({ error: 'invalid_response' }, 502)
       }
 
       const imageMime = normaliseImageMime(response.headers.get('content-type'))
@@ -901,192 +928,6 @@ export function createProviderHandler(
     return lxTransientMedia(publicOrigin, policy).serve(request, url)
   }
 
-  const configuredJellyfinPolicy = () => {
-    const configuredOrigin = configuredJellyfinOrigin(env)
-    const apiToken = configuredJellyfinApiToken(env)
-    const userId = configuredJellyfinUserId(env)
-    return configuredOrigin && apiToken && userId
-      ? {
-          configuredOrigin,
-          apiToken,
-          userId,
-          validateUrl: createExactMediaUrlValidator([new URL(configuredOrigin).hostname]),
-        }
-      : null
-  }
-
-  const jellyfinTransientMedia = (publicOrigin: string) => {
-    const policy = configuredJellyfinPolicy()
-    return createTransientMedia({
-      providerId: 'jellyfin',
-      publicOrigin,
-      externalIdPattern: JELLYFIN_ITEM_ID_PATTERN,
-      validateUrl: (value, current) =>
-        policy?.validateUrl(value, current) ?? null,
-      isEffective: async () => await readEffective('jellyfin') === true,
-      getUpstreamHeaders: (): HeadersInit => policy
-        ? jellyfinAuthHeaders(policy.apiToken)
-        : {},
-    }, {
-      cache: preparationCache(),
-      crypto: dependencies.crypto,
-      fetch: dependencies.fetch,
-      now: dependencies.now,
-    })
-  }
-
-  const handleJellyfinResolve = async (request: Request, url: URL): Promise<Response> => {
-    const publicOrigin = configuredPublicOrigin(env.PUBLIC_ORIGIN)
-    if (
-      request.method !== 'POST' || !publicOrigin || url.origin !== publicOrigin || url.search ||
-      request.headers.get('origin') !== publicOrigin || !hasExactJsonMime(request.headers)
-    ) return json({ error: 'invalid_response' }, request.method === 'POST' ? 400 : 405)
-
-    const parsedBody = await readBoundedJson(request, MAX_RESOLVE_BODY_BYTES)
-    const externalId = parsedBody.ok
-      ? resolveExternalId(parsedBody.value, JELLYFIN_ITEM_ID_PATTERN)
-      : null
-    if (!externalId) return json({ error: 'invalid_response' }, 400)
-    if (await readEffective('jellyfin') !== true) return json({ error: 'unavailable' }, 503)
-
-    const policy = configuredJellyfinPolicy()
-    if (!policy) return json({ error: 'unavailable' }, 503)
-    const metadata = await resolveJellyfinMetadata({
-      configuredOrigin: policy.configuredOrigin,
-      apiToken: policy.apiToken,
-      userId: policy.userId,
-      externalId,
-      fetch: dependencies.fetch,
-      validateMediaUrl: (value) => policy.validateUrl(value),
-    })
-    if (!metadata.ok) {
-      const status = metadata.error === 'rate_limited'
-        ? 429
-        : metadata.error === 'timeout' ? 504 : 502
-      // The upstream status is a non-sensitive discriminator: it lets an operator tell a rejected
-      // credential from a missing user context or an absent item without ever seeing the token.
-      return json(
-        metadata.upstreamStatus !== undefined
-          ? { error: metadata.error, upstreamStatus: metadata.upstreamStatus }
-          : { error: metadata.error },
-        status,
-      )
-    }
-    const prepared = await jellyfinTransientMedia(publicOrigin).prepare({
-      externalId,
-      validatedUrl: metadata.mediaUrl,
-      mimeType: metadata.mimeType,
-    })
-    if (!prepared) return json({ error: 'unavailable' }, 503)
-
-    return json({
-      ...prepared,
-      metadata: {
-        quality: metadata.quality,
-        ...(metadata.hasArtwork && metadata.artworkId
-          ? { artworkUrl: `/api/providers/jellyfin/artwork/${metadata.artworkId}` }
-          : {}),
-      },
-    })
-  }
-
-  const handleJellyfinMedia = async (request: Request, url: URL): Promise<Response> => {
-    const publicOrigin = configuredPublicOrigin(env.PUBLIC_ORIGIN)
-    if (!publicOrigin) return json({ error: 'invalid_response' }, 400)
-    return jellyfinTransientMedia(publicOrigin).serve(request, url)
-  }
-
-  const handleJellyfinArtwork = async (request: Request, url: URL): Promise<Response> => {
-    const publicOrigin = configuredPublicOrigin(env.PUBLIC_ORIGIN)
-    if (!publicOrigin || url.origin !== publicOrigin || url.search || url.hash) {
-      return json({ error: 'invalid_response' }, 400)
-    }
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      return json({ error: 'method_not_allowed' }, 405)
-    }
-
-    const artworkPrefix = '/api/providers/jellyfin/artwork/'
-    if (!url.pathname.startsWith(artworkPrefix)) {
-      return json({ error: 'invalid_response' }, 400)
-    }
-    const rawId = url.pathname.slice(artworkPrefix.length)
-    const itemId = parseJellyfinExternalId(rawId)
-    if (!itemId) {
-      return json({ error: 'invalid_response' }, 400)
-    }
-
-    if (await readEffective('jellyfin') !== true) return json({ error: 'unavailable' }, 503)
-
-    const policy = configuredJellyfinPolicy()
-    if (!policy) return json({ error: 'unavailable' }, 503)
-
-    let upstreamArtworkUrl: URL
-    try {
-      upstreamArtworkUrl = new URL(`/Items/${itemId}/Images/Primary`, policy.configuredOrigin)
-      upstreamArtworkUrl.searchParams.set('maxWidth', String(MAX_ARTWORK_DIMENSION))
-      upstreamArtworkUrl.searchParams.set('maxHeight', String(MAX_ARTWORK_DIMENSION))
-    } catch {
-      return json({ error: 'unavailable' }, 503)
-    }
-
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), ARTWORK_TIMEOUT_MS)
-
-    try {
-      const response = await dependencies.fetch(upstreamArtworkUrl.href, {
-        method: request.method,
-        headers: {
-          accept: 'image/webp,image/jpeg,image/png,image/*',
-          ...jellyfinAuthHeaders(policy.apiToken),
-        },
-        redirect: 'manual',
-        signal: controller.signal,
-      })
-
-      if (response.status === 404) {
-        return json({ error: 'not_found' }, 404)
-      }
-      if (!response.ok) {
-        return json({ error: 'unavailable' }, response.status === 429 ? 429 : 502)
-      }
-
-      const imageMime = normaliseImageMime(response.headers.get('content-type'))
-      if (!imageMime) {
-        return json({ error: 'invalid_response' }, 502)
-      }
-
-      const contentLength = response.headers.get('content-length')
-      if (contentLength !== null) {
-        const length = Number(contentLength)
-        if (!Number.isSafeInteger(length) || length < 0 || length > MAX_ARTWORK_BYTES) {
-          return json({ error: 'invalid_response' }, 502)
-        }
-      }
-
-      const imageBytes = request.method === 'HEAD' ? null : await readArtworkBytes(response)
-      if (controller.signal.aborted) return json({ error: 'timeout' }, 504)
-      if (request.method === 'GET' && !imageBytes) return json({ error: 'invalid_response' }, 502)
-
-      const headers = new Headers({
-        'content-type': imageMime,
-        'cache-control': 'public, max-age=3600',
-        'x-content-type-options': 'nosniff',
-      })
-      if (contentLength !== null) {
-        headers.set('content-length', contentLength)
-      }
-
-      return new Response(imageBytes, {
-        status: 200,
-        headers,
-      })
-    } catch {
-      return json({ error: controller.signal.aborted ? 'timeout' : 'unavailable' }, controller.signal.aborted ? 504 : 502)
-    } finally {
-      clearTimeout(timeout)
-    }
-  }
-
   const configuredGdStudioPolicy = () => {
     const configuredOrigin = configuredGdStudioOrigin(env)
     const allowedHostnames = configuredGdStudioMediaHostnames(env)
@@ -1102,6 +943,13 @@ export function createProviderHandler(
     providerId: 'gd-studio',
     publicOrigin,
     externalIdPattern: GD_STUDIO_EXTERNAL_ID_PATTERN,
+    includeExpiry: true,
+    // GD Studio lossless / Hi-Res metadata yields a `.flac` media path, so the ticket expects
+    // `audio/flac`, yet the upstream CDN labels a genuine `fLaC` body `audio/mpeg`. Under the
+    // strict `requireMimeMatch` default that expected/declared mismatch would refuse a valid
+    // asset. Reconciling from the leading bytes serves the container actually found; a non-audio
+    // or unrecognisable body is still refused, so the guard stays meaningful.
+    reconcileMislabelledAudioTypes: true,
     validateUrl: (value, current) =>
       configuredGdStudioPolicy()?.validateUrl(value, current) ?? null,
     isEffective: async () => await readEffective('gd-studio') === true,
@@ -1240,6 +1088,15 @@ export function createProviderHandler(
   const fetchHandler = async (request: Request): Promise<Response> => {
     const url = new URL(request.url)
     if (url.pathname === '/api/providers/config') return handleConfig(request)
+    if (url.pathname.startsWith('/api/providers/lx/artwork/') || url.pathname.startsWith('/api/providers/gd-studio/artwork/')) {
+      const providerId = url.pathname.startsWith('/api/providers/lx/') ? 'lx' : 'gd-studio'
+      return createNeteaseArtworkHandler({
+        providerId,
+        publicOrigin: configuredPublicOrigin(env.PUBLIC_ORIGIN),
+        isEnabled: async () => await readEffective(providerId) === true,
+        fetch: dependencies.fetch,
+      })(request)
+    }
     if (url.pathname === '/api/providers/chksz/discover') return handleChkszDiscover(request, url)
     if (url.pathname === '/api/providers/chksz/resolve') return handleChkszResolve(request, url)
     if (url.pathname.startsWith('/api/providers/chksz/media/')) return handleChkszMedia(request, url)
@@ -1259,15 +1116,6 @@ export function createProviderHandler(
     }
     if (url.pathname.startsWith('/api/providers/invidious/media/')) {
       return handleAudioResolverMedia('invidious', request, url)
-    }
-    if (url.pathname === '/api/providers/jellyfin/resolve') {
-      return handleJellyfinResolve(request, url)
-    }
-    if (url.pathname.startsWith('/api/providers/jellyfin/media/')) {
-      return handleJellyfinMedia(request, url)
-    }
-    if (url.pathname.startsWith('/api/providers/jellyfin/artwork/')) {
-      return handleJellyfinArtwork(request, url)
     }
     if (url.pathname === '/api/providers/gd-studio/resolve') {
       return handleGdStudioResolve(request, url)

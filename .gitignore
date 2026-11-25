@@ -16,3 +16,9 @@ public/pwa-icon-192.png
 public/pwa-icon-512.png
 wrangler.remote.toml
 wrangler.staging.toml
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+vite.config.ts.timestamp-*.mjs
+.vercel/

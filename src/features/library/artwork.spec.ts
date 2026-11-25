@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { effectScope, type EffectScope } from 'vue'
+import { flushPromises } from '@vue/test-utils'
+import { artworkBlob, mockValidatedArtwork } from '../../test/artworkLeaseFixture'
 import type { Track } from '../catalog/types'
 import {
   clearArtworkCache,
   fetchChkszArtwork,
-  getJellyfinArtworkUrl,
   isValidArtworkUrl,
   placeholderArtwork,
   resolveChkszArtwork,
@@ -94,13 +96,21 @@ describe('placeholderArtwork', () => {
 })
 
 describe('isValidArtworkUrl', () => {
+  it('accepts existing same-origin LX and GD artwork routes for canonical NetEase bindings',()=>{
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/2155423468')).toBe(true)
+    expect(isValidArtworkUrl('/api/providers/gd-studio/artwork/2155423468')).toBe(true)
+    expect(isValidArtworkUrl('https://evil.example/api/providers/lx/artwork/2155423468')).toBe(false)
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/2155423468?url=https://evil.example')).toBe(false)
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/not-a-number')).toBe(false)
+    expect(isValidArtworkUrl('/api/providers/lx/artwork/123456789012345678901')).toBe(false)
+  })
   it('accepts safe relative provider artwork URLs', () => {
     expect(
       isValidArtworkUrl('/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fcover.jpg'),
     ).toBe(true)
     expect(
       isValidArtworkUrl('/api/providers/jellyfin/artwork/6213b704a0d954293110f4d561b0f614'),
-    ).toBe(true)
+    ).toBe(false)
   })
 
   it('rejects external or unapproved endpoints', () => {
@@ -111,198 +121,131 @@ describe('isValidArtworkUrl', () => {
   })
 })
 
-describe('getJellyfinArtworkUrl', () => {
-  it('constructs correct encoded URL for Jellyfin item artwork', () => {
-    expect(getJellyfinArtworkUrl('item/123')).toBe('/api/providers/jellyfin/artwork/item%2F123')
-  })
-})
-
 describe('Artwork resolution & useArtwork composable', () => {
-  beforeEach(() => {
-    clearArtworkCache()
-    vi.restoreAllMocks()
+  let cache: ReturnType<typeof mockValidatedArtwork>
+  const scopes: EffectScope[] = []
+  const artwork = (...args: Parameters<typeof useArtwork>) => {
+    const scope = effectScope(); scopes.push(scope)
+    return scope.run(() => useArtwork(...args))!
+  }
+  beforeEach(() => { clearArtworkCache(); vi.restoreAllMocks(); cache = mockValidatedArtwork() })
+  afterEach(async () => {
+    for (const scope of scopes.splice(0)) scope.stop()
+    await flushPromises(); clearArtworkCache(); vi.restoreAllMocks()
+  })
+  const legacy = '/api/providers/chksz/artwork?url=' + encodeURIComponent('https://p1.music.126.net/cover.jpg')
+  const lx = '/api/providers/lx/artwork/2155423468', gd = '/api/providers/gd-studio/artwork/2155423468'
+  const canonical = { ...trackWithJellyfin, sources: [
+    { provider: 'jellyfin', externalId: 'retired-item' }, { provider: 'chksz', externalId: '2155423468' },
+  ] }
+
+  it('skips retired Jellyfin artwork and preserves the LX to GD cover fallback', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const art = artwork('album:retired-jellyfin', canonical)
+    await flushPromises(); expect(art.artworkUrl.value).toBe(artworkBlob(lx))
+    art.onError(); await flushPromises()
+    expect(cache.invalidate).toHaveBeenCalledWith(lx)
+    expect(art.artworkUrl.value).toBe(artworkBlob(gd)); expect(art.sourceUrl.value).toBe(gd)
+    expect(art.isLoaded.value).toBe(true); expect(fetchSpy).not.toHaveBeenCalled()
+    expect(cache.acquire.mock.calls.every(([url]) => !url.includes('jellyfin'))).toBe(true)
   })
 
-  afterEach(() => {
-    clearArtworkCache()
-    vi.restoreAllMocks()
+  it('uses a placeholder for a Jellyfin-only historical binding without resolving audio', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const art = artwork('album:retired-only', { ...trackWithJellyfin, sources: [{ provider: 'jellyfin', externalId: 'retired-item' }] })
+    expect(art.artworkUrl.value).toBeUndefined(); expect(art.hasFailed.value).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled(); expect(cache.acquire).not.toHaveBeenCalled()
   })
 
-  it('starts with Jellyfin candidate when track has Jellyfin source', () => {
-    const { artworkUrl, isLoaded, hasFailed, onLoad } = useArtwork('album:Album One', trackWithJellyfin)
-
-    expect(artworkUrl.value).toBe('/api/providers/jellyfin/artwork/jf-item-123')
-    expect(isLoaded.value).toBe(false)
-    expect(hasFailed.value).toBe(false)
-
-    // Simulating successful image load
-    onLoad()
-    expect(isLoaded.value).toBe(true)
-    expect(hasFailed.value).toBe(false)
+  it('uses key-free artwork routes despite a historical Jellyfin binding without resolving audio', async () => {
+    cache.rejected.add(lx)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const art = artwork('album:canonical', canonical); await flushPromises()
+    expect(art.artworkUrl.value).toBe(artworkBlob(gd)); expect(art.isLoaded.value).toBe(true)
+    const cached = artwork('album:canonical', canonical); await flushPromises()
+    expect(cached.artworkUrl.value).toBe(art.artworkUrl.value); expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('falls back to ChKSz when Jellyfin candidate errors', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          metadata: {
-            artworkUrl: '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fcover.jpg',
-          },
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    )
-
-    const { artworkUrl, hasFailed, onError, onLoad, isLoaded } = useArtwork(
-      'album:Album One',
-      trackWithJellyfin,
-    )
-
-    expect(artworkUrl.value).toBe('/api/providers/jellyfin/artwork/jf-item-123')
-
-    // Simulate Jellyfin image load error (e.g. 404 from upstream Jellyfin item)
-    onError()
-
-    // Wait for async ChKSz resolve
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    expect(fetchSpy).toHaveBeenCalledWith(
-      '/api/providers/chksz/resolve',
-      expect.objectContaining({
-        method: 'POST',
-        body: JSON.stringify({ externalId: 'chksz-123', level: 'standard' }),
-      }),
-    )
-
-    expect(artworkUrl.value).toBe(
-      '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fcover.jpg',
-    )
-    expect(hasFailed.value).toBe(false)
-
-    // Simulate successful ChKSz image load
-    onLoad()
-    expect(isLoaded.value).toBe(true)
+  it('resolves canonical NetEase and standalone GD bindings without an Owner ChKSz key', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const netease = artwork('album:netease', { ...trackWithChkszOnly, sources: [{ provider: 'chksz', externalId: '2155423468' }] })
+    const studio = artwork('album:gd', { ...trackWithChkszOnly, sources: [{ provider: 'gd-studio', externalId: 'netease:2155423468:999' }] })
+    await flushPromises()
+    expect(netease.artworkUrl.value).toBe(artworkBlob(lx)); expect(studio.artworkUrl.value).toBe(artworkBlob(gd))
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('marks failed and cleans up if both Jellyfin and ChKSz fail', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: 'unavailable' }), {
-        status: 502,
-        headers: { 'content-type': 'application/json' },
-      }),
-    )
+  it('evicts a failed cached GD image before trying the remaining legacy fallback', async () => {
+    cache.rejected.add(lx)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ metadata: { artworkUrl: legacy } }))
+    const first = artwork('album:cached-gd', canonical); await flushPromises()
+    expect(first.artworkUrl.value).toBe(artworkBlob(gd))
+    first.onError(); await flushPromises()
+    expect(cache.invalidate).toHaveBeenCalledWith(gd)
+    expect(fetchSpy).toHaveBeenCalledOnce(); expect(first.artworkUrl.value).toBe(artworkBlob(legacy))
+  })
 
-    const { artworkUrl, hasFailed, onError } = useArtwork('album:Album One', trackWithJellyfin)
-    expect(artworkUrl.value).toBe('/api/providers/jellyfin/artwork/jf-item-123')
+  it('resolves a legacy ChKSz binding without requesting retired Jellyfin artwork', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ metadata: { artworkUrl: legacy } }))
+    const art = artwork('album:Album One', trackWithJellyfin)
+    expect(art.artworkUrl.value).toBeUndefined(); await flushPromises()
+    expect(fetchSpy).toHaveBeenCalledWith('/api/providers/chksz/resolve', expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ externalId: 'chksz-123', level: 'standard' }),
+    }))
+    expect(art.artworkUrl.value).toBe(artworkBlob(legacy)); expect(art.sourceUrl.value).toBe(legacy)
+    expect(art.hasFailed.value).toBe(false); expect(art.isLoaded.value).toBe(true)
+  })
 
-    // Trigger error on Jellyfin
-    onError()
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    expect(hasFailed.value).toBe(true)
-    expect(artworkUrl.value).toBeUndefined()
+  it('marks failed when the remaining legacy ChKSz artwork fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ error: 'unavailable' }, { status: 502 }))
+    const art = artwork('album:Album One', trackWithJellyfin); await flushPromises()
+    expect(art.hasFailed.value).toBe(true); expect(art.artworkUrl.value).toBeUndefined()
   })
 
   it('resolves ChKSz immediately when track has no Jellyfin source', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          metadata: {
-            artworkUrl: '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Ftrack2.jpg',
-          },
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    )
-
-    const { artworkUrl, hasFailed } = useArtwork('album:Album Two', trackWithChkszOnly)
-
-    // While resolving
-    expect(artworkUrl.value).toBeUndefined()
-
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    expect(artworkUrl.value).toBe(
-      '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Ftrack2.jpg',
-    )
-    expect(hasFailed.value).toBe(false)
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ metadata: { artworkUrl: legacy } }))
+    const art = artwork('album:Album Two', trackWithChkszOnly)
+    expect(art.artworkUrl.value).toBeUndefined(); await flushPromises()
+    expect(art.artworkUrl.value).toBe(artworkBlob(legacy)); expect(art.hasFailed.value).toBe(false)
   })
 
   it('marks failed immediately with zero network requests when track has no supported artwork sources', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
-
-    const { artworkUrl, hasFailed } = useArtwork('track:track-3', trackWithNoArtworkSources)
-
-    expect(artworkUrl.value).toBeUndefined()
-    expect(hasFailed.value).toBe(true)
-    expect(fetchSpy).not.toHaveBeenCalled()
+    const art = artwork('track:track-3', trackWithNoArtworkSources)
+    expect(art.artworkUrl.value).toBeUndefined(); expect(art.hasFailed.value).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled(); expect(cache.acquire).not.toHaveBeenCalled()
   })
 
   it('memoises and shares artwork at album level', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          metadata: {
-            artworkUrl: '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fshared.jpg',
-          },
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    )
-
-    // Album card resolves first
-    const album: AlbumEntry = {
-      id: 'hsr:Album Two',
-      title: 'Album Two',
-      game: 'hsr',
-      trackIds: ['track-2'],
-      trackCount: 1,
-      representativeTrack: trackWithChkszOnly,
-    }
-
-    const cardArtwork = useAlbumArtwork(album)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    expect(cardArtwork.artworkUrl.value).toBe(
-      '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fshared.jpg',
-    )
-    cardArtwork.onLoad()
-
-    // TrackRow in the same album opens later
-    const rowArtwork = useArtwork('album:Album Two', trackWithChkszOnly)
-
-    // It immediately reads from cache without any additional network call
-    expect(rowArtwork.artworkUrl.value).toBe(
-      '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fshared.jpg',
-    )
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ metadata: { artworkUrl: legacy } }))
+    const album: AlbumEntry = { id: 'hsr:Album Two', title: 'Album Two', game: 'hsr', trackIds: ['track-2'],
+      trackCount: 1, representativeTrack: trackWithChkszOnly }
+    const scope = effectScope(); scopes.push(scope)
+    const card = scope.run(() => useAlbumArtwork(album))!; await flushPromises()
+    expect(card.artworkUrl.value).toBe(artworkBlob(legacy))
+    const row = artwork('album:hsr:Album Two', trackWithChkszOnly); await flushPromises()
+    expect(row.artworkUrl.value).toBe(card.artworkUrl.value); expect(fetchSpy).toHaveBeenCalledOnce()
   })
 
   it('deduplicates concurrent in-flight ChKSz resolves for the same key', async () => {
-    let resolveNetwork!: (value: Response) => void
-    const networkPromise = new Promise<Response>((r) => {
-      resolveNetwork = r
-    })
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockReturnValue(networkPromise)
+    let finish!: (value: Response) => void
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockReturnValue(new Promise(resolve => { finish = resolve }))
+    const first = resolveChkszArtwork('album:Shared', 'chksz-123'), second = resolveChkszArtwork('album:Shared', 'chksz-123')
+    await Promise.resolve(); expect(fetchSpy).toHaveBeenCalledOnce()
+    finish(Response.json({ metadata: { artworkUrl: legacy } }))
+    expect(await first).toBe(legacy); expect(await second).toBe(legacy)
+  })
 
-    const p1 = resolveChkszArtwork('album:Shared', 'chksz-123')
-    const p2 = resolveChkszArtwork('album:Shared', 'chksz-123')
-
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
-
-    resolveNetwork(
-      new Response(
-        JSON.stringify({
-          metadata: {
-            artworkUrl: '/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fdedup.jpg',
-          },
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      ),
-    )
-
-    const [r1, r2] = await Promise.all([p1, p2])
-    expect(r1).toBe('/api/providers/chksz/artwork?url=https%3A%2F%2Fp1.music.126.net%2Fdedup.jpg')
-    expect(r2).toBe(r1)
+  it('uses validated acquisition without Image.decode and rejects arbitrary external candidates', async () => {
+    const original = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'decode')
+    Reflect.deleteProperty(HTMLImageElement.prototype, 'decode')
+    try {
+      const art = artwork('without-decode', canonical); await flushPromises()
+      expect(art.artworkUrl.value).toBe(artworkBlob(lx)); expect(art.isLoaded.value).toBe(true)
+      const calls = cache.acquire.mock.calls.length
+      const rejected = artwork('external', trackWithNoArtworkSources, { candidates: ['https://evil.invalid/image.png'] })
+      await flushPromises(); expect(rejected.artworkUrl.value).toBeUndefined(); expect(rejected.hasFailed.value).toBe(true)
+      expect(cache.acquire).toHaveBeenCalledTimes(calls)
+    } finally { if (original) Object.defineProperty(HTMLImageElement.prototype, 'decode', original) }
   })
 })

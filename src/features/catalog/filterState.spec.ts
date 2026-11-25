@@ -620,3 +620,247 @@ describe('obsolete URL query parameters', () => {
     expect(state.filteredTracks.value.map(({ id }) => id)).toEqual(['dawn', 'express', 'sixth'])
   })
 })
+
+describe('virtual vocal mode filtering and persistence', () => {
+  const mixedVocalTracks: Track[] = [
+    {
+      id: 'genshin-vocal',
+      title: 'Devastation and Redemption',
+      aliases: { 'zh-Hans': ['神女劈观'] },
+      games: ['genshin'],
+      relationIds: ['character:yun-jin'],
+      tabs: ['focus'],
+      workGroupId: 'work-devastation',
+      vocalStatus: 'vocal',
+      needsClassification: false,
+      sources: [{ provider: 'gd', externalId: 'vocal-1' }],
+    },
+    {
+      id: 'hsr-vocal',
+      title: 'Wildfire',
+      aliases: { 'zh-Hans': ['野火'] },
+      games: ['hsr'],
+      relationIds: ['faction:belobog'],
+      tabs: ['chill'],
+      workGroupId: 'work-wildfire',
+      vocalStatus: 'vocal',
+      needsClassification: false,
+      sources: [{ provider: 'lx', externalId: 'vocal-2' }],
+    },
+    {
+      id: 'zzz-vocal',
+      title: 'Zenless Vocal Theme',
+      aliases: { en: ['B-side Song'] },
+      games: ['zzz'],
+      relationIds: ['place:new-eridu'],
+      tabs: ['sleep'],
+      workGroupId: 'work-zzz-vocal',
+      vocalStatus: 'vocal',
+      needsClassification: false,
+      sources: [{ provider: 'chksz', externalId: 'vocal-3' }],
+    },
+    {
+      id: 'uncertain-track',
+      title: 'Uncertain Track With Choir',
+      aliases: {},
+      games: ['genshin', 'hsr'],
+      relationIds: ['place:mondstadt'],
+      tabs: ['focus', 'sleep'],
+      workGroupId: 'work-uncertain',
+      vocalStatus: 'uncertain',
+      needsClassification: false,
+      sources: [{ provider: 'chksz', externalId: 'unc-1' }],
+    },
+    {
+      id: 'instrumental-track',
+      title: 'Pure Instrumental BGM',
+      aliases: {},
+      games: ['zzz'],
+      relationIds: ['place:new-eridu'],
+      tabs: ['focus'],
+      workGroupId: 'work-inst',
+      vocalStatus: 'instrumental',
+      needsClassification: false,
+      sources: [{ provider: 'gd', externalId: 'inst-1' }],
+    },
+  ]
+
+  it('filters catalogue to display exclusively tracks with vocalStatus === vocal', () => {
+    const storage = memoryStorage()
+    const state = createCatalogFilterState(mixedVocalTracks, storage)
+
+    state.setMode('vocal')
+    expect(state.mode.value).toBe('vocal')
+
+    const trackIds = state.filteredTracks.value.map((t) => t.id)
+    expect(trackIds).toEqual(['genshin-vocal', 'hsr-vocal', 'zzz-vocal'])
+    expect(trackIds).not.toContain('uncertain-track')
+    expect(trackIds).not.toContain('instrumental-track')
+  })
+
+  it('excludes tracks with vocalStatus === uncertain or instrumental from vocal tab', () => {
+    const state = createCatalogFilterState(mixedVocalTracks, memoryStorage())
+    state.setMode('vocal')
+
+    const vocalTracks = state.filteredTracks.value
+    for (const track of vocalTracks) {
+      expect(track.vocalStatus).toBe('vocal')
+      expect(track.vocalStatus).not.toBe('uncertain')
+      expect(track.vocalStatus).not.toBe('instrumental')
+    }
+  })
+
+  it('functions accurately across Genshin, HSR, and ZZZ in vocal mode', () => {
+    const state = createCatalogFilterState(mixedVocalTracks, memoryStorage())
+    state.setMode('vocal')
+
+    // Filter to Genshin only (remove hsr and zzz)
+    state.toggleGame('hsr')
+    state.toggleGame('zzz')
+    expect(state.games.value).toEqual(['genshin'])
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['genshin-vocal'])
+
+    // Switch to HSR only: add hsr, then remove genshin
+    state.toggleGame('hsr')
+    state.toggleGame('genshin')
+    expect(state.games.value).toEqual(['hsr'])
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['hsr-vocal'])
+
+    // Switch to ZZZ only: add zzz, then remove hsr
+    state.toggleGame('zzz')
+    state.toggleGame('hsr')
+    expect(state.games.value).toEqual(['zzz'])
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['zzz-vocal'])
+  })
+
+  it('combines vocal mode with search and relation filters', () => {
+    const state = createCatalogFilterState(mixedVocalTracks, memoryStorage())
+    state.setMode('vocal')
+
+    state.setSearch('神女劈观')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['genshin-vocal'])
+
+    state.setSearch('')
+    state.toggleRelation('faction:belobog')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['hsr-vocal'])
+  })
+
+  it('handles empty results gracefully when no vocal tracks match filters', () => {
+    const state = createCatalogFilterState(mixedVocalTracks, memoryStorage())
+    state.setMode('vocal')
+    state.setSearch('nonexistent-query-string')
+
+    expect(state.filteredTracks.value).toEqual([])
+  })
+
+  it('maintains tabs arrays unmodified (vocal operates as virtual filter)', () => {
+    const state = createCatalogFilterState(mixedVocalTracks, memoryStorage())
+    state.setMode('vocal')
+
+    for (const track of mixedVocalTracks) {
+      expect((track.tabs as string[])).not.toContain('vocal')
+      expect(track.tabs.every((tab) => ['sleep', 'focus', 'chill'].includes(tab))).toBe(true)
+    }
+  })
+
+  it('seamlessly transitions between vocal, other modes, and all (null)', () => {
+    const state = createCatalogFilterState(mixedVocalTracks, memoryStorage())
+
+    // Initial state: all modes (null)
+    expect(state.mode.value).toBeNull()
+    expect(state.filteredTracks.value).toHaveLength(5)
+
+    // Switch to vocal
+    state.setMode('vocal')
+    expect(state.mode.value).toBe('vocal')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['genshin-vocal', 'hsr-vocal', 'zzz-vocal'])
+
+    // Switch to focus (returns both vocal and non-vocal focus tracks)
+    state.setMode('focus')
+    expect(state.mode.value).toBe('focus')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['genshin-vocal', 'uncertain-track', 'instrumental-track'])
+
+    // Switch to chill
+    state.setMode('chill')
+    expect(state.mode.value).toBe('chill')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['hsr-vocal'])
+
+    // Switch back to vocal
+    state.setMode('vocal')
+    expect(state.mode.value).toBe('vocal')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['genshin-vocal', 'hsr-vocal', 'zzz-vocal'])
+
+    // Clear mode
+    state.setMode(null)
+    expect(state.mode.value).toBeNull()
+    expect(state.filteredTracks.value).toHaveLength(5)
+  })
+
+  it('persists mode: vocal to localStorage and hydrates accurately on reload', () => {
+    const storage = memoryStorage()
+    const firstState = createCatalogFilterState(mixedVocalTracks, storage)
+
+    firstState.setMode('vocal')
+    expect(firstState.mode.value).toBe('vocal')
+
+    const savedRaw = storage.getItem(V2_KEY)
+    expect(savedRaw).not.toBeNull()
+    const saved = JSON.parse(savedRaw!)
+    expect(saved.mode).toBe('vocal')
+
+    // Hydrate new state instance from the same storage
+    const reloadedState = createCatalogFilterState(mixedVocalTracks, storage)
+    expect(reloadedState.mode.value).toBe('vocal')
+    expect(reloadedState.filteredTracks.value.map((t) => t.id)).toEqual(['genshin-vocal', 'hsr-vocal', 'zzz-vocal'])
+  })
+
+  it('preserves backward compatibility when hydrating existing snapshots with standard modes', () => {
+    for (const mode of ['focus', 'sleep', 'chill', null] as const) {
+      const storage = memoryStorage(JSON.stringify(completeSnapshot({ mode })))
+      const state = createCatalogFilterState(tracks, storage)
+      expect(state.mode.value).toBe(mode)
+    }
+  })
+
+  it('preserves backward compatibility when migrating retired v2 snapshots', () => {
+    const storage = memoryStorage(JSON.stringify(retiredSnapshot({ mode: 'focus' })), V2_KEY)
+    const state = createCatalogFilterState(tracks, storage)
+    expect(state.mode.value).toBe('focus')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual(['dawn'])
+  })
+
+  it('preserves mode: vocal across replaceTracks', () => {
+    const storage = memoryStorage()
+    const state = createCatalogFilterState(mixedVocalTracks, storage)
+    state.setMode('vocal')
+
+    const newTrack: Track = {
+      id: 'genshin-vocal-2',
+      title: 'Lover\'s Oath',
+      aliases: {},
+      games: ['genshin'],
+      relationIds: [],
+      tabs: ['chill'],
+      workGroupId: 'work-lovers-oath',
+      vocalStatus: 'vocal',
+      needsClassification: false,
+      sources: [{ provider: 'gd', externalId: 'vocal-4' }],
+    }
+
+    state.replaceTracks([...mixedVocalTracks, newTrack])
+    expect(state.mode.value).toBe('vocal')
+    expect(state.filteredTracks.value.map((t) => t.id)).toEqual([
+      'genshin-vocal',
+      'hsr-vocal',
+      'zzz-vocal',
+      'genshin-vocal-2',
+    ])
+  })
+
+  it('fails closed and defaults mode to null when stored snapshot has invalid mode', () => {
+    const invalidStorage = memoryStorage(JSON.stringify(completeSnapshot({ mode: 'invalid-mode' })))
+    const state = createCatalogFilterState(mixedVocalTracks, invalidStorage)
+    expect(state.mode.value).toBeNull()
+    expect(state.filteredTracks.value).toHaveLength(5)
+  })
+})

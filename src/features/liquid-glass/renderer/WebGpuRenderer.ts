@@ -106,15 +106,20 @@ export class WebGpuRenderer implements GlassRenderer {
     private readonly uniformBuffer: GpuBufferLike,
   ) {}
 
-  static async create(canvas: HTMLCanvasElement): Promise<WebGpuRenderer> {
+  static async create(canvas: HTMLCanvasElement, signal?: AbortSignal): Promise<WebGpuRenderer> {
+    signal?.throwIfAborted()
     const gpu = gpuApi()
     const adapter = await gpu.requestAdapter()
+    signal?.throwIfAborted()
     if (!adapter) throw new Error('WebGPU adapter request returned no adapter')
 
     const device = await adapter.requestDevice()
     let context: GpuCanvasContextLike | null = null
     let uniformBuffer: GpuBufferLike | null = null
     try {
+      // requestDevice itself is not cancellable. Release a late device before
+      // constructing a context, pipeline or buffers for an unmounted owner.
+      signal?.throwIfAborted()
       context = (canvas.getContext as (contextId: string) => unknown)('webgpu') as
         | GpuCanvasContextLike
         | null

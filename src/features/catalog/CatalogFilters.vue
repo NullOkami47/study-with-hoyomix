@@ -11,7 +11,12 @@ const emit = defineEmits<{ (event: 'filtered', tracks: Track[]): void }>()
 const { locale } = usePreferences()
 const text = (key: TranslationKey): string => translate(locale.value, key)
 const gameKey: Record<GameId, TranslationKey> = { genshin: 'game.genshin', hsr: 'game.hsr', zzz: 'game.zzz' }
-const tabKey: Record<TabId, TranslationKey> = { sleep: 'tab.sleep', focus: 'tab.focus', chill: 'tab.chill' }
+const tabKey: Record<TabId | 'vocal', TranslationKey> = {
+  sleep: 'tab.sleep',
+  focus: 'tab.focus',
+  chill: 'tab.chill',
+  vocal: 'tab.vocal',
+}
 const relationKey: Record<RelationKind, TranslationKey> = {
   place: 'relation.place',
   character: 'relation.character',
@@ -84,7 +89,7 @@ watch(state.filteredTracks, (value) => emit('filtered', value), { immediate: tru
       <div class="catalog-filters__choices">
         <button type="button" :aria-pressed="state.mode.value === null" data-filter-tab="all" @click="state.setMode(null)">{{ text('catalog.allModes') }}</button>
         <button
-          v-for="tab in (['sleep', 'focus', 'chill'] as TabId[])"
+          v-for="tab in (['sleep', 'focus', 'chill', 'vocal'] as (TabId | 'vocal')[])"
           :key="tab"
           type="button"
           :aria-pressed="state.mode.value === tab"

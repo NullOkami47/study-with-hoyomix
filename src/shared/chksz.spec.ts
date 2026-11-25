@@ -524,3 +524,4 @@ describe('createChkszArtworkProxyUrl', () => {
     expect(createChkszArtworkProxyUrl('not a url')).toBeNull()
   })
 })
+

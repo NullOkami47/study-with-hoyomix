@@ -74,9 +74,9 @@ export const findSession = async (
 ) => {
   if (!token) return null
   const tokenHash = await hashSessionToken(token, secret, cryptoApi)
-  return database.prepare(`
+  const row = await database.prepare(`
     SELECT sessions.id, sessions.user_id AS userId, users.display_name AS displayName,
-      users.avatar_url AS avatarUrl, users.role
+      users.avatar_url AS avatarUrl, users.role, sessions.last_seen_at AS lastSeenAt
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.token_hash = ? AND sessions.revoked_at IS NULL
@@ -87,7 +87,27 @@ export const findSession = async (
     displayName: string
     avatarUrl: string | null
     role: 'user' | 'moderator' | 'admin' | 'owner'
+    lastSeenAt: number | null
   }>()
+  if (!row) return null
+  const { lastSeenAt, ...session } = row
+  if (lastSeenAt === null || now - lastSeenAt >= SESSION_LAST_SEEN_INTERVAL_MS) {
+    await touchSession(database, session.id, now)
+  }
+  return session
+}
+
+/** L-15: `sessions.last_seen_at` is refreshed at most once per hour per session (one D1 write). */
+export const SESSION_LAST_SEEN_INTERVAL_MS = 60 * 60 * 1000
+
+const touchSession = async (database: Database, sessionId: string, now: number) => {
+  try {
+    // The condition keeps concurrent requests from writing twice within the interval.
+    await database.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at <= ?)')
+      .bind(now, sessionId, now - SESSION_LAST_SEEN_INTERVAL_MS).run()
+  } catch {
+    // Recording activity is best effort; it must never turn a valid session into a failure.
+  }
 }
 
 export const revokeSession = async (database: Database, sessionId: string, now: number) => {

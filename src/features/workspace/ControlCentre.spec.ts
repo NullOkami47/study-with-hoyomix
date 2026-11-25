@@ -23,7 +23,7 @@ const cleanups: Array<() => void> = []
 const ALL_PROVIDERS_ENABLED: PublicProviderState[] = [
   { id: 'chksz', available: true, enabled: true, automaticEligible: true, priority: 10 },
   { id: 'lx', available: true, enabled: true, automaticEligible: true, priority: 20 },
-  { id: 'jellyfin', available: true, enabled: true, automaticEligible: true, priority: 30 },
+  { id: 'gd-studio', available: true, enabled: true, automaticEligible: true, priority: 40 },
 ]
 
 const tracks: Track[] = [{
@@ -311,7 +311,8 @@ describe('ControlCentre', () => {
     expect(wrapper.find('[data-control-centre-focus-chat]').exists()).toBe(false)
     await wrapper.get('[data-control-centre-open-chat]').trigger('click')
     expect(wrapper.emitted('open-chat')).toHaveLength(1)
-    expect(wrapper.findAll('[data-chat-availability]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-chat-panel]')).toHaveLength(0)
+    expect(wrapper.get('[data-control-centre-chat]').text()).toContain('A shared study lounge')
   })
 
   it('offers to focus the open chat window rather than to open a second one', async () => {

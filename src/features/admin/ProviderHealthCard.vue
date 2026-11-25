@@ -71,7 +71,7 @@ const formatRelative = (checkedAt: number | null): string =>
           :class="`provider-health__dot--${provider.status}`"
           aria-hidden="true"
         ></span>
-        <span class="provider-health__name">{{ provider.key }}</span>
+        <span class="provider-health__name">{{ provider.key === 'gd-studio' ? 'GD Studio' : provider.key }}</span>
         <span
           class="provider-health__status"
           :data-provider-status-text="provider.status"

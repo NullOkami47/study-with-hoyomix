@@ -2,8 +2,14 @@ import type { CanonicalProviderId } from './config'
 import { AUDIO_CONTAINER_MIME, mimeEssence } from './audioContainer'
 import type { AudioContainer } from './audioContainer'
 
-const TICKET_TTL_MS = 30_000
-const MAX_TICKET_BYTES = 1024
+/**
+ * A ticket must outlive the player's next-track lead window (60 s) and its preparation reuse
+ * window (100 s, `PREPARATION_VALIDITY_MS`), so a track prepared early can still be promoted.
+ * The URL stays an unguessable same-origin nonce and every request still checks `isEffective`,
+ * so disabling a provider takes effect immediately regardless of the remaining lifetime.
+ */
+export const TICKET_TTL_MS = 120_000
+const MAX_TICKET_BYTES = 2048
 const AUDIO_MIME = /^audio\/[a-z0-9!#$&^_.+-]+$/
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const NONCE_PATTERN = '[A-Za-z0-9_-]{32}'
@@ -24,6 +30,25 @@ export interface TransientMediaOptions {
    * audio types keep the strict `audio/*` requirement.
    */
   allowGenericAudioTypes?: boolean
+  /**
+   * Opt in to reconciling a *concrete but wrong* `audio/*` declaration against the leading bytes,
+   * **when, and only when** those bytes positively identify a known audio container — in which case
+   * the served type is corrected to the container actually found.
+   *
+   * Distinct from {@link allowGenericAudioTypes}: that covers an upstream that declares *no* useful
+   * type (`application/octet-stream`); this covers one that declares the *wrong* audio type. GD
+   * Studio lossless / Hi-Res metadata yields a `.flac` media path (expected `audio/flac`), but the
+   * CDN labels the HTTP response `audio/mpeg` over a genuine `fLaC` body. Under the strict
+   * `requireMimeMatch` guard the expected/declared mismatch would otherwise refuse a valid asset.
+   *
+   * Off unless a provider has been evidenced to need it. The allowance never widens `AUDIO_MIME`
+   * and never trusts a label: it is keyed entirely on identifying the bytes, so a non-audio or
+   * unrecognisable body (and, unavoidably, any request whose bytes carry no container header, such
+   * as a non-zero range or a HEAD) still keeps the strict reject.
+   */
+  reconcileMislabelledAudioTypes?: boolean
+  /** Expose the effective cached ticket deadline to clients which consume it. */
+  includeExpiry?: boolean
   getUpstreamHeaders?: (input: { externalId: string; url: URL }) => HeadersInit | Promise<HeadersInit>
 }
 
@@ -38,6 +63,8 @@ export interface PreparedMediaInput {
   externalId: string
   validatedUrl: URL
   mimeType: string
+  /** Upstream URL expiry in epoch milliseconds, when known. */
+  expiresAt?: number
 }
 
 const randomNonce = (cryptoApi: Crypto) => {
@@ -106,118 +133,136 @@ const contentRangeAnswersRequest = (
   }
 }
 
+const cancelResponse = (response: Response | undefined) => {
+  // Cancellation must not hold a failure response open if an upstream cancellation hangs.
+  void response?.body?.cancel().catch(() => { /* already closed or errored */ })
+}
+
+// Twelve bytes cover the longest supported signature (RIFF/WAVE). Empty transport chunks
+// also consume a read budget, so an upstream cannot keep prefix collection running forever.
+const MAX_AUDIO_PREFIX_BYTES = 12
+const MAX_AUDIO_PREFIX_READS = 16
+
+const identifyAudioContainer = (prefix: Uint8Array): AudioContainer => {
+  const ascii = (offset: number, length: number): string => {
+    if (prefix.length < offset + length) return ''
+    let out = ''
+    for (let i = offset; i < offset + length; i += 1) out += String.fromCharCode(prefix[i]!)
+    return out
+  }
+
+  if (ascii(0, 4) === 'fLaC') return 'flac'
+  if (ascii(0, 3) === 'ID3') return 'mp3'
+  if (ascii(0, 4) === 'OggS') return 'ogg'
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return 'wav'
+  if (ascii(4, 4) === 'ftyp') return 'm4a'
+  if (ascii(0, 4) === 'MAC ') return 'ape'
+  if (ascii(0, 4) === 'wmap') return 'wma'
+  const b0 = prefix[0]
+  const b1 = prefix[1]
+  // A bare ADTS AAC frame. Checked *before* the generic MPEG frame sync below, because the ADTS
+  // sync word is a subset of that pattern: testing the broad rule first would classify raw AAC
+  // as `mp3` and label it `audio/mpeg`. AAC is a niche container here, so the tier whose bytes
+  // this sniffer exists to recognise is unaffected — this only keeps the remaining branches
+  // honest rather than advertising a container the order made unreachable.
+  if (b0 === 0xff && (b1 === 0xf1 || b1 === 0xf9)) {
+    return 'aac'
+  }
+  // A bare MPEG-1/2/2.5 audio frame: 11 bits of frame sync.
+  if (b0 !== undefined && b1 !== undefined && b0 === 0xff && (b1 & 0xe0) === 0xe0) {
+    return 'mp3'
+  }
+
+  return 'unknown'
+}
+
 /**
- * Identify an audio container from its leading bytes, and return a response whose body still
- * contains **all** the original bytes.
- *
- * Returns the container name (never bytes or a byte sequence) plus a replacement `Response` whose
- * body is the prefix followed by the untouched remainder. Callers must use the returned response
- * body for serving; the original body is consumed by this call.
- *
- * The read is bounded to the first chunk. Streams are chained rather than buffered, so a large
- * asset is not held in memory: the prefix is replayed, then the rest is piped through.
- *
- * Recognises the containers this deployment can legitimately serve:
- * - `flac`  — `fLaC` magic
- * - `mp3`   — `ID3` tag, or a bare MPEG audio frame sync
- * - `ogg`, `wav`, `m4a`, `aac`, `ape`, `wma` — other plausible audio
- * - `unknown` — anything else, including a truncated or non-audio prefix
- *
- * A `null` container means the prefix could not be read; the response is returned unread.
+ * Inspect a bounded prefix and replay bytes only on downstream demand. Generic containers keep
+ * their 12-byte / 16-read policy and never scan the remaining media. Original chunks are retained
+ * for replay, including the final chunk's uninspected tail; its size remains controlled by the
+ * transport.
  */
 const sniffAudioContainer = async (
   response: Response,
 ): Promise<{ container: AudioContainer | null; response: Response }> => {
   if (!response.body) return { container: null, response }
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  let released = false
+  let cancelled = false
+  const release = () => {
+    if (reader && !released) {
+      released = true
+      reader.releaseLock()
+    }
+  }
+  const cancel = async (reason?: unknown) => {
+    if (released || cancelled) return
+    cancelled = true
+    // Closing the stream settles pending reads immediately. Do not wait for a remote cancel
+    // implementation that may never resolve.
+    try { void reader?.cancel(reason).catch(() => {}) } catch { /* cleanup is best effort */ }
+    finally { release() }
+  }
   try {
-    const reader = response.body.getReader()
-    const first = await reader.read()
-    if (first.done || !first.value || first.value.length === 0) {
-      try { await reader.cancel() } catch { /* ignore */ }
-      return { container: null, response }
+    reader = response.body.getReader()
+    const upstreamReader = reader
+    const prefix = new Uint8Array(MAX_AUDIO_PREFIX_BYTES)
+    const replay: Uint8Array[] = []
+    let used = 0
+    let container: AudioContainer = 'unknown'
+    for (let reads = 0; reads < MAX_AUDIO_PREFIX_READS && used < prefix.length; reads += 1) {
+      const next = await upstreamReader.read()
+      if (cancelled || next.done) break
+      if (next.value.byteLength === 0) continue
+      replay.push(next.value)
+      const copied = Math.min(next.value.byteLength, prefix.length - used)
+      prefix.set(next.value.subarray(0, copied), used)
+      used += copied
+      container = identifyAudioContainer(prefix.subarray(0, used))
+      if (container !== 'unknown') break
     }
-    const prefix = first.value
+    if (cancelled || container === 'unknown') {
+      await cancel()
+      return { container, response: new Response(null, { status: response.status }) }
+    }
 
-    // Re-attach the consumed prefix ahead of the remaining stream so nothing is lost.
-    const remainder = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        try {
-          const next = await reader.read()
-          if (next.done) controller.close()
-          else controller.enqueue(next.value)
-        } catch (error) {
-          controller.error(error)
-        }
-      },
-      cancel(reason) { return reader.cancel(reason) },
-    })
-    const replay = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(prefix)
-        controller.close()
-      },
-    })
     const restoredBody = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        const pump = async (stream: ReadableStream<Uint8Array>) => {
-          const r = stream.getReader()
-          while (true) {
-            const { done, value } = await r.read()
-            if (done) break
-            controller.enqueue(value)
-          }
-        }
+      async pull(controller) {
+        if (cancelled) return
         try {
-          await pump(replay)
-          await pump(remainder)
-          controller.close()
+          const chunk = replay.shift()
+          if (chunk) {
+            controller.enqueue(chunk)
+            return
+          }
+          const next = await upstreamReader.read()
+          // Cancellation may have resolved an in-flight read; the controller is already closed.
+          if (cancelled) return
+          if (next.done) {
+            release()
+            controller.close()
+          } else controller.enqueue(next.value)
         } catch (error) {
+          if (cancelled) return
+          await cancel(error)
           controller.error(error)
         }
       },
-    })
-    const restored = new Response(restoredBody, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    })
-
-    const ascii = (offset: number, length: number): string => {
-      if (prefix.length < offset + length) return ''
-      let out = ''
-      for (let i = offset; i < offset + length; i += 1) out += String.fromCharCode(prefix[i]!)
-      return out
+      cancel(reason) {
+        replay.length = 0
+        return cancel(reason)
+      },
+    }, { highWaterMark: 0 })
+    return {
+      container,
+      response: new Response(restoredBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }),
     }
-
-    if (ascii(0, 4) === 'fLaC') return { container: 'flac', response: restored }
-    if (ascii(0, 3) === 'ID3') return { container: 'mp3', response: restored }
-    if (ascii(0, 4) === 'OggS') return { container: 'ogg', response: restored }
-    if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return { container: 'wav', response: restored }
-    if (ascii(4, 4) === 'ftyp') return { container: 'm4a', response: restored }
-    if (ascii(0, 4) === 'MAC ') return { container: 'ape', response: restored }
-    if (ascii(0, 4) === 'wmap') return { container: 'wma', response: restored }
-    const b0 = prefix[0]
-    const b1 = prefix[1]
-    // A bare ADTS AAC frame. Checked *before* the generic MPEG frame sync below, because the ADTS
-    // sync word is a subset of that pattern: testing the broad rule first would classify raw AAC
-    // as `mp3` and label it `audio/mpeg`. AAC is a niche container here, so the tier whose bytes
-    // this sniffer exists to recognise is unaffected — this only keeps the remaining branches
-    // honest rather than advertising a container the order made unreachable.
-    if (b0 === 0xff && (b1 === 0xf1 || b1 === 0xf9)) {
-      return { container: 'aac', response: restored }
-    }
-    // A bare MPEG-1/2/2.5 audio frame: 11 bits of frame sync.
-    if (b0 !== undefined && b1 !== undefined && b0 === 0xff && (b1 & 0xe0) === 0xe0) {
-      return { container: 'mp3', response: restored }
-    }
-
-    return { container: 'unknown', response: restored }
-  } catch {
-    // Anything thrown past the point where the prefix was consumed must not be reported as "the
-    // response is fine, we just could not name it": by then the original body is partially read,
-    // so handing it back would be handing back a disturbed stream. Returning the container slot as
-    // `null` keeps the caller's reject path (a `null` container never maps to a MIME), and the
-    // response returned here is deliberately an empty one rather than the withered original.
+  } catch (error) {
+    await cancel(error)
     return { container: null, response: new Response(null, { status: response.status }) }
   }
 }
@@ -229,6 +274,7 @@ const sniffAudioContainer = async (
  * `allowGenericAudioTypes`.
  */
 const GENERIC_OCTET_MIME = 'application/octet-stream'
+const UPSTREAM_EXPIRY_MARGIN_MS = 30_000
 
 /**
  * Result of the response-header policy check.
@@ -251,40 +297,48 @@ type SafeMediaHeadersResult =
  * 2. A declared **generic** type (`application/octet-stream`) is accepted *only* when the leading
  *    bytes positively identify a known audio container, in which case the returned type is the
  *    container's real type. This is the case the CDN produces for some higher tiers.
- * 3. Anything else — a declared non-audio type, or a generic type whose bytes are not recognisable
- *    audio — is rejected.
+ * 3. Everything else is rejected.
  *
  * The allowance is deliberately keyed on **identifying the bytes**, never on loosening the
  * `audio/*` pattern. Accepting a generic type on the strength of its header alone would admit any
  * payload; requiring recognisable audio framing keeps the guard meaningful while no longer
  * refusing a valid asset over a header the CDN omitted.
  *
- * `sniff` is called at most once and only in case 2, so the common paths never read the body.
+ * `sniff` is called at most once and only in case 2; declared audio types never read the body.
  */
 const resolveAudioMime = async (
   declaredMimeType: string | undefined,
   expectedMimeType: string,
   requireMimeMatch: boolean,
   allowGenericAudio: boolean,
+  reconcileMislabelled: boolean,
   sniff: () => Promise<AudioContainer | null>,
 ): Promise<string | null> => {
+  const sniffContainerMime = async (): Promise<string | null> => {
+    const container = await sniff()
+    const corrected = container ? AUDIO_CONTAINER_MIME[container] : undefined
+    return corrected ?? null
+  }
+
   if (declaredMimeType && AUDIO_MIME.test(declaredMimeType)) {
-    if (requireMimeMatch && declaredMimeType !== expectedMimeType) return null
+    if (requireMimeMatch && declaredMimeType !== expectedMimeType) {
+      // A concrete but wrong audio label. Trust neither the declared nor the expected type: only
+      // the bytes decide, and only when they name a known container. Otherwise keep the reject.
+      return reconcileMislabelled ? await sniffContainerMime() : null
+    }
     return declaredMimeType
   }
   if (!allowGenericAudio || declaredMimeType !== GENERIC_OCTET_MIME) return null
 
-  const container = await sniff()
-  const corrected = container ? AUDIO_CONTAINER_MIME[container] : undefined
-  return corrected ?? null
+  return await sniffContainerMime()
 }
 
 /**
  * Derive the served response headers from the upstream ones.
  *
- * The MIME type is an **input**, not something decided here: `resolveAudioMime` has already
- * settled it (and rejected the response when it could not). This function owns only the
- * declared-length and range-contract policies. It deliberately takes no `expectedMimeType` /
+ * The MIME type is an **input**, not something decided here. The caller validates this contract
+ * before sniffing, then replaces only content-type with the accepted MIME. This function owns
+ * only the declared-length and range-contract policies. It deliberately takes no `expectedMimeType` /
  * `requireMimeMatch` parameters — accepting them would suggest a MIME guard lives here, and the
  * next change to this function would then be made under a false assumption.
  */
@@ -327,27 +381,84 @@ const safeMediaHeaders = (
   return { ok: true, headers }
 }
 
-const requestJson = (request: Request, body: unknown, status: number) => {
+// A closed vocabulary only: never include a URL, nonce, upstream header/body or exception.
+// The existing status and JSON envelope remain unchanged, including bodyless HEAD failures.
+type MediaFailure =
+  | 'ticket-cache-miss'
+  | 'ticket-expired'
+  | 'ticket-cache-unavailable'
+  | 'ticket-invalid'
+  | 'provider-unavailable'
+  | 'upstream-unavailable'
+  | 'upstream-status'
+  | 'upstream-redirect-rejected'
+  | 'range-contract-rejected'
+  | 'content-length-rejected'
+  | 'mime-rejected'
+
+const requestJson = (request: Request, body: unknown, status: number, failure?: MediaFailure) => {
+  const headers = new Headers({ 'cache-control': 'no-store' })
+  if (failure) headers.set('X-Hoyomix-Media-Failure', failure)
   if (request.method !== 'HEAD') return Response.json(body, {
     status,
-    headers: { 'cache-control': 'no-store' },
+    headers,
   })
+  headers.set('content-type', 'application/json')
   return new Response(null, {
     status,
-    headers: {
-      'cache-control': 'no-store',
-      'content-type': 'application/json',
-    },
+    headers,
   })
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
+interface VerifiedAudioProof {
+  mimeType: string
+  declaredMimeType: string
+  finalUrl: string
+  totalBytes: string | null
+  etag: string | null
+}
+
+const VERIFIED_AUDIO_KEYS = ['mimeType', 'declaredMimeType', 'finalUrl', 'totalBytes', 'etag'] as const
+
+const parseBoundedEtag = (value: string | null): string | null => {
+  if (value === null) return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 && trimmed.length <= 128 ? trimmed : null
+}
+
+const isValidVerifiedAudioProof = (
+  value: unknown,
+  validateUrl: TransientMediaOptions['validateUrl'],
+): value is VerifiedAudioProof => {
+  if (!isObject(value)) return false
+  const keys = Object.keys(value)
+  if (keys.length !== VERIFIED_AUDIO_KEYS.length || !VERIFIED_AUDIO_KEYS.every((k) => keys.includes(k))) {
+    return false
+  }
+  return (
+    typeof value.mimeType === 'string' &&
+    AUDIO_MIME.test(value.mimeType) &&
+    typeof value.declaredMimeType === 'string' &&
+    (AUDIO_MIME.test(value.declaredMimeType) || value.declaredMimeType === GENERIC_OCTET_MIME) &&
+    typeof value.finalUrl === 'string' &&
+    value.finalUrl.length <= 1024 &&
+    validateUrl(value.finalUrl) !== null &&
+    (value.totalBytes === null || (typeof value.totalBytes === 'string' && /^[0-9]+$/.test(value.totalBytes))) &&
+    (value.etag === null || (typeof value.etag === 'string' && value.etag.length > 0 && value.etag.length <= 128))
+  )
+}
+
 const readBoundedTicket = async (response: Response): Promise<unknown | null> => {
-  if (response.headers.get('content-type')?.toLowerCase() !== 'application/json') return null
+  if (response.headers.get('content-type')?.toLowerCase() !== 'application/json') {
+    cancelResponse(response)
+    return null
+  }
   const declaredLength = response.headers.get('content-length')
   if (declaredLength !== null && (!/^[0-9]+$/.test(declaredLength) || Number(declaredLength) > MAX_TICKET_BYTES)) {
+    cancelResponse(response)
     return null
   }
 
@@ -361,13 +472,14 @@ const readBoundedTicket = async (response: Response): Promise<unknown | null> =>
       if (done) break
       received += value.byteLength
       if (received > MAX_TICKET_BYTES) {
-        await reader.cancel()
         return null
       }
       chunks.push(value)
     }
   } catch {
     return null
+  } finally {
+    void reader.cancel().catch(() => { /* ignore */ })
   }
 
   const bytes = new Uint8Array(received)
@@ -387,13 +499,19 @@ export const createTransientMedia = (
   options: TransientMediaOptions,
   dependencies: TransientMediaDependencies,
 ) => {
-  const prepare = async (input: PreparedMediaInput): Promise<{ mimeType: string; url: string } | null> => {
+  const prepare = async (input: PreparedMediaInput): Promise<{ mimeType: string; url: string; expiresAt?: number; ttlMs?: number } | null> => {
     const canonicalUrl = options.validateUrl(input.validatedUrl.toString())
     if (
       !options.externalIdPattern.test(input.externalId) ||
       !AUDIO_MIME.test(input.mimeType) ||
       !canonicalUrl
     ) return null
+
+    const now = dependencies.now()
+    if (input.expiresAt !== undefined && !Number.isSafeInteger(input.expiresAt)) return null
+    const expiresAt = Math.min(now + TICKET_TTL_MS,
+      input.expiresAt === undefined ? Infinity : input.expiresAt - UPSTREAM_EXPIRY_MARGIN_MS)
+    if (expiresAt <= now) return null
 
     let nonce: string
     if (!dependencies.cache) return null
@@ -414,10 +532,10 @@ export const createTransientMedia = (
           nonce,
           validatedUrl: canonicalUrl.toString(),
           mimeType: input.mimeType,
-          expiresAt: dependencies.now() + TICKET_TTL_MS,
+          expiresAt,
         }), {
           headers: {
-            'cache-control': 'max-age=30',
+            'cache-control': `max-age=${Math.floor((expiresAt - now) / 1000)}`,
             'content-type': 'application/json',
           },
         }),
@@ -426,7 +544,15 @@ export const createTransientMedia = (
       return null
     }
 
-    return { mimeType: input.mimeType, url: mediaPath }
+    const issuedAt = dependencies.now()
+    const ttlMs = expiresAt - issuedAt
+    if (issuedAt < now || ttlMs <= 0 || ttlMs > TICKET_TTL_MS) return null
+
+    return {
+      mimeType: input.mimeType,
+      url: mediaPath,
+      ...(options.includeExpiry ? { expiresAt, ttlMs } : {}),
+    }
   }
 
   const mediaPath = new RegExp(
@@ -468,48 +594,53 @@ export const createTransientMedia = (
     if (options.isEffective) {
       try {
         if (!await options.isEffective()) {
-          return requestJson(request, { error: 'unavailable' }, 503)
+          return requestJson(request, { error: 'unavailable' }, 503, 'provider-unavailable')
         }
       } catch {
-        return requestJson(request, { error: 'unavailable' }, 503)
+        return requestJson(request, { error: 'unavailable' }, 503, 'provider-unavailable')
       }
     }
-    if (!dependencies.cache) return requestJson(request, { error: 'unavailable' }, 503)
+    if (!dependencies.cache) return requestJson(request, { error: 'unavailable' }, 503, 'ticket-cache-unavailable')
 
     const cacheKey = new Request(new URL(url.pathname, options.publicOrigin), { method: 'GET' })
     let cached: Response | undefined
     try {
       cached = await dependencies.cache.match(cacheKey)
     } catch {
-      return requestJson(request, { error: 'unavailable' }, 503)
+      return requestJson(request, { error: 'unavailable' }, 503, 'ticket-cache-unavailable')
     }
-    if (!cached) return requestJson(request, { error: 'preparation_expired' }, 410)
+    if (!cached) return requestJson(request, { error: 'preparation_expired' }, 410, 'ticket-cache-miss')
 
-    const ticket = await readBoundedTicket(cached)
+    const rawTicket = await readBoundedTicket(cached)
+    const ticket = isObject(rawTicket) ? rawTicket : null
+    const ticketKeys = ticket ? Object.keys(ticket) : []
+    const hasVerifiedAudio = ticket !== null && ticketKeys.length === 7 && 'verifiedAudio' in ticket
     if (
-      !isObject(ticket) || Object.keys(ticket).length !== 6 ||
+      !ticket ||
+      (ticketKeys.length !== 6 && !hasVerifiedAudio) ||
       ticket.providerId !== options.providerId || ticket.externalId !== externalId ||
       typeof ticket.nonce !== 'string' || ticket.nonce !== nonce ||
       typeof ticket.validatedUrl !== 'string' || typeof ticket.mimeType !== 'string' ||
       !AUDIO_MIME.test(ticket.mimeType) ||
-      typeof ticket.expiresAt !== 'number' || !Number.isSafeInteger(ticket.expiresAt)
-    ) return requestJson(request, { error: 'invalid_response' }, 502)
+      typeof ticket.expiresAt !== 'number' || !Number.isSafeInteger(ticket.expiresAt) ||
+      (hasVerifiedAudio && !isValidVerifiedAudioProof(ticket.verifiedAudio, options.validateUrl))
+    ) return requestJson(request, { error: 'invalid_response' }, 502, 'ticket-invalid')
     const remainingTtl = ticket.expiresAt - dependencies.now()
     if (remainingTtl <= 0) {
-      return requestJson(request, { error: 'preparation_expired' }, 410)
+      return requestJson(request, { error: 'preparation_expired' }, 410, 'ticket-expired')
     }
     if (remainingTtl > TICKET_TTL_MS) {
-      return requestJson(request, { error: 'invalid_response' }, 502)
+      return requestJson(request, { error: 'invalid_response' }, 502, 'ticket-invalid')
     }
 
     const initialUrl = options.validateUrl(ticket.validatedUrl)
-    if (!initialUrl) return requestJson(request, { error: 'invalid_response' }, 502)
+    if (!initialUrl) return requestJson(request, { error: 'invalid_response' }, 502, 'ticket-invalid')
     let currentUrl: URL = initialUrl
 
     const range = request.headers.get('range')
     const requestedRange = range === null ? null : parseRequestedRange(range)
     if (range !== null && !requestedRange) {
-      return requestJson(request, { error: 'invalid_response' }, 400)
+      return requestJson(request, { error: 'invalid_response' }, 400, 'range-contract-rejected')
     }
     const upstreamHeaders = new Headers()
     if (range !== null) upstreamHeaders.set('range', range)
@@ -532,6 +663,9 @@ export const createTransientMedia = (
     let redirectsFollowed = 0
     let upstream: Response
     while (true) {
+      if (ticket.expiresAt <= dependencies.now()) {
+        return requestJson(request, { error: 'preparation_expired' }, 410, 'ticket-expired')
+      }
       try {
         upstream = await dependencies.fetch(currentUrl, {
           headers: upstreamHeaders,
@@ -539,54 +673,132 @@ export const createTransientMedia = (
           redirect: 'manual',
         })
       } catch {
-        return requestJson(request, { error: 'unavailable' }, 502)
+        return requestJson(request, { error: 'unavailable' }, 502, 'upstream-unavailable')
       }
 
       if (!REDIRECT_STATUSES.has(upstream.status)) break
+      cancelResponse(upstream)
       if (redirectsFollowed >= 2) {
-        return requestJson(request, { error: 'invalid_response' }, 502)
+        return requestJson(request, { error: 'invalid_response' }, 502, 'upstream-redirect-rejected')
       }
       const location = upstream.headers.get('location')
       const redirectedUrl: URL | null = location
         ? options.validateUrl(location, currentUrl)
         : null
-      if (!redirectedUrl) return requestJson(request, { error: 'invalid_response' }, 502)
+      if (!redirectedUrl) return requestJson(request, { error: 'invalid_response' }, 502, 'upstream-redirect-rejected')
       currentUrl = redirectedUrl
       redirectsFollowed += 1
     }
 
-    if (upstream.status !== 200 && upstream.status !== 206) {
-      return requestJson(request, { error: 'invalid_response' }, 502)
-    }
-    // Resolve the effective audio type. A generic declaration is only trusted when the leading
-    // bytes identify a known container; the sniffer runs at most once and only in that case, and
-    // returns a response whose body still carries every original byte.
-    const declaredMimeType = mimeEssence(upstream.headers.get('content-type'))
     let servableResponse = upstream
-    const resolvedMimeType = await resolveAudioMime(
+    const reject = (failure: MediaFailure) => {
+      cancelResponse(servableResponse)
+      const expired = failure === 'ticket-expired'
+      return requestJson(request,
+        { error: expired ? 'preparation_expired' : 'invalid_response' }, expired ? 410 : 502, failure)
+    }
+    if (ticket.expiresAt <= dependencies.now()) return reject('ticket-expired')
+    if (upstream.status !== 200 && upstream.status !== 206) return reject('upstream-status')
+
+    // Check the actual range before interpreting any bytes, including suffix ranges and servers
+    // ignoring Range with a full 200. Only responses starting at zero can identify their container.
+    const headerResult = safeMediaHeaders(upstream.headers, upstream.status, requestedRange, ticket.mimeType)
+    if (!headerResult.ok) return reject(headerResult.reason === 'range_contract_rejected'
+      ? 'range-contract-rejected' : 'content-length-rejected')
+    const declaredMimeType = mimeEssence(upstream.headers.get('content-type'))
+    const servedRange = parseContentRange(upstream.headers.get('content-range') ?? '')
+    let sniffedContainerMime: string | null = null
+    let resolvedMimeType = await resolveAudioMime(
       declaredMimeType,
       ticket.mimeType,
       options.requireMimeMatch !== false,
       options.allowGenericAudioTypes === true,
+      options.reconcileMislabelledAudioTypes === true,
       async () => {
+        if (request.method === 'HEAD' || (servedRange && servedRange.start !== 0n)) return null
         const sniffed = await sniffAudioContainer(upstream)
         servableResponse = sniffed.response
+        if (sniffed.container) {
+          sniffedContainerMime = AUDIO_CONTAINER_MIME[sniffed.container] ?? null
+        }
         return sniffed.container
       },
     )
-    if (resolvedMimeType === null) {
-      return requestJson(request, { error: 'invalid_response' }, 502)
-    }
-    const headerResult = safeMediaHeaders(
-      upstream.headers,
-      upstream.status,
-      requestedRange,
-      resolvedMimeType,
-    )
-    if (!headerResult.ok) {
-      return requestJson(request, { error: 'invalid_response' }, 502)
+    if (ticket.expiresAt <= dependencies.now()) return reject('ticket-expired')
+
+    const responseTotalBytes = servedRange?.total !== null && servedRange?.total !== undefined
+      ? String(servedRange.total)
+      : upstream.status === 200
+        ? upstream.headers.get('content-length')
+        : null
+    const responseEtag = parseBoundedEtag(upstream.headers.get('etag'))
+
+    if (
+      resolvedMimeType !== null &&
+      sniffedContainerMime !== null &&
+      declaredMimeType !== undefined &&
+      (declaredMimeType === GENERIC_OCTET_MIME || AUDIO_MIME.test(declaredMimeType))
+    ) {
+      const proof: VerifiedAudioProof = {
+        mimeType: resolvedMimeType,
+        declaredMimeType,
+        finalUrl: currentUrl.toString(),
+        totalBytes: responseTotalBytes,
+        etag: responseEtag,
+      }
+      const remainingSeconds = Math.floor((ticket.expiresAt - dependencies.now()) / 1000)
+      const serialized = JSON.stringify({
+        providerId: ticket.providerId,
+        externalId: ticket.externalId,
+        nonce: ticket.nonce,
+        validatedUrl: ticket.validatedUrl,
+        mimeType: ticket.mimeType,
+        expiresAt: ticket.expiresAt,
+        verifiedAudio: proof,
+      })
+      if (
+        remainingSeconds > 0 &&
+        new TextEncoder().encode(serialized).byteLength <= MAX_TICKET_BYTES
+      ) {
+        try {
+          await dependencies.cache.put(
+            cacheKey,
+            new Response(serialized, {
+              headers: {
+                'cache-control': `max-age=${remainingSeconds}`,
+                'content-type': 'application/json',
+              },
+            }),
+          )
+        } catch { /* Best-effort ticket proof persistence; byte-0 is already verified. */ }
+      }
+    } else if (
+      resolvedMimeType === null &&
+      (request.method === 'HEAD' || (servedRange !== null && servedRange.start !== 0n)) &&
+      hasVerifiedAudio &&
+      declaredMimeType !== undefined
+    ) {
+      const proof = ticket.verifiedAudio as VerifiedAudioProof
+      const optInPermitted =
+        (declaredMimeType === GENERIC_OCTET_MIME && options.allowGenericAudioTypes === true) ||
+        (AUDIO_MIME.test(declaredMimeType) && options.reconcileMislabelledAudioTypes === true)
+      const totalMatches = proof.totalBytes === null || responseTotalBytes === proof.totalBytes
+      const etagMatches = proof.etag === null || responseEtag === proof.etag
+      if (
+        optInPermitted &&
+        proof.declaredMimeType === declaredMimeType &&
+        proof.finalUrl === currentUrl.toString() &&
+        totalMatches &&
+        etagMatches
+      ) {
+        resolvedMimeType = proof.mimeType
+      }
     }
 
+    if (resolvedMimeType === null) return reject('mime-rejected')
+    headerResult.headers.set('content-type', resolvedMimeType)
+
+    if (request.method === 'HEAD') cancelResponse(servableResponse)
     return new Response(request.method === 'HEAD' ? null : servableResponse.body, {
       status: servableResponse.status,
       headers: headerResult.headers,

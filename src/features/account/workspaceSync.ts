@@ -8,6 +8,7 @@ import type { FocusSessionRecord } from '../focus/types'
 import { applyAccountPreferences, captureAccountPreferences, createAccountPreferencesRepository, type VolumeControls } from './accountPreferences'
 import { automaticSyncStatus, createAutomaticSync, syncChannel } from './automaticSync'
 import { useAccountSession } from './session'
+import { traceSync } from './syncTrace'
 
 export function createWorkspaceAccountSync(options: {
   preferences: Preferences; player: VolumeControls; backgrounds: BackgroundStore
@@ -59,6 +60,7 @@ export function createWorkspaceAccountSync(options: {
   }, { immediate: true, flush: 'sync' })
   const coordinator = createAutomaticSync({ userId: session.userId, status: automaticSyncStatus, pendingStorage: safeLocalStorage, channels: [
     syncChannel({
+      name: 'preferences',
       capture: () => ({ ...captureAccountPreferences(preferences, player), backgroundPlaybackMode: backgrounds.playbackMode.value, backgroundQualityMode: backgrounds.qualityMode.value }),
       load: () => repository.load(),
       apply: saved => {
@@ -69,6 +71,8 @@ export function createWorkspaceAccountSync(options: {
       save: saved => repository.save(saved),
     }),
     syncChannel({
+      name: 'backgrounds',
+      diagnostics: () => ({ localSelectedCount: backgrounds.selection.value.selectedIds.length }),
       isLocalChange: () => !backgrounds.hydratingSelection.value,
       capture: () => ({ selectedIds: [...backgrounds.selection.value.selectedIds],
         autoRotate: backgrounds.selection.value.autoRotate, intervalSeconds: backgrounds.selection.value.intervalSeconds }),
@@ -77,6 +81,8 @@ export function createWorkspaceAccountSync(options: {
       save: saved => backgrounds.pushAuthenticated(saved),
     }),
     syncChannel({
+      name: 'focus',
+      diagnostics: () => ({ focusLocalCount: sessions.value.length, focusKnownRemoteCount: knownFocusIds.size }),
       persistPending: false,
       capture: () => ({ sessions: sessions.value.map(record => ({ ...record })) }),
       async load() {
@@ -112,23 +118,33 @@ export function createWorkspaceAccountSync(options: {
     try { safeLocalStorage.setItem(scopedKey(scope), JSON.stringify(value)) } catch { /* retain in-memory operation */ }
   }, { deep: true })
   let lastRefresh = 0
-  async function refresh() {
-    if (destroyed || document.visibilityState === 'hidden' || Date.now() - lastRefresh < 5000) return
+  async function refresh(source = 'interval') {
+    const skipped = destroyed ? 'destroyed' : document.visibilityState === 'hidden' ? 'hidden' : Date.now() - lastRefresh < 5000 ? 'throttled' : null
+    traceSync('trigger', { source, skipped })
+    if (skipped) return
     lastRefresh = Date.now()
     await session.refresh()
     if (!destroyed) coordinator.refresh()
   }
-  const onVisible = () => { if (document.visibilityState !== 'hidden') void refresh() }
+  const trigger = (source: string) => () => { if (document.visibilityState !== 'hidden') void refresh(source); else traceSync('trigger', { source, skipped: 'hidden' }) }
+  const onVisible = trigger('visibilitychange'), onResume = trigger('resume'), onFocus = trigger('focus'), onOnline = trigger('online'), onShown = trigger('pageshow')
+  // Android may restore a frozen or back/forward-cached page without a new focus
+  // event. Restart the existing account-fenced pipeline; keep its retry backoff.
+  const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) onShown() }
   document.addEventListener('visibilitychange', onVisible)
-  window.addEventListener('focus', onVisible)
-  window.addEventListener('online', onVisible)
+  document.addEventListener('resume', onResume)
+  window.addEventListener('pageshow', onPageShow)
+  window.addEventListener('focus', onFocus)
+  window.addEventListener('online', onOnline)
   const timer = setInterval(() => { void refresh() }, 60_000)
   void session.ensure()
   return {
     destroy() {
       destroyed = true; clearInterval(timer); coordinator.destroy(); unsubscribe(); stopScope(); stopPersist()
       document.removeEventListener('visibilitychange', onVisible)
-      window.removeEventListener('focus', onVisible); window.removeEventListener('online', onVisible)
+      document.removeEventListener('resume', onResume)
+      window.removeEventListener('pageshow', onPageShow)
+      window.removeEventListener('focus', onFocus); window.removeEventListener('online', onOnline)
     },
   }
 }

@@ -8,10 +8,14 @@ import {
 } from './types'
 
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024
+const MAX_TICKET_TTL_MS = 120_000
 
 export interface ServerProxyProviderOptions {
   fetch?: typeof fetch
   validateExternalId?: (value: string) => boolean
+  /** Preserve a validated effective ticket deadline only for providers using that contract. */
+  includeExpiry?: boolean
+  now?: () => number
   requestHeaders?: () => HeadersInit | undefined
   /**
    * Extra fields merged into the resolve request body alongside `externalId`.
@@ -24,6 +28,9 @@ export interface ServerProxyProviderOptions {
 }
 
 interface ProxyAudioResponse {
+  expiresAt?: unknown
+  issuedAt?: unknown
+  ttlMs?: unknown
   mimeType: string
   url: string
   metadata?: unknown
@@ -173,6 +180,9 @@ function validatePlayable(
   origin: URL,
   mediaPathPrefix: string,
   externalId: string,
+  includeExpiry = false,
+  requestStartedAt?: number,
+  receivedAt?: number,
 ): Playable {
   if (typeof value !== 'object' || value === null) {
     throw new ProviderResolveError('invalid_response')
@@ -217,6 +227,82 @@ function validatePlayable(
     throw new ProviderResolveError('invalid_response')
   }
 
+  let expiresAt: number | undefined
+  if (includeExpiry) {
+    const hasExpiresAt = 'expiresAt' in response
+    const hasTtlMs = 'ttlMs' in response
+    const hasIssuedAt = 'issuedAt' in response
+    if (hasExpiresAt || hasTtlMs || hasIssuedAt) {
+      if (
+        !hasExpiresAt ||
+        typeof response.expiresAt !== 'number' ||
+        !Number.isSafeInteger(response.expiresAt) ||
+        response.expiresAt <= 0
+      ) {
+        throw new ProviderResolveError('invalid_response')
+      }
+      let serverTtlMs: number | undefined
+      if (hasTtlMs) {
+        if (
+          typeof response.ttlMs !== 'number' ||
+          !Number.isSafeInteger(response.ttlMs) ||
+          response.ttlMs <= 0 ||
+          response.ttlMs > MAX_TICKET_TTL_MS ||
+          response.expiresAt < response.ttlMs
+        ) {
+          throw new ProviderResolveError('invalid_response')
+        }
+        serverTtlMs = response.ttlMs
+      }
+      if (hasIssuedAt) {
+        if (
+          typeof response.issuedAt !== 'number' ||
+          !Number.isSafeInteger(response.issuedAt) ||
+          response.issuedAt <= 0
+        ) {
+          throw new ProviderResolveError('invalid_response')
+        }
+        const issuedSpanMs = response.expiresAt - response.issuedAt
+        if (
+          !Number.isSafeInteger(issuedSpanMs) ||
+          issuedSpanMs <= 0 ||
+          issuedSpanMs > MAX_TICKET_TTL_MS
+        ) {
+          throw new ProviderResolveError('invalid_response')
+        }
+        if (serverTtlMs !== undefined && serverTtlMs > issuedSpanMs) {
+          throw new ProviderResolveError('invalid_response')
+        }
+        serverTtlMs ??= issuedSpanMs
+      }
+      if (serverTtlMs !== undefined) {
+        if (
+          requestStartedAt === undefined ||
+          receivedAt === undefined ||
+          !Number.isSafeInteger(requestStartedAt) ||
+          !Number.isSafeInteger(receivedAt)
+        ) {
+          throw new ProviderResolveError('invalid_response')
+        }
+        const baselineAt = Math.min(requestStartedAt, receivedAt)
+        const clientExpiresAt = baselineAt + serverTtlMs
+        const remainingMs = clientExpiresAt - receivedAt
+        if (
+          !Number.isSafeInteger(clientExpiresAt) ||
+          clientExpiresAt <= 0 ||
+          !Number.isFinite(remainingMs) ||
+          remainingMs <= 0 ||
+          remainingMs > MAX_TICKET_TTL_MS
+        ) {
+          throw new ProviderResolveError('invalid_response')
+        }
+        expiresAt = clientExpiresAt
+      } else {
+        expiresAt = response.expiresAt
+      }
+    }
+  }
+
   let metadata: PlaybackPresentationMetadata | undefined
   if ('metadata' in response && typeof response.metadata === 'object' && response.metadata !== null) {
     const rawMeta = response.metadata as Record<string, unknown>
@@ -235,6 +321,7 @@ function validatePlayable(
     mimeType: response.mimeType.toLowerCase(),
     url: playbackUrl.toString(),
     ...(metadata ? { metadata } : {}),
+    ...(expiresAt === undefined ? {} : { expiresAt }),
   }
 }
 
@@ -279,7 +366,8 @@ async function proxyFetch(
     if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
       throw abortReason(signal)
     }
-    throw new ProviderResolveError('unavailable')
+    // A dropped request says nothing about the track (task 41.7).
+    throw new ProviderResolveError('unavailable', { transient: true })
   }
 }
 
@@ -305,6 +393,7 @@ export function createServerProxyProvider(
 ): AudioProvider {
   const origin = currentApplicationOrigin()
   const fetchImpl = options.fetch ?? fetch
+  const now = options.now ?? Date.now
   const resolvePath = `/api/providers/${routeSegment}/resolve`
   const mediaPathPrefix = `/api/providers/${routeSegment}/media/`
   const resolveUrl = new URL(resolvePath, origin).toString()
@@ -321,6 +410,7 @@ export function createServerProxyProvider(
         throw new ProviderResolveError('invalid_response')
       }
 
+      const requestStartedAt = now()
       const response = await proxyFetch(
         fetchImpl,
         resolveUrl,
@@ -334,11 +424,22 @@ export function createServerProxyProvider(
       if (response.status === 429) throw new ProviderResolveError('rate_limited')
       if (!response.ok) {
         const code = await parseFailureCode(response)
-        throw new ProviderResolveError(code ?? (response.status === 504 ? 'timeout' : 'unavailable'))
+        const resolved = code ?? (response.status === 504 ? 'timeout' : 'unavailable')
+        // A 5xx outage reported as `unavailable` may answer on a retry (task 41.7).
+        throw new ProviderResolveError(resolved, { transient: response.status >= 500 && resolved === 'unavailable' })
       }
 
       const body = await parseJsonResponse(response, DEFAULT_MAX_RESPONSE_BYTES)
-      return validatePlayable(body, origin, mediaPathPrefix, source.externalId)
+      const receivedAt = now()
+      return validatePlayable(
+        body,
+        origin,
+        mediaPathPrefix,
+        source.externalId,
+        options.includeExpiry === true,
+        requestStartedAt,
+        receivedAt,
+      )
     },
   }
 }

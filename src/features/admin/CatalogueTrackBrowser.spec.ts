@@ -28,8 +28,8 @@ const detailOf = (value: AdminCatalogueTrack): AdminCatalogueTrackDetail => ({
   sources: [
     {
       sourceRowId: `src-${value.id}`,
-      provider: 'jellyfin',
-      externalId: 'a'.repeat(32),
+      provider: 'gd-studio',
+      externalId: 'netease:100001:320',
       sourceType: 'stream',
       sourceStatus: 'active',
       rightsStatus: 'owner-authorised',
@@ -64,6 +64,7 @@ function setup(tracks: AdminCatalogueTrack[]) {
       ...current,
       ...(changes.title !== undefined ? { title: changes.title } : {}),
       ...(changes.vocal_status !== undefined ? { vocalStatus: changes.vocal_status } : {}),
+      ...(changes.needs_classification !== undefined ? { needsClassification: changes.needs_classification } : {}),
       ...(changes.focus !== undefined
         ? { tabs: changes.focus ? [...new Set([...current.tabs, 'focus' as const])] : current.tabs.filter((t) => t !== 'focus') }
         : {}),
@@ -140,7 +141,7 @@ describe('CatalogueTrackBrowser', () => {
     expect(detail.text()).toContain('Tiny Giant')
     expect(detail.text()).toContain('zzz-tiny-giant')
     expect(detail.text()).toContain('chill')
-    expect(detail.text()).toContain('jellyfin')
+    expect(detail.text()).toContain('gd-studio')
   })
 
   it('saves only the changed fields against the loaded revision', async () => {
@@ -188,6 +189,28 @@ describe('CatalogueTrackBrowser', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-catalogue-track-save-error]').text()).toContain('changed while you were editing')
+  })
+
+  it('corrects an uncertain recording and clears its review flag without changing playlist tags', async () => {
+    const { wrapper, update } = setup([track('hsr-review-candidate', {
+      vocalStatus: 'uncertain', needsClassification: true, tabs: ['focus', 'chill'],
+    })])
+    await flushPromises()
+    await wrapper.get('[data-catalogue-track-row]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-catalogue-track-edit]').trigger('click')
+    await wrapper.get('[data-catalogue-track-field="vocal_status"]').setValue('vocal')
+    await wrapper.get('[data-catalogue-track-field="needs_classification"]').setValue(false)
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+    expect(update).toHaveBeenCalledWith('hsr-review-candidate', {
+      vocal_status: 'vocal', needs_classification: false,
+    }, 7)
+    await wrapper.get('[data-catalogue-track-edit]').trigger('click')
+    expect((wrapper.get('[data-catalogue-track-field="vocal_status"]').element as HTMLSelectElement).value).toBe('vocal')
+    expect((wrapper.get('[data-catalogue-track-field="needs_classification"]').element as HTMLInputElement).checked).toBe(false)
+    expect((wrapper.get('[data-catalogue-track-field="focus"]').element as HTMLInputElement).checked).toBe(true)
+    expect((wrapper.get('[data-catalogue-track-field="chill"]').element as HTMLInputElement).checked).toBe(true)
   })
 
   it('reports a catalogue load failure', async () => {

@@ -1,0 +1,15 @@
+/* Optical mechanics only. Surface tint, typography and centre legibility belong
+   to the theme. A ready host must not itself establish a backdrop-filter root. */
+.studio-native-glass-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  overflow: hidden;
+  border-radius: inherit;
+  background: var(--studio-native-tint, transparent);
+}
+.studio-native-glass-overlay[hidden] { display: none; }
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
+  .studio-native-glass-overlay { display: none; }
+}

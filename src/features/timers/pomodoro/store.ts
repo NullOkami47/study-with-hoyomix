@@ -176,17 +176,23 @@ function safeInteger(value: unknown, positive = false): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && (!positive || value > 0)
 }
 
+// Legacy snapshots can contain performance.now() fractions. ISO dates persist
+// millisecond precision; normalise only timestamps, never session durations.
+function epochMilliseconds(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 8.64e15
+}
+
 function parseFocusRun(value: unknown): PomodoroFocusRun | null {
   if (!hasExactKeys(value, FOCUS_RUN_KEYS)) return null
   if (
     typeof value.id !== 'string' ||
     !UUID_PATTERN.test(value.id) ||
-    !safeInteger(value.startedAt) ||
+    !epochMilliseconds(value.startedAt) ||
     !safeInteger(value.plannedFocusSeconds, true)
   ) return null
   return {
     id: value.id.toLowerCase(),
-    startedAt: value.startedAt,
+    startedAt: Math.trunc(value.startedAt),
     plannedFocusSeconds: value.plannedFocusSeconds,
   }
 }
@@ -196,8 +202,8 @@ function parseFocusFinalization(value: unknown): PomodoroFocusSessionFinalized |
   const run = parseFocusRun(value.run)
   if (
     !run ||
-    !safeInteger(value.endedAt) ||
-    value.endedAt < run.startedAt ||
+    !epochMilliseconds(value.endedAt) ||
+    value.endedAt < (value.run as PomodoroFocusRun).startedAt ||
     !safeInteger(value.actualFocusSeconds, true) ||
     value.actualFocusSeconds > run.plannedFocusSeconds ||
     (value.status !== 'completed' && value.status !== 'interrupted') ||
@@ -206,7 +212,7 @@ function parseFocusFinalization(value: unknown): PomodoroFocusSessionFinalized |
   ) return undefined
   return {
     run,
-    endedAt: value.endedAt,
+    endedAt: Math.trunc(value.endedAt),
     actualFocusSeconds: value.actualFocusSeconds,
     status: value.status,
     presentSummary: value.presentSummary,
@@ -488,7 +494,7 @@ export function createPomodoroStore(options: PomodoroStoreOptions = {}): Pomodor
     focusRunUntracked = false
     const run = {
       id: createUuid(),
-      startedAt,
+      startedAt: Math.trunc(startedAt),
       plannedFocusSeconds: phaseSeconds('focus'),
     }
     options.onFocusRunStarted?.(run)
@@ -522,7 +528,7 @@ export function createPomodoroStore(options: PomodoroStoreOptions = {}): Pomodor
       if (focusRun) {
         focusFinalizations.push({
           run: focusRun,
-          endedAt: expiredAt,
+          endedAt: Math.trunc(expiredAt),
           actualFocusSeconds: focusRun.plannedFocusSeconds,
           status: 'completed',
           presentSummary: false,
@@ -619,7 +625,7 @@ export function createPomodoroStore(options: PomodoroStoreOptions = {}): Pomodor
     if (focusRun && phase.value === 'focus' && actualFocusSeconds > 0) {
       directHandoffs = stageFocusFinalizations([{
         run: focusRun,
-        endedAt: clock.now(),
+        endedAt: Math.trunc(clock.now()),
         actualFocusSeconds,
         status: 'interrupted',
         presentSummary: true,
@@ -654,7 +660,7 @@ export function createPomodoroStore(options: PomodoroStoreOptions = {}): Pomodor
     ) {
       directHandoffs = stageFocusFinalizations([{
         run: focusRun,
-        endedAt: clock.now(),
+        endedAt: Math.trunc(clock.now()),
         actualFocusSeconds,
         status: 'interrupted',
         presentSummary: true,

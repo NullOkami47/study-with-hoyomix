@@ -2,10 +2,22 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { mount } from '@vue/test-utils'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ProviderControls from './ProviderControls.vue'
 import type { AdminProvider } from './client'
+
+const pointerMethodDescriptors = ['setPointerCapture', 'releasePointerCapture'].map(name => ({
+  name, descriptor: Object.getOwnPropertyDescriptor(Element.prototype, name),
+}))
+afterEach(() => {
+  // defineProperty stubs are not restored by vi.restoreAllMocks(). Restore their
+  // descriptors so later suites can install their own writable media/UI stubs.
+  for (const { name, descriptor } of pointerMethodDescriptors) {
+    if (descriptor) Object.defineProperty(Element.prototype, name, descriptor)
+    else Reflect.deleteProperty(Element.prototype, name)
+  }
+})
 
 const makeProvider = (overrides: Partial<AdminProvider> = {}): AdminProvider => ({
   key: 'chksz',
@@ -29,10 +41,10 @@ const mountControls = (providers: AdminProvider[]) => mount(ProviderControls, {
 describe('ProviderControls', () => {
   it('labels manual-only and direct providers truthfully', () => {
     const wrapper = mountControls([
-      makeProvider({ key: 'jellyfin', automaticPolicy: 'never' }),
+      makeProvider({ key: 'gd-studio', automaticPolicy: 'never' }),
       makeProvider({ key: 'chksz', automaticPolicy: 'direct' }),
     ])
-    expect(wrapper.get('[data-provider-policy="jellyfin"]').text()).toBe('Manual-only')
+    expect(wrapper.get('[data-provider-policy="gd-studio"]').text()).toBe('Manual-only')
     expect(wrapper.get('[data-provider-policy="chksz"]').text()).toBe('Automatic direct audio')
   })
 
@@ -77,7 +89,7 @@ describe('ProviderControls', () => {
     expect(disabledWrapper.get('[data-chksz-owner-fallback] input').attributes('disabled')).toBeDefined()
   })
 
-  it.each(['chksz', 'lx', 'jellyfin'] as const)(
+  it.each(['chksz', 'lx', 'gd-studio'] as const)(
     'disables non-last provider %s immediately without a global confirmation',
     async (key) => {
       const otherKey = key === 'chksz' ? 'lx' : 'chksz'
@@ -185,14 +197,14 @@ describe('ProviderControls', () => {
   it('shows Admin intent, deployment availability, and effective status separately', () => {
     const wrapper = mountControls([
       makeProvider({
-        key: 'jellyfin',
+        key: 'gd-studio',
         adminEnabled: true,
         deploymentAvailable: false,
         effectiveEnabled: false,
       }),
     ])
-    const item = wrapper.find('[data-provider-key="jellyfin"]')
-    const toggle = item.find('[data-provider-toggle="jellyfin"]')
+    const item = wrapper.find('[data-provider-key="gd-studio"]')
+    const toggle = item.find('[data-provider-toggle="gd-studio"]')
 
     expect((toggle.element as HTMLInputElement).checked).toBe(true)
     expect(toggle.attributes('disabled')).toBeUndefined()
@@ -203,7 +215,7 @@ describe('ProviderControls', () => {
   it('blocks an unavailable off-to-on action while keeping ordering controls usable', async () => {
     const wrapper = mountControls([
       makeProvider({
-        key: 'jellyfin',
+        key: 'gd-studio',
         priority: 1,
         adminEnabled: false,
         deploymentAvailable: false,
@@ -214,15 +226,15 @@ describe('ProviderControls', () => {
         priority: 2,
       }),
     ])
-    const toggle = wrapper.find('[data-provider-toggle="jellyfin"]')
-    const moveDown = wrapper.find('[data-provider-move-down="jellyfin"]')
+    const toggle = wrapper.find('[data-provider-toggle="gd-studio"]')
+    const moveDown = wrapper.find('[data-provider-move-down="gd-studio"]')
 
     expect(toggle.attributes('disabled')).toBeDefined()
     expect(moveDown.attributes('disabled')).toBeUndefined()
   })
 
   describe('canonical provider projection and ordering controls', () => {
-    it('renders only the 3 canonical top-level providers in priority order', () => {
+    it('renders all three independent canonical top-level providers in priority order', () => {
       const wrapper = mountControls([
         makeProvider({ key: 'youtube', priority: 1 }),
         makeProvider({ key: 'lx-ikun', priority: 2 }),
@@ -230,15 +242,17 @@ describe('ProviderControls', () => {
         makeProvider({ key: 'meting', priority: 5 }),
         makeProvider({ key: 'jellyfin', priority: 30 }),
         makeProvider({ key: 'r2', priority: 8 }),
+        makeProvider({ key: 'gd-studio', priority: 40 }),
         makeProvider({ key: 'chksz', priority: 10 }),
       ])
 
       const items = wrapper.findAll('[data-provider-key]')
       expect(items).toHaveLength(3)
-      expect(items.map((i) => i.attributes('data-provider-key'))).toEqual(['chksz', 'lx', 'jellyfin'])
+      expect(items.map((i) => i.attributes('data-provider-key'))).toEqual(['chksz', 'lx', 'gd-studio'])
       expect(items[0].text()).toContain('ChKSz BYOK')
       expect(items[1].text()).toContain('LX Music')
-      expect(items[2].text()).toContain('Jellyfin')
+      expect(items[2].text()).toContain('GD Studio')
+      expect(wrapper.find('[data-provider-key="jellyfin"]').exists()).toBe(false)
 
       expect(wrapper.find('[data-provider-key="youtube"]').exists()).toBe(false)
       expect(wrapper.find('[data-provider-key="lx-ikun"]').exists()).toBe(false)
@@ -248,7 +262,7 @@ describe('ProviderControls', () => {
 
     it('shows them as an ordered numbered list (1, 2, 3)', () => {
       const wrapper = mountControls([
-        makeProvider({ key: 'jellyfin', priority: 5 }),
+        makeProvider({ key: 'gd-studio', priority: 5 }),
         makeProvider({ key: 'chksz', priority: 15 }),
         makeProvider({ key: 'lx', priority: 25 }),
       ])
@@ -257,14 +271,14 @@ describe('ProviderControls', () => {
       expect(badges).toHaveLength(3)
       expect(badges.map((b) => b.text().trim())).toEqual(['1', '2', '3'])
       const items = wrapper.findAll('[data-provider-key]')
-      expect(items.map((i) => i.attributes('data-provider-key'))).toEqual(['jellyfin', 'chksz', 'lx'])
+      expect(items.map((i) => i.attributes('data-provider-key'))).toEqual(['gd-studio', 'chksz', 'lx'])
     })
 
     it('never exposes arbitrary numeric sliders or priority steppers', () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       expect(wrapper.find('input[type="range"]').exists()).toBe(false)
@@ -278,7 +292,7 @@ describe('ProviderControls', () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       // First item (chksz): Move Up disabled, Move Down enabled
@@ -298,39 +312,39 @@ describe('ProviderControls', () => {
       expect(lxDown.attributes('disabled')).toBeUndefined()
 
       // Third item (jellyfin): Move Up enabled, Move Down disabled
-      const jellyfinUp = wrapper.get('[data-provider-move-up="jellyfin"]')
-      const jellyfinDown = wrapper.get('[data-provider-move-down="jellyfin"]')
-      expect(jellyfinUp.attributes('aria-label')).toBe('Move Jellyfin up')
-      expect(jellyfinUp.attributes('disabled')).toBeUndefined()
-      expect(jellyfinDown.attributes('aria-label')).toBe('Move Jellyfin down')
-      expect(jellyfinDown.attributes('disabled')).toBeDefined()
+      const gdUp = wrapper.get('[data-provider-move-up="gd-studio"]')
+      const gdDown = wrapper.get('[data-provider-move-down="gd-studio"]')
+      expect(gdUp.attributes('aria-label')).toBe('Move GD Studio up')
+      expect(gdUp.attributes('disabled')).toBeUndefined()
+      expect(gdDown.attributes('aria-label')).toBe('Move GD Studio down')
+      expect(gdDown.attributes('disabled')).toBeDefined()
     })
 
     it('emits order with the full new order when Move Down is clicked', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       await wrapper.get('[data-provider-move-down="chksz"]').trigger('click')
-      expect(wrapper.emitted('order')).toEqual([[['lx', 'chksz', 'jellyfin']]])
+      expect(wrapper.emitted('order')).toEqual([[['lx', 'chksz', 'gd-studio']]])
     })
 
     it('emits order with the full new order when Move Up is clicked', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
-      await wrapper.get('[data-provider-move-up="jellyfin"]').trigger('click')
-      expect(wrapper.emitted('order')).toEqual([[['chksz', 'jellyfin', 'lx']]])
+      await wrapper.get('[data-provider-move-up="gd-studio"]').trigger('click')
+      expect(wrapper.emitted('order')).toEqual([[['chksz', 'gd-studio', 'lx']]])
     })
 
     it('provides a Reset default order button that emits order with canonical default order', async () => {
       const wrapper = mountControls([
-        makeProvider({ key: 'jellyfin', priority: 10 }),
+        makeProvider({ key: 'gd-studio', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
         makeProvider({ key: 'chksz', priority: 30 }),
       ])
@@ -339,7 +353,7 @@ describe('ProviderControls', () => {
       expect(resetBtn.text()).toContain('Reset default order')
       await resetBtn.trigger('click')
 
-      expect(wrapper.emitted('order')).toEqual([[['chksz', 'lx', 'jellyfin']]])
+      expect(wrapper.emitted('order')).toEqual([[['chksz', 'lx', 'gd-studio']]])
     })
 
     it('disables Move Up, Move Down, and Reset buttons when mutating is active', () => {
@@ -348,7 +362,7 @@ describe('ProviderControls', () => {
           providers: [
             makeProvider({ key: 'chksz', priority: 10 }),
             makeProvider({ key: 'lx', priority: 20 }),
-            makeProvider({ key: 'jellyfin', priority: 30 }),
+            makeProvider({ key: 'gd-studio', priority: 30 }),
           ],
           mutating: 'order',
         },
@@ -357,7 +371,7 @@ describe('ProviderControls', () => {
       expect(wrapper.get('[data-provider-move-down="chksz"]').attributes('disabled')).toBeDefined()
       expect(wrapper.get('[data-provider-move-up="lx"]').attributes('disabled')).toBeDefined()
       expect(wrapper.get('[data-provider-move-down="lx"]').attributes('disabled')).toBeDefined()
-      expect(wrapper.get('[data-provider-move-up="jellyfin"]').attributes('disabled')).toBeDefined()
+      expect(wrapper.get('[data-provider-move-up="gd-studio"]').attributes('disabled')).toBeDefined()
       expect(wrapper.get('[data-provider-order-reset]').attributes('disabled')).toBeDefined()
     })
   })
@@ -378,15 +392,15 @@ describe('ProviderControls', () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       const handles = wrapper.findAll('[data-provider-drag-handle]')
       expect(handles).toHaveLength(3)
 
-      const jellyfinHandle = wrapper.get('[data-provider-drag-handle="jellyfin"]')
-      expect(jellyfinHandle.attributes('aria-label')).toBe('Reorder Jellyfin')
-      expect(jellyfinHandle.attributes('aria-grabbed')).toBe('false')
+      const gdHandle = wrapper.get('[data-provider-drag-handle="gd-studio"]')
+      expect(gdHandle.attributes('aria-label')).toBe('Reorder GD Studio')
+      expect(gdHandle.attributes('aria-grabbed')).toBe('false')
 
       const chkszHandle = wrapper.get('[data-provider-drag-handle="chksz"]')
       expect(chkszHandle.attributes('aria-label')).toBe('Reorder ChKSz BYOK')
@@ -401,7 +415,7 @@ describe('ProviderControls', () => {
           providers: [
             makeProvider({ key: 'chksz', priority: 10 }),
             makeProvider({ key: 'lx', priority: 20 }),
-            makeProvider({ key: 'jellyfin', priority: 30 }),
+            makeProvider({ key: 'gd-studio', priority: 30 }),
           ],
           mutating: 'order',
         },
@@ -414,11 +428,11 @@ describe('ProviderControls', () => {
       }
     })
 
-    it('reorders via pointer drag: dragging Jellyfin to the top emits [jellyfin, chksz, lx]', async () => {
+    it('reorders via pointer drag: dragging GD Studio to the top emits [gd-studio, chksz, lx]', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       Object.defineProperty(Element.prototype, 'setPointerCapture', { configurable: true, value: vi.fn() })
@@ -427,30 +441,30 @@ describe('ProviderControls', () => {
       const chkszItem = wrapper.get('[data-provider-key="chksz"]').element
       Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: vi.fn(() => chkszItem) })
 
-      const jellyfinHandle = wrapper.get('[data-provider-drag-handle="jellyfin"]')
-      const jellyfinItem = wrapper.get('[data-provider-key="jellyfin"]')
+      const gdHandle = wrapper.get('[data-provider-drag-handle="gd-studio"]')
+      const gdItem = wrapper.get('[data-provider-key="gd-studio"]')
 
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointerdown', 1))
+      gdHandle.element.dispatchEvent(createPointerEvent('pointerdown', 1))
       await wrapper.vm.$nextTick()
-      expect(jellyfinItem.attributes('data-provider-dragging')).toBe('true')
-      expect(jellyfinHandle.attributes('aria-grabbed')).toBe('true')
+      expect(gdItem.attributes('data-provider-dragging')).toBe('true')
+      expect(gdHandle.attributes('aria-grabbed')).toBe('true')
 
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointermove', 1, 10, 50))
-      await wrapper.vm.$nextTick()
-
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointerup', 1, 10, 50))
+      gdHandle.element.dispatchEvent(createPointerEvent('pointermove', 1, 10, 50))
       await wrapper.vm.$nextTick()
 
-      expect(wrapper.emitted('order')).toEqual([[['jellyfin', 'chksz', 'lx']]])
-      expect(jellyfinItem.attributes('data-provider-dragging')).toBe('false')
-      expect(jellyfinHandle.attributes('aria-grabbed')).toBe('false')
+      gdHandle.element.dispatchEvent(createPointerEvent('pointerup', 1, 10, 50))
+      await wrapper.vm.$nextTick()
+
+      expect(wrapper.emitted('order')).toEqual([[['gd-studio', 'chksz', 'lx']]])
+      expect(gdItem.attributes('data-provider-dragging')).toBe('false')
+      expect(gdHandle.attributes('aria-grabbed')).toBe('false')
     })
 
-    it('reorders via pointer drag: dragging LX to the top emits [lx, chksz, jellyfin]', async () => {
+    it('reorders via pointer drag: dragging LX to the top emits [lx, chksz, gd-studio]', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       Object.defineProperty(Element.prototype, 'setPointerCapture', { configurable: true, value: vi.fn() })
@@ -466,14 +480,14 @@ describe('ProviderControls', () => {
       lxHandle.element.dispatchEvent(createPointerEvent('pointerup', 2, 10, 50))
       await wrapper.vm.$nextTick()
 
-      expect(wrapper.emitted('order')).toEqual([[['lx', 'chksz', 'jellyfin']]])
+      expect(wrapper.emitted('order')).toEqual([[['lx', 'chksz', 'gd-studio']]])
     })
 
     it('cancels pointer drag on pointercancel without emitting order', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       Object.defineProperty(Element.prototype, 'setPointerCapture', { configurable: true, value: vi.fn() })
@@ -482,28 +496,28 @@ describe('ProviderControls', () => {
       const chkszItem = wrapper.get('[data-provider-key="chksz"]').element
       Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: vi.fn(() => chkszItem) })
 
-      const jellyfinHandle = wrapper.get('[data-provider-drag-handle="jellyfin"]')
-      const jellyfinItem = wrapper.get('[data-provider-key="jellyfin"]')
+      const gdHandle = wrapper.get('[data-provider-drag-handle="gd-studio"]')
+      const gdItem = wrapper.get('[data-provider-key="gd-studio"]')
 
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointerdown', 3))
+      gdHandle.element.dispatchEvent(createPointerEvent('pointerdown', 3))
       await wrapper.vm.$nextTick()
-      expect(jellyfinItem.attributes('data-provider-dragging')).toBe('true')
+      expect(gdItem.attributes('data-provider-dragging')).toBe('true')
 
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointercancel', 3))
+      gdHandle.element.dispatchEvent(createPointerEvent('pointercancel', 3))
       await wrapper.vm.$nextTick()
 
       expect(wrapper.emitted('order')).toBeUndefined()
-      expect(jellyfinItem.attributes('data-provider-dragging')).toBe('false')
+      expect(gdItem.attributes('data-provider-dragging')).toBe('false')
     })
 
-    it('supports HTML5 drag-and-drop: dragging Jellyfin to the top emits [jellyfin, chksz, lx]', async () => {
+    it('supports HTML5 drag-and-drop: dragging GD Studio to the top emits [gd-studio, chksz, lx]', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
-      const jellyfinItem = wrapper.get('[data-provider-key="jellyfin"]')
+      const gdItem = wrapper.get('[data-provider-key="gd-studio"]')
       const chkszItem = wrapper.get('[data-provider-key="chksz"]')
 
       const dataTransfer = {
@@ -513,18 +527,18 @@ describe('ProviderControls', () => {
         dropEffect: 'move',
       }
 
-      await jellyfinItem.trigger('dragstart', { dataTransfer })
+      await gdItem.trigger('dragstart', { dataTransfer })
       await chkszItem.trigger('dragover', { dataTransfer })
       await chkszItem.trigger('drop', { dataTransfer })
 
-      expect(wrapper.emitted('order')).toEqual([[['jellyfin', 'chksz', 'lx']]])
+      expect(wrapper.emitted('order')).toEqual([[['gd-studio', 'chksz', 'lx']]])
     })
 
     it('performs optimistic reordering and rolls back when mutating resets without prop change', async () => {
       const wrapper = mountControls([
         makeProvider({ key: 'chksz', priority: 10 }),
         makeProvider({ key: 'lx', priority: 20 }),
-        makeProvider({ key: 'jellyfin', priority: 30 }),
+        makeProvider({ key: 'gd-studio', priority: 30 }),
       ])
 
       Object.defineProperty(Element.prototype, 'setPointerCapture', { configurable: true, value: vi.fn() })
@@ -532,16 +546,16 @@ describe('ProviderControls', () => {
       const chkszItem = wrapper.get('[data-provider-key="chksz"]').element
       Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: vi.fn(() => chkszItem) })
 
-      const jellyfinHandle = wrapper.get('[data-provider-drag-handle="jellyfin"]')
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointerdown', 4))
+      const gdHandle = wrapper.get('[data-provider-drag-handle="gd-studio"]')
+      gdHandle.element.dispatchEvent(createPointerEvent('pointerdown', 4))
       await wrapper.vm.$nextTick()
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointermove', 4, 10, 50))
-      jellyfinHandle.element.dispatchEvent(createPointerEvent('pointerup', 4, 10, 50))
+      gdHandle.element.dispatchEvent(createPointerEvent('pointermove', 4, 10, 50))
+      gdHandle.element.dispatchEvent(createPointerEvent('pointerup', 4, 10, 50))
       await wrapper.vm.$nextTick()
 
       // Optimistic update should immediately reflect in rendered order
       let renderedKeys = wrapper.findAll('[data-provider-key]').map((el) => el.attributes('data-provider-key'))
-      expect(renderedKeys).toEqual(['jellyfin', 'chksz', 'lx'])
+      expect(renderedKeys).toEqual(['gd-studio', 'chksz', 'lx'])
 
       // Simulate mutation start in parent
       await wrapper.setProps({ mutating: 'order' })
@@ -552,7 +566,7 @@ describe('ProviderControls', () => {
 
       // Should roll back to props order
       renderedKeys = wrapper.findAll('[data-provider-key]').map((el) => el.attributes('data-provider-key'))
-      expect(renderedKeys).toEqual(['chksz', 'lx', 'jellyfin'])
+      expect(renderedKeys).toEqual(['chksz', 'lx', 'gd-studio'])
     })
   })
 
@@ -567,7 +581,7 @@ describe('ProviderControls', () => {
           checkedAt: Date.now() - 30_000,
         }),
         makeProvider({
-          key: 'jellyfin',
+          key: 'gd-studio',
           status: 'degraded',
           latencyMs: 650,
           failureClass: 'http_502_upstream_gateway',
@@ -580,11 +594,11 @@ describe('ProviderControls', () => {
       expect(chkszCard.find('[data-provider-status-text]').text()).toBe('healthy')
       expect(chkszCard.find('.provider-health__metric--latency').text()).toBe('142 ms')
 
-      const jellyfinCard = wrapper.find('[data-provider-key="jellyfin"]')
-      expect(jellyfinCard.find('.provider-health__dot--degraded').exists()).toBe(true)
-      expect(jellyfinCard.find('[data-provider-status-text]').text()).toBe('degraded')
-      expect(jellyfinCard.find('[data-provider-failure]').attributes('data-provider-failure')).toBe('http_502_upstream_gateway')
-      expect(jellyfinCard.find('.provider-health__metric--latency').text()).toBe('650 ms')
+      const gdCard = wrapper.find('[data-provider-key="gd-studio"]')
+      expect(gdCard.find('.provider-health__dot--degraded').exists()).toBe(true)
+      expect(gdCard.find('[data-provider-status-text]').text()).toBe('degraded')
+      expect(gdCard.find('[data-provider-failure]').attributes('data-provider-failure')).toBe('http_502_upstream_gateway')
+      expect(gdCard.find('.provider-health__metric--latency').text()).toBe('650 ms')
     })
   })
 
@@ -601,4 +615,18 @@ describe('ProviderControls', () => {
       expect(source).not.toContain('input[type="range"]')
     })
   })
+
+  it('keeps GD Studio independently toggleable and truthfully unavailable when deployment policy is missing', async () => {
+    const wrapper = mountControls([
+      makeProvider({ key: 'lx', priority: 20 }),
+      makeProvider({ key: 'gd-studio', priority: 40, adminEnabled: false, effectiveEnabled: false }),
+    ])
+    expect(wrapper.get('[data-provider-key="gd-studio"]').text()).toContain('GD Studio')
+    await wrapper.get('[data-provider-toggle="gd-studio"]').setValue(true)
+    expect(wrapper.emitted('toggle')).toEqual([['gd-studio', true]])
+    expect(wrapper.get('[data-provider-toggle="lx"]').element).toHaveProperty('checked', true)
+    await wrapper.setProps({ providers: [makeProvider({ key: 'gd-studio', adminEnabled: false, deploymentAvailable: false, effectiveEnabled: false })] })
+    expect(wrapper.get('[data-provider-toggle="gd-studio"]').element).toHaveProperty('disabled', true)
+  })
+
 })

@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { Log, LogLevel, Miniflare } from './miniflare-compat'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { issueSession } from '../auth/session'
+import { issueSession, SESSION_LIFETIME_MS } from '../auth/session'
 import type { Database } from '../db'
 import worker from '../index'
 
@@ -49,7 +49,7 @@ describe('IDOR and cross-user resource isolation', () => {
   let userBToken: string
 
   beforeEach(async () => {
-    // Session issuance and request validation must share the fixture clock.
+    // Sessions and direct Worker requests share a deterministic clock; real timers stay active.
     vi.spyOn(Date, 'now').mockReturnValue(NOW)
     miniflare = new Miniflare({
       compatibilityDate: '2025-12-01',
@@ -79,8 +79,7 @@ describe('IDOR and cross-user resource isolation', () => {
   })
 
   afterEach(async () => {
-    vi.restoreAllMocks()
-    await miniflare.dispose()
+    try { await miniflare.dispose() } finally { vi.restoreAllMocks() }
   })
 
   const request = (path: string, token: string, init: RequestInit = {}) => {
@@ -343,4 +342,19 @@ describe('IDOR and cross-user resource isolation', () => {
     ).bind('user-a').first<{ selection_json: string }>()
     expect(aSelection?.selection_json).toBe('["bg-a"]')
   })
+
+  it.each([
+    [SESSION_LIFETIME_MS - 1, 200],
+    [SESSION_LIFETIME_MS, 401],
+    [SESSION_LIFETIME_MS + 1, 401],
+  ] as const)('enforces the real session expiry boundary at age %i', async (age, expectedStatus) => {
+    vi.mocked(Date.now).mockReturnValue(NOW + age)
+    const response = await worker.fetch(request('/api/library', userAToken), env as never)
+    expect(response.status).toBe(expectedStatus)
+    if (expectedStatus === 401) {
+      expect(await response.json()).toEqual({ error: 'authentication_required' })
+    }
+    expect(await database.prepare('SELECT COUNT(*) AS total FROM users').first('total')).toBe(2)
+  })
+
 })

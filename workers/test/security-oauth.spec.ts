@@ -1,11 +1,14 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { Log, LogLevel, Miniflare } from './miniflare-compat'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import fc from 'fast-check'
 
 import { consumeOAuthFlow, registerOAuthFlow } from '../auth/flow'
 import { createAuthHandler } from '../auth/routes'
 import type { AuthEnv } from '../auth/routes'
+import worker from '../index'
 
 const ORIGIN = 'https://study.example'
 const NOW = 1_786_480_000_000
@@ -542,5 +545,147 @@ describe('OAuth security - replay and binding', () => {
       // This prevents session fixation attacks
       expect(true).toBe(true)
     })
+  })
+})
+
+// Wave E exploration (task 17, H-04 / design Property 3). Encodes the expected behaviour, so it
+// FAILS on the unfixed tree: every anonymous start inserts an oauth_flows row and none is limited.
+describe('OAuth start through worker.fetch - bounded and write-free (Property 3)', () => {
+  // Design H-04 step 2: 20 starts per 10 minutes per client-IP key.
+  const START_BUDGET = 20
+  const REQUESTS = 50
+  let miniflare: Miniflare
+  let database: TestDatabase
+  let env: AuthEnv
+
+  beforeEach(async () => {
+    miniflare = new Miniflare({
+      compatibilityDate: '2025-12-01',
+      modules: true,
+      script: 'export default { fetch() { return new Response("ok") } }',
+      d1Databases: { DB: `oauth-start-${crypto.randomUUID()}` },
+      d1Persist: false,
+      log: new Log(LogLevel.NONE),
+    })
+    database = await miniflare.getD1Database('DB')
+    await applyMigrations(database)
+    env = {
+      DB: database as never,
+      PUBLIC_ORIGIN: ORIGIN,
+      SESSION_HMAC_SECRET: 'oauth-test-session-secret',
+      OAUTH_STATE_SECRET: 'oauth-test-state-secret',
+      GOOGLE_CLIENT_ID: 'test-google-client',
+      GOOGLE_CLIENT_SECRET: 'TEST-google-secret',
+      GITHUB_CLIENT_ID: 'test-github-client',
+      GITHUB_CLIENT_SECRET: 'TEST-github-secret',
+    }
+  })
+
+  afterEach(async () => {
+    await miniflare.dispose()
+  })
+
+  it('writes no oauth_flows row for anonymous starts and answers 429 with Retry-After beyond the budget', async () => {
+    let run = 0
+    await fc.assert(
+      fc.asyncProperty(fc.constantFrom('github' as const, 'google' as const), async (provider) => {
+        // A distinct client key per run, so one run's budget never leaks into the next.
+        const ip = `203.0.113.${++run}`
+        const before = (await database.prepare('SELECT COUNT(*) AS count FROM oauth_flows').first<{ count: number }>())!.count
+        const statuses: number[] = []
+        const problems: string[] = []
+        for (let index = 0; index < REQUESTS; index++) {
+          // Called with the (env, ctx) shape the fixed entry point takes (design Shared Infrastructure 3).
+          const response = await (worker.fetch as (...args: unknown[]) => Promise<Response>)(
+            new Request(`${ORIGIN}/api/auth/${provider}/start`, { headers: { 'cf-connecting-ip': ip } }),
+            env,
+            { waitUntil: () => {}, passThroughOnException: () => {} },
+          )
+          statuses.push(response.status)
+          if (response.status === 429) {
+            const retryAfter = Number(response.headers.get('retry-after'))
+            if (!Number.isInteger(retryAfter) || retryAfter <= 0) problems.push(`#${index}: 429 without a valid Retry-After`)
+          } else if (response.status === 302) {
+            if (!(response.headers.get('set-cookie') ?? '').includes('__Host-oauth=')) problems.push(`#${index}: 302 without __Host-oauth`)
+          } else {
+            problems.push(`#${index}: unexpected status ${response.status}`)
+          }
+        }
+        const after = (await database.prepare('SELECT COUNT(*) AS count FROM oauth_flows').first<{ count: number }>())!.count
+        const firstLimited = statuses.indexOf(429)
+        const summary = {
+          provider,
+          oauthFlowRowsWritten: after - before,
+          redirects: statuses.filter((status) => status === 302).length,
+          limited: statuses.filter((status) => status === 429).length,
+          limitedOnceStartedStaysLimited: firstLimited >= 0 && statuses.slice(firstLimited).every((status) => status === 429),
+          problems,
+        }
+        expect(summary).toEqual({
+          provider,
+          oauthFlowRowsWritten: 0,
+          redirects: expect.any(Number),
+          limited: expect.any(Number),
+          limitedOnceStartedStaysLimited: true,
+          problems: [],
+        })
+        expect(summary.redirects).toBeGreaterThan(0)
+        expect(summary.redirects).toBeLessThanOrEqual(START_BUDGET)
+        expect(summary.limited).toBe(REQUESTS - summary.redirects)
+      }),
+      { numRuns: 2, endOnFailure: true },
+    )
+  })
+})
+
+// Wave F exploration (task 21, design Property 11, M-09). Expected to FAIL on the unfixed tree: a
+// failed callback navigation through worker.fetch ends on `401 {"error":"oauth_callback_failed"}`.
+describe('OAuth callback failure through worker.fetch redirects back to the app (Property 11)', () => {
+  let miniflare: Miniflare
+  let database: TestDatabase
+  let env: AuthEnv
+  beforeEach(async () => {
+    miniflare = new Miniflare({
+      compatibilityDate: '2025-12-01',
+      modules: true,
+      script: 'export default { fetch() { return new Response("ok") } }',
+      d1Databases: { DB: `oauth-callback-${crypto.randomUUID()}` },
+      d1Persist: false,
+      log: new Log(LogLevel.NONE),
+    })
+    database = await miniflare.getD1Database('DB')
+    await applyMigrations(database)
+    env = {
+      DB: database as never,
+      PUBLIC_ORIGIN: ORIGIN,
+      SESSION_HMAC_SECRET: 'oauth-test-session-secret',
+      OAUTH_STATE_SECRET: 'oauth-test-state-secret',
+      GOOGLE_CLIENT_ID: 'test-google-client',
+      GOOGLE_CLIENT_SECRET: 'TEST-google-secret',
+      GITHUB_CLIENT_ID: 'test-github-client',
+      GITHUB_CLIENT_SECRET: 'TEST-github-secret',
+    }
+  })
+  afterEach(async () => {
+    vi.unstubAllGlobals()
+    await miniflare.dispose()
+  })
+  it('answers a failed GitHub code exchange with 302 to /?auth_error=oauth_callback_failed and clears __Host-oauth', async () => {
+    vi.stubGlobal('fetch', async () => { throw new Error('private-upstream-detail-sentinel') })
+    const ctx = { waitUntil: () => {}, passThroughOnException: () => {} }
+    const call = worker.fetch as (...args: unknown[]) => Promise<Response>
+    const start = await call(new Request(`${ORIGIN}/api/auth/github/start`, { headers: { 'cf-connecting-ip': '198.51.100.7' } }), env, ctx)
+    expect(start.status).toBe(302)
+    const state = new URL(start.headers.get('location')!).searchParams.get('state')
+    const oauth = (start.headers.get('set-cookie') ?? '').match(/__Host-oauth=([^;]*)/)?.[1] ?? ''
+    const response = await call(new Request(`${ORIGIN}/api/auth/github/callback?code=private-code&state=${state}`, {
+      headers: { cookie: `__Host-oauth=${oauth}`, 'cf-connecting-ip': '198.51.100.7' },
+    }), env, ctx)
+    expect(response.status, `status=${response.status} body=${await response.clone().text()}`).toBe(302)
+    const location = new URL(response.headers.get('location') ?? 'invalid:', ORIGIN)
+    expect(`${location.origin}${location.pathname}`).toBe(`${ORIGIN}/`)
+    expect([...location.searchParams.entries()]).toEqual([['auth_error', 'oauth_callback_failed']])
+    expect(response.headers.get('location') ?? '').not.toMatch(/private-|TEST-github-secret/)
+    expect(response.headers.getSetCookie().some((cookie) => cookie.startsWith('__Host-oauth=;') && cookie.includes('Max-Age=0'))).toBe(true)
   })
 })

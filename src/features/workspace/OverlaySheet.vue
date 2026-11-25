@@ -3,7 +3,6 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { X } from 'lucide-vue-next'
 
 import { translate } from '../../i18n'
-import StudioGlassCanvas from '../liquid-glass/StudioGlassCanvas.vue'
 import { usePreferences } from '../../stores/preferences'
 
 let sheetSequence = 0
@@ -32,7 +31,7 @@ const props = withDefaults(defineProps<{
   variant: 'panel',
 })
 const emit = defineEmits<{ (event: 'close'): void }>()
-const { locale, lowPower, studioBlur, studioGlassGray, studioEdge, visualStyle } = usePreferences()
+const { locale } = usePreferences()
 const root = ref<HTMLElement>()
 const titleId = `overlay-sheet-title-${++sheetSequence}`
 let opener: HTMLElement | null = null
@@ -229,7 +228,7 @@ onBeforeUnmount(() => {
       tabindex="-1"
       @keydown="onKeydown"
     >
-      <StudioGlassCanvas v-if="visualStyle === 'studio'" plate :low-power="lowPower" :blur-radius="studioBlur" :glass-gray="studioGlassGray" :edge="studioEdge" />
+
       <header class="overlay-sheet__header">
         <h2 :id="titleId">{{ title }}</h2>
         <button type="button" data-overlay-close :aria-label="translate(locale, 'workspace.closeSheet')" @click="requestClose">

@@ -5,6 +5,7 @@ import type { AdminRepository, CatalogueStatus, ImportBatch, ChangeKind, Proposa
 import AdminFieldDiff from './primitives/AdminFieldDiff.vue'
 import AdminStatusChip from './primitives/AdminStatusChip.vue'
 import CatalogueTrackBrowser from './CatalogueTrackBrowser.vue'
+import CatalogueDiscovery from './CatalogueDiscovery.vue'
 import { usePreferences } from '../../stores/preferences'
 import { translate, type TranslationKey } from '../../i18n'
 import { ALLOWED_STRUCTURAL_FIELDS } from './catalogueSchema'
@@ -27,14 +28,15 @@ const filter = ref('all')
  * persisted so a reload (or an edit round-trip) does not drop the admin back to Tracks.
  */
 const VIEW_STORAGE_KEY = 'study-with-hoyomix.admin-catalogue-view.v1'
-const readStoredView = (): 'tracks' | 'review' => {
+const readStoredView = (): 'tracks' | 'review' | 'discovery' => {
   try {
-    return localStorage.getItem(VIEW_STORAGE_KEY) === 'review' ? 'review' : 'tracks'
+    const stored=localStorage.getItem(VIEW_STORAGE_KEY)
+    return stored==='review'||stored==='discovery'?stored:'tracks'
   } catch {
     return 'tracks'
   }
 }
-const view = ref<'tracks' | 'review'>(readStoredView())
+const view = ref<'tracks' | 'review' | 'discovery'>(readStoredView())
 watch(view, (value) => {
   try {
     localStorage.setItem(VIEW_STORAGE_KEY, value)
@@ -414,11 +416,13 @@ onBeforeUnmount(() => {
       >
         {{ text('viewReview') }}
       </button>
+      <button type="button" data-catalogue-view="discovery" :class="{ 'catalogue-manager__view--active': view === 'discovery' }" :aria-pressed="view === 'discovery'" @click="view = 'discovery'">{{text('discovery.title')}}</button>
     </nav>
 
+    <CatalogueDiscovery v-if="view === 'discovery'" :repository="repository"/>
     <CatalogueTrackBrowser v-if="view === 'tracks'" :repository="repository" />
 
-    <template v-else>
+    <template v-else-if="view === 'review'">
     <!-- Lifecycle Pipeline Stepper -->
     <nav :aria-label="text('reviewPipeline') || 'Catalogue review pipeline'" class="catalogue-manager__stepper" tabindex="0">
       <div class="catalogue-manager__step catalogue-manager__step--complete">

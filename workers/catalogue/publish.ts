@@ -39,10 +39,17 @@ async function verifiedOwnerR2Keys(
   return keys
 }
 
+/**
+ * `actor` is NULL only for the unattended discovery automation. `admin_audit_log.actor_user_id`
+ * and `catalogue_import_batches.published_by` are nullable FKs to `users(id)`, so a NULL actor
+ * is structurally distinct from every human admin and cannot be forged into one. Every other
+ * guarantee below — batch status, revision CAS, projection validation, Owner-R2 verification —
+ * applies identically regardless of actor.
+ */
 export async function publishImportBatch(
   db: D1Database,
   batch: ImportBatch,
-  actor: string,
+  actor: string | null,
   now: number,
   beforeBatch?: (
     statements: D1PreparedStatement[],

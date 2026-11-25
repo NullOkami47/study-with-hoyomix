@@ -1,18 +1,24 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { Track } from './types'
-
-// Original metadata-only fixture, independent of the public empty catalogue.
-const seed: Track[] = ['one', 'two', 'three'].map((id, index): Track => ({
-  id: `synthetic-${id}`, title: `Tiny synthetic ${id}`, aliases: {},
-  games: [(['genshin', 'hsr', 'zzz'] as const)[index]], relationIds: [],
-  tabs: ['focus'], workGroupId: `synthetic-work-${id}`,
-  needsClassification: false, vocalStatus: 'instrumental',
-  sources: [{ provider: 'r2', externalId: `synthetic/${id}.ogg` }],
-}))
 import { loadRemoteCatalog } from './remoteCatalog'
 import { createCatalogFilterState } from './filterState'
 import { parseCatalog } from './schema'
 import { nextTick } from 'vue'
+
+// Original metadata-only fixture, independent of the public empty catalogue.
+const seed: Track[] = ['one', 'two', 'three'].map((id, index): Track => ({
+  id: `synthetic-${id}`,
+  title: `Tiny synthetic ${id}`,
+  aliases: {},
+  games: [(['genshin', 'hsr', 'zzz'] as const)[index]],
+  relationIds: [],
+  tabs: ['focus'],
+  workGroupId: `synthetic-work-${id}`,
+  needsClassification: false,
+  vocalStatus: 'instrumental',
+  sources: [{ provider: 'r2', externalId: `synthetic/${id}.ogg` }],
+}))
+
 describe('published remote catalogue', () => {
   it('fetches only the same-origin endpoint and strictly parses the payload', async () => {
     const fetcher = vi.fn(async () => Response.json({ revision: '1', tracks: seed }))
@@ -22,6 +28,7 @@ describe('published remote catalogue', () => {
       expect.objectContaining({ credentials: 'same-origin', redirect: 'error' }),
     )
   })
+
   it.each([
     { revision: '1', tracks: [] },
     { revision: '1', tracks: seed, secret: 'no' },
@@ -37,6 +44,7 @@ describe('published remote catalogue', () => {
       'catalogue_unavailable',
     )
   })
+
   it('rejects failed and oversized responses without reflecting private errors', async () => {
     await expect(
       loadRemoteCatalog(async () => new Response('secret', { status: 503 })),
@@ -50,6 +58,7 @@ describe('published remote catalogue', () => {
       ),
     ).rejects.toThrow('catalogue_unavailable')
   })
+
   it('replaces query data/options but preserves valid filters and exact source mappings', async () => {
     const tracks = parseCatalog(seed)
     const state = createCatalogFilterState(tracks, {
@@ -66,8 +75,6 @@ describe('published remote catalogue', () => {
     await nextTick()
     expect(state.search.value).toBe('Tiny')
     expect(state.filteredTracks.value).toEqual(replacement)
-    // The replacement catalogue introduces the relation, which becomes selectable and
-    // filtering against the fresh option set rather than the stale one.
     state.toggleRelation('place:new')
     expect(state.relationIds.value).toEqual(['place:new'])
     expect(state.filteredTracks.value).toEqual(replacement)
@@ -75,43 +82,29 @@ describe('published remote catalogue', () => {
     expect(state.filteredTracks.value[0].sources).toEqual(tracks[0].sources)
   })
 
-  it('loads Jellyfin sources from /api/catalogue and ensures they supersede stale R2-only data in player', async () => {
+  it('loads remote sources from /api/catalogue and ensures they supersede stale R2-only data in player', async () => {
     const staleStaticTracks = parseCatalog(seed)
-    // Verify stale static fixture only has r2
     expect(staleStaticTracks.every((t) => t.sources.every((s) => s.provider === 'r2'))).toBe(true)
 
-    // Remote D1 catalogue response with Jellyfin primary and ChKSz fallback
     const remoteTracksPayload = [
       {
         ...seed[0],
         sources: [
-          {
-            provider: 'jellyfin',
-            externalId: '11111111111111111111111111111111',
-            metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' },
-          },
+          { provider: 'gd-studio', externalId: 'netease:1001', metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' } },
           { provider: 'chksz', externalId: '101', metadata: {} },
         ],
       },
       {
         ...seed[1],
         sources: [
-          {
-            provider: 'jellyfin',
-            externalId: '22222222222222222222222222222222',
-            metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' },
-          },
+          { provider: 'gd-studio', externalId: 'netease:1002', metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' } },
           { provider: 'chksz', externalId: '102', metadata: {} },
         ],
       },
       {
         ...seed[2],
         sources: [
-          {
-            provider: 'jellyfin',
-            externalId: '33333333333333333333333333333333',
-            metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' },
-          },
+          { provider: 'gd-studio', externalId: 'netease:1003', metadata: { contentType: 'audio/mpeg', rightsStatus: 'not-reviewed' } },
           { provider: 'chksz', externalId: '103', metadata: {} },
         ],
       },
@@ -122,28 +115,24 @@ describe('published remote catalogue', () => {
 
     expect(loaded.revision).toBe('3')
     expect(loaded.tracks).toHaveLength(3)
-    // Preserves existing track metadata
     expect(loaded.tracks.map((t) => t.id)).toEqual(staleStaticTracks.map((t) => t.id))
     expect(loaded.tracks.map((t) => t.title)).toEqual(staleStaticTracks.map((t) => t.title))
     expect(loaded.tracks.map((t) => t.games)).toEqual(staleStaticTracks.map((t) => t.games))
     expect(loaded.tracks.map((t) => t.workGroupId)).toEqual(staleStaticTracks.map((t) => t.workGroupId))
 
-    // Jellyfin sources are present and R2 is absent
     for (const track of loaded.tracks) {
       const providers = track.sources.map((s) => s.provider)
-      expect(providers).toContain('jellyfin')
+      expect(providers).toContain('gd-studio')
       expect(providers).toContain('chksz')
       expect(providers).not.toContain('r2')
     }
 
-    // Now verify filter state replacement
     const state = createCatalogFilterState(staleStaticTracks)
     state.replaceTracks(loaded.tracks)
     await nextTick()
 
-    // The active tracks in filter state are now the remote tracks with Jellyfin
     const activeFirstTrack = state.filteredTracks.value[0]
-    expect(activeFirstTrack.sources.some((s) => s.provider === 'jellyfin')).toBe(true)
+    expect(activeFirstTrack.sources.some((s) => s.provider === 'gd-studio')).toBe(true)
     expect(activeFirstTrack.sources.some((s) => s.provider === 'r2')).toBe(false)
   })
 

@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import { LxRuntimeClient } from '../player/lx/runtime/client'
 import { getDefaultLxSourceRepository } from '../player/lx/sourceRepository'
+import { getDefaultGlobalSourceRepository, type LxGlobalSourceRepository } from '../player/lx/globalSourceRepository'
 import {
   LX_MAX_SCRIPT_BYTES,
   type LxSourceRecord,
@@ -20,11 +21,13 @@ export type LxSourceTestRunner = (source: LxSourceRecord) => Promise<void>
 const props = defineProps<{
   locale: Locale
   repository?: LxSourceRepository
+  globalRepository?: LxGlobalSourceRepository
   testRunner?: LxSourceTestRunner
   requestConsent?: () => Promise<boolean>
 }>()
 
 const repository = props.repository ?? getDefaultLxSourceRepository()
+const globalRepository = props.globalRepository ?? getDefaultGlobalSourceRepository()
 
 const text = (key: TranslationKey, params?: Record<string, unknown>): string =>
   translate(props.locale, key, params)
@@ -43,6 +46,7 @@ const defaultTestRunner: LxSourceTestRunner = async (source) => {
 }
 
 const sources = ref<LxSourceRecord[]>([])
+const publishedSources = ref<LxSourceRecord[]>([])
 const busy = ref(false)
 const status = ref('')
 const failure = ref('')
@@ -50,24 +54,18 @@ const urlText = ref('')
 const pasteText = ref('')
 const refreshTargetId = ref<string | null>(null)
 
-/**
- * The bundled snapshot is pinned first. The repository already keeps it at the lowest
- * priority, but the pin is the component's contract: reordering is only ever offered for
- * custom sources, so the built-in cannot be displaced even by inconsistent stored data.
- */
-const builtInSource = computed<LxSourceRecord | null>(
-  () => sources.value.find((source) => source.builtIn) ?? null,
-)
-const customSources = computed<LxSourceRecord[]>(() =>
-  sources.value
-    .filter((source) => !source.builtIn)
-    .slice()
-    .sort((left, right) => left.priority - right.priority),
-)
-const rows = computed<LxSourceRecord[]>(() => {
-  const pinned = builtInSource.value
-  return pinned ? [pinned, ...customSources.value] : [...customSources.value]
-})
+const byPriority = (left: LxSourceRecord, right: LxSourceRecord): number =>
+  left.priority - right.priority || left.id.localeCompare(right.id)
+const isPublished = (source: LxSourceRecord): boolean => source.id.startsWith('global:')
+const customSources = computed(() => sources.value.filter((source) => !source.builtIn).sort(byPriority))
+const sourceGroups = computed(() => [
+  {
+    id: 'published',
+    title: text('settings.lx.publishedHeading'),
+    sources: [...publishedSources.value, ...sources.value.filter((source) => source.builtIn)].sort(byPriority),
+  },
+  { id: 'personal', title: text('settings.lx.personalHeading'), sources: customSources.value },
+])
 
 const pasteBytes = computed(() => new TextEncoder().encode(pasteText.value).byteLength)
 
@@ -91,7 +89,19 @@ function describeFailure(caught: unknown): string {
 }
 
 async function reload(): Promise<void> {
-  sources.value = await repository.list()
+  const [personal, published] = await Promise.all([repository.list(), globalRepository.list()])
+  sources.value = globalRepository.managesBundledSource === true
+    ? personal.filter((source) => !source.builtIn)
+    : personal
+  publishedSources.value = published
+  const managed = globalRepository.managedSource?.()
+  if (managed && !managed.deleted && !published.some((source) => source.id === `global:${managed.id}`)) {
+    publishedSources.value = [...published, {
+      id: `global:${managed.id}`, name: managed.name, version: managed.version ?? undefined,
+      sha256: managed.sha256, priority: managed.priority, enabled: managed.enabled,
+      builtIn: false, script: '', importedAt: 0, updatedAt: 0,
+    }]
+  }
 }
 
 async function withMutation(
@@ -117,6 +127,7 @@ async function withMutation(
 
 async function onToggle(source: LxSourceRecord, event: Event): Promise<void> {
   const input = event.target as HTMLInputElement
+  if (isPublished(source)) { input.checked = source.enabled; return }
   const enabled = input.checked
   if (enabled && !source.builtIn && props.requestConsent && !await props.requestConsent()) {
     input.checked = source.enabled
@@ -130,6 +141,7 @@ async function onToggle(source: LxSourceRecord, event: Event): Promise<void> {
 }
 
 async function move(source: LxSourceRecord, delta: -1 | 1): Promise<void> {
+  if (isPublished(source)) return
   const order = customSources.value.map((record) => record.id)
   const from = order.indexOf(source.id)
   const to = from + delta
@@ -139,10 +151,12 @@ async function move(source: LxSourceRecord, delta: -1 | 1): Promise<void> {
 }
 
 async function removeSource(source: LxSourceRecord): Promise<void> {
+  if (isPublished(source)) return
   await withMutation(() => repository.delete(source.id), { success: 'settings.lx.removed' })
 }
 
 async function testSource(source: LxSourceRecord): Promise<void> {
+  if (!source.script) return
   if (!source.builtIn && props.requestConsent && !await props.requestConsent()) return
   const runner = props.testRunner ?? defaultTestRunner
   await withMutation(() => runner(source), {
@@ -236,6 +250,7 @@ async function importPasted(): Promise<void> {
 }
 
 function beginRefresh(source: LxSourceRecord): void {
+  if (isPublished(source)) return
   refreshTargetId.value = source.id
   status.value = ''
   failure.value = ''
@@ -251,6 +266,7 @@ function cancelRefresh(): void {
  * current remote content.
  */
 async function confirmRefresh(source: LxSourceRecord): Promise<void> {
+  if (isPublished(source)) return
   if (!source.builtIn && props.requestConsent && !await props.requestConsent()) return
   const replacedSha = source.sha256
   let adoptedSha = ''
@@ -277,11 +293,18 @@ onMounted(() => {
   <div class="lx-manager" data-lx-source-manager>
     <p data-lx-explanation>{{ text('settings.lx.explanation') }}</p>
 
-    <fieldset class="lx-manager__group" data-lx-source-list>
-      <legend>{{ text('settings.lx.title') }}</legend>
+    <fieldset
+      v-for="group in sourceGroups"
+      :key="group.id"
+      class="lx-manager__group"
+      data-lx-source-list
+      :data-lx-source-group="group.id"
+    >
+      <legend>{{ group.title }}</legend>
+      <p v-if="group.id === 'published'" class="lx-manager__note">{{ text('settings.lx.publishedPolicy') }}</p>
       <ul class="lx-manager__list">
         <li
-          v-for="source in rows"
+          v-for="source in group.sources"
           :key="source.id"
           class="lx-manager__item"
           :data-lx-source="source.id"
@@ -292,12 +315,13 @@ onMounted(() => {
               <input
                 type="checkbox"
                 :checked="source.enabled"
-                :disabled="busy"
+                :disabled="busy || isPublished(source)"
                 @change="onToggle(source, $event)"
               />
               <span data-lx-source-name>{{ source.name }}</span>
             </label>
-            <span v-if="source.builtIn" class="lx-manager__badge">{{ text('settings.lx.builtIn') }}</span>
+            <span v-if="source.builtIn || isPublished(source)" class="lx-manager__badge">{{ text('settings.lx.builtIn') }}</span>
+            <span v-if="isPublished(source) && !source.script" class="lx-manager__note" data-lx-source-unavailable>{{ text('settings.lx.publishedUnavailable') }}</span>
           </div>
           <p class="lx-manager__meta">
             <span class="lx-manager__meta-label">SHA-256</span>
@@ -310,6 +334,7 @@ onMounted(() => {
           <div class="lx-manager__actions">
             <button
               type="button"
+              v-if="!isPublished(source)"
               data-lx-source-move-up
               :disabled="busy || source.builtIn || isFirstCustom(source)"
               :aria-label="text('settings.lx.moveUpNamed', { name: source.name })"
@@ -318,6 +343,7 @@ onMounted(() => {
             >{{ text('settings.lx.moveUp') }}</button>
             <button
               type="button"
+              v-if="!isPublished(source)"
               data-lx-source-move-down
               :disabled="busy || source.builtIn || isLastCustom(source)"
               :aria-label="text('settings.lx.moveDownNamed', { name: source.name })"
@@ -327,12 +353,12 @@ onMounted(() => {
             <button
               type="button"
               data-lx-source-test
-              :disabled="busy"
+              :disabled="busy || !source.script"
               :aria-label="text('settings.lx.testNamed', { name: source.name })"
               @click="testSource(source)"
             >{{ text('settings.lx.test') }}</button>
             <button
-              v-if="source.originUrl"
+              v-if="source.originUrl && !isPublished(source)"
               type="button"
               data-lx-source-refresh
               :disabled="busy"
@@ -341,6 +367,7 @@ onMounted(() => {
             >{{ text('settings.lx.refresh') }}</button>
             <button
               type="button"
+              v-if="!isPublished(source)"
               data-lx-source-delete
               :disabled="busy || source.builtIn"
               :aria-label="text('settings.lx.deleteNamed', { name: source.name })"

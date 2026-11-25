@@ -1,16 +1,23 @@
+import { GD_STUDIO_API_ORIGIN } from '../../src/shared/gdStudio'
 import type { AuthEnv } from '../auth/routes'
 import type { D1Database } from '../env'
-import { parseJellyfinUserId } from './jellyfin'
+import { isPublicHostname } from './resolverMediaUrl'
 
-export const PLAYBACK_PROVIDER_IDS = ['chksz', 'lx', 'jellyfin'] as const
+export const PLAYBACK_PROVIDER_IDS = ['chksz', 'lx', 'gd-studio'] as const
 export type PlaybackProviderId = typeof PLAYBACK_PROVIDER_IDS[number]
 
+/**
+ * Identities that remain readable for historical catalogue rows, audits and old
+ * configuration, but are never canonical or eligible to resolve. `vkeys` was
+ * retired on 2026-11-16; keeping it in this union lets persisted legacy data be
+ * parsed safely without making the provider selectable.
+ */
 export type LegacyProviderId =
   | 'r2' | 'meting'
   | 'lx-huibq' | 'lx-ikun' | 'lx-juhe' | 'lx-qdy'
   | 'lx-flower' | 'lx-lx' | 'lx-grass' | 'lx-sixyin'
-  | 'piped' | 'invidious' | 'youtube' | 'qijie' | 'gd-studio'
-  | 'lx-huanyin'
+  | 'piped' | 'invidious' | 'youtube' | 'qijie'
+  | 'lx-huanyin' | 'vkeys' | 'jellyfin'
 
 export type CanonicalProviderId = PlaybackProviderId | LegacyProviderId
 
@@ -36,9 +43,6 @@ export interface ProviderEnv extends AuthEnv {
   LX_IKUN_MEDIA_ALLOWED_HOSTNAMES?: string
   LX_IKUN_REQUEST_KEY?: string
   CHKSZ_API_KEY?: string
-  JELLYFIN_BASE_URL?: string
-  JELLYFIN_API_TOKEN?: string
-  JELLYFIN_USER_ID?: string
   GD_STUDIO_API_BASE_URL?: string
   GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES?: string
   HUANYIN_API_BASE_URL?: string
@@ -80,36 +84,10 @@ interface ProviderHealthRow {
 export const CANONICAL_PROVIDERS: readonly CanonicalProviderDefinition[] = Object.freeze([
   Object.freeze({ id: 'chksz' as const, defaults: Object.freeze({ enabled: true, priority: 10 }), automaticPolicy: 'direct' as const }),
   Object.freeze({ id: 'lx' as const, defaults: Object.freeze({ enabled: true, priority: 20 }), automaticPolicy: 'direct' as const }),
-  Object.freeze({ id: 'jellyfin' as const, defaults: Object.freeze({ enabled: true, priority: 30 }), automaticPolicy: 'direct' as const }),
+  Object.freeze({ id: 'gd-studio' as const, defaults: Object.freeze({ enabled: true, priority: 40 }), automaticPolicy: 'direct' as const }),
 ])
 
 const validStatuses = new Set<ProviderState['status']>(['unknown', 'healthy', 'degraded', 'unavailable'])
-
-const PRIVATE_HOST_SUFFIXES = [
-  'localhost',
-  'local',
-  'internal',
-  'lan',
-  'home',
-  'home.arpa',
-  'localdomain',
-  'intranet',
-  'private',
-  'corp',
-] as const
-
-const isPublicHostname = (hostname: string) => {
-  if (
-    hostname.length > 253 || hostname.endsWith('.') || !hostname.includes('.') ||
-    hostname.includes(':') || hostname.startsWith('[') || /^\d+(?:\.\d+){3}$/.test(hostname)
-  ) return false
-
-  if (PRIVATE_HOST_SUFFIXES.some((suffix) =>
-    hostname === suffix || hostname.endsWith(`.${suffix}`))) return false
-
-  return hostname.split('.').every((label) =>
-    /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
-}
 
 const parseAllowedHostnames = (value: string | undefined) => {
   if (!value) return null
@@ -253,28 +231,10 @@ export const configuredLxRequestKey = (
   return value && /^[\x21-\x7e]{1,256}$/.test(value) ? value : null
 }
 
-export const configuredJellyfinOrigin = (env: ProviderEnv): string | null =>
-  parseConfiguredResolverOrigin(env.JELLYFIN_BASE_URL)
-
-export const configuredJellyfinApiToken = (env: ProviderEnv): string | null => {
-  const value = env.JELLYFIN_API_TOKEN
-  return value && /^[\x21-\x7e]{1,256}$/.test(value) ? value : null
+export const configuredGdStudioOrigin = (env: ProviderEnv): string | null => {
+  const origin = parseConfiguredResolverOrigin(env.GD_STUDIO_API_BASE_URL)
+  return origin === GD_STUDIO_API_ORIGIN ? origin : null
 }
-
-/**
- * Jellyfin identifies the acting user by GUID. Jellyfin 12 returns HTTP 400 for the single-item
- * metadata route when no user context is supplied, so a user ID is a hard requirement rather
- * than an optional enrichment. It is an identifier, not a credential, so it lives in `[vars]`
- * alongside the base URL rather than in the Worker secret store.
- */
-export const configuredJellyfinUserId = (env: ProviderEnv): string | null => {
-  const value = env.JELLYFIN_USER_ID
-  if (!value) return null
-  return parseJellyfinUserId(value)
-}
-
-export const configuredGdStudioOrigin = (env: ProviderEnv): string | null =>
-  parseConfiguredResolverOrigin(env.GD_STUDIO_API_BASE_URL)
 
 export const configuredGdStudioMediaHostnames = (env: ProviderEnv): string[] | null =>
   parseMetingAllowedHostnames(env.GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES)
@@ -309,15 +269,15 @@ export const deploymentAvailable = (id: CanonicalProviderId, env: ProviderEnv) =
         configuredLxMediaHostnames(id, env) !== null &&
         configuredLxRequestKey(id, env) !== null
     case 'jellyfin':
-      return configuredJellyfinOrigin(env) !== null &&
-        configuredJellyfinApiToken(env) !== null &&
-        configuredJellyfinUserId(env) !== null
+      return false // Retired by the owner; saved legacy configuration cannot restore it.
     case 'gd-studio':
       return configuredGdStudioOrigin(env) !== null &&
         configuredGdStudioMediaHostnames(env) !== null
     case 'lx-huanyin':
       return configuredHuanyinOrigin(env) !== null &&
         configuredHuanyinMediaHostnames(env) !== null
+    case 'vkeys':
+      return false // Retired on 2026-11-16; legacy rows and flags cannot reactivate it.
     case 'qijie':
     case 'lx-juhe':
     case 'lx-qdy':

@@ -7,6 +7,7 @@ import type { Track } from '../catalog/types'
 import { createPomodoroStore } from '../timers/pomodoro/store'
 import FocusBar from './FocusBar.vue'
 import { createSleepTimerStore } from '../timers/sleep/store'
+import { usePreferences } from '../../stores/preferences'
 
 const storage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
 const sleepStore = () => createSleepTimerStore({ autoTick: false, clock: { now: () => 0 }, storage, player: { pause() {}, stop() {} } })
@@ -162,12 +163,12 @@ describe('FocusBar shared filters and independent sleep session', () => {
     await wrapper.get('[data-phase-select="sleep"]').trigger('click')
   }
 
-  it('keeps all four music choices in Filters, independently of timer selection', async () => {
+  it('keeps all five music choices in Filters, independently of timer selection', async () => {
     const wrapper = mountBar()
     const state = wrapper.props('state')
     expect(wrapper.findAll('[data-focus-mode]')).toHaveLength(0)
     await wrapper.get('[data-advanced-trigger]').trigger('click')
-    expect(wrapper.findAll('[data-filter-tab]').map((button) => button.text())).toEqual(['All modes', 'Chill', 'Focus', 'Sleep'])
+    expect(wrapper.findAll('[data-filter-tab]').map((button) => button.text())).toEqual(['All modes', 'Chill', 'Focus', 'Sleep', 'Vocal(0)'])
     await wrapper.get('[data-filter-tab="sleep"]').trigger('click')
     expect(state.mode.value).toBe('sleep')
     expect(state.filteredTracks.value.map((track) => track.id)).toEqual(['sixth'])
@@ -192,7 +193,7 @@ describe('FocusBar shared filters and independent sleep session', () => {
     const wrapper = mountBar(undefined, { tracks: unclassified })
     const state = wrapper.props('state')
     await wrapper.get('[data-advanced-trigger]').trigger('click')
-    expect(wrapper.findAll('[data-filter-tab]')).toHaveLength(4)
+    expect(wrapper.findAll('[data-filter-tab]')).toHaveLength(5)
     await wrapper.get('[data-filter-tab="focus"]').trigger('click')
     expect(state.filteredTracks.value).toEqual([])
     await wrapper.get('[data-filter-tab="all"]').trigger('click')
@@ -626,5 +627,107 @@ describe('FocusBar as the Control Center opener', () => {
     await wrapper.get('.focus-bar').trigger('click')
     await wrapper.get('[data-focus-local-clock]').trigger('click')
     expect(wrapper.emitted('open-control-centre')).toBeUndefined()
+  })
+
+  it('displays active Vocal filter summary and mobile vocal badge', async () => {
+    const wrapper = mountBar()
+    const state = wrapper.props('state')
+    const trigger = wrapper.get('[data-advanced-trigger]')
+
+    expect(wrapper.find('[data-focus-vocal-badge]').exists()).toBe(false)
+    expect(trigger.attributes('data-filter-mode')).toBeUndefined()
+
+    state.setMode('vocal')
+    await nextTick()
+
+    expect(trigger.attributes('data-filter-active')).toBe('true')
+    expect(trigger.attributes('data-filter-mode')).toBe('vocal')
+    expect(wrapper.get('[data-focus-filter-summary]').text()).toBe('All games · Vocal')
+    expect(trigger.attributes('aria-label')).toContain('Vocal')
+    expect(wrapper.find('[data-focus-vocal-badge]').exists()).toBe(true)
+    expect(wrapper.get('[data-focus-vocal-badge]').text()).toBe('Vocal')
+
+    state.setMode(null)
+    await nextTick()
+
+    expect(wrapper.find('[data-focus-vocal-badge]').exists()).toBe(false)
+    expect(trigger.attributes('data-filter-mode')).toBeUndefined()
+  })
+
+  it('preserves Vocal selections and the running timer through resize and filter reopening', async () => {
+    const vocalTrack: Track = {
+      id: 'vocal-resize', title: 'Chorus', aliases: {}, games: ['hsr'], tabs: [],
+      relationIds: ['event:shared'], workGroupId: 'vocal-resize', vocalStatus: 'vocal',
+      needsClassification: false, sources: [{ provider: 'lx', externalId: 'wy:100001' }],
+    }
+    const wrapper = mountBar(undefined, { tracks: [vocalTrack] })
+    const state = wrapper.props('state')
+    state.setMode('vocal')
+    state.setSearch('Chorus')
+    state.toggleGame('genshin')
+    state.toggleGame('zzz')
+    state.toggleRelation('event:shared')
+    wrapper.props('pomodoroStore').start()
+    const remaining = wrapper.props('pomodoroStore').remainingSeconds.value
+    const trigger = wrapper.get('[data-advanced-trigger]')
+    await trigger.trigger('click')
+    const filters = wrapper.get('[data-advanced-filters]').element
+    window.dispatchEvent(new Event('resize'))
+    await nextTick()
+    expect(wrapper.get('[data-advanced-filters]').element).toBe(filters)
+    await trigger.trigger('keydown', { key: 'Escape' })
+    expect(document.activeElement).toBe(trigger.element)
+    await trigger.trigger('click')
+    expect(state.mode.value).toBe('vocal')
+    expect(state.search.value).toBe('Chorus')
+    expect(state.games.value).toEqual(['hsr'])
+    expect(state.relationIds.value).toEqual(['event:shared'])
+    expect(state.filteredTracks.value.map(track => track.id)).toEqual(['vocal-resize'])
+    expect(wrapper.get('[data-filter-tab="vocal"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.props('pomodoroStore').status.value).toBe('running')
+    expect(wrapper.props('pomodoroStore').remainingSeconds.value).toBe(remaining)
+    expect(wrapper.emitted('open-control-centre')).toBeUndefined()
+  })
+
+  it('closes filters with Escape after Clear all removes the focused button', async () => {
+    const wrapper = mountBar(undefined, { tracks: [] })
+    wrapper.props('state').setMode('vocal')
+    await wrapper.get('[data-advanced-trigger]').trigger('click')
+    const clear = wrapper.get<HTMLButtonElement>('[data-filter-clear-all]')
+    clear.element.focus()
+    await clear.trigger('click')
+    expect(document.activeElement).toBe(document.body)
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(wrapper.find('[data-advanced-filters]').exists()).toBe(false)
+    expect(document.activeElement).toBe(wrapper.get('[data-advanced-trigger]').element)
+  })
+
+  it('leaves Escape to another focused surface while filters remain open', async () => {
+    const wrapper = mountBar(undefined, { tracks: [] })
+    await wrapper.get('[data-advanced-trigger]').trigger('click')
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    outside.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(wrapper.find('[data-advanced-filters]').exists()).toBe(true)
+    expect(document.activeElement).toBe(outside)
+  })
+
+  it.each([
+    ['en', 'Vocal'],
+    ['zh-Hans', '人声'],
+    ['zh-Hant', '人聲'],
+  ] as const)('renders translated Vocal mode badge and summary in %s', async (locale, expectedText) => {
+    usePreferences().setLocale(locale)
+    const wrapper = mountBar()
+    const state = wrapper.props('state')
+    state.setMode('vocal')
+    await nextTick()
+
+    expect(wrapper.get('[data-focus-filter-summary]').text()).toContain(expectedText)
+    expect(wrapper.get('[data-focus-vocal-badge]').text()).toBe(expectedText)
+    usePreferences().setLocale('en')
   })
 })

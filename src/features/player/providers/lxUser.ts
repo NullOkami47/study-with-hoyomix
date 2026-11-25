@@ -9,18 +9,148 @@ import {
   type LxQuality,
   type PlaybackQualityPreferencesStore,
 } from '../qualityPreferences'
-import type {
-  AudioProvider,
-  Playable,
-  ProviderAttempt,
-  ResolveFailureCode,
+import {
+  ProviderResolveError,
+  type AudioProvider,
+  type Playable,
+  type ProviderAttempt,
+  type ResolveFailureCode,
 } from './types'
+import { BUILD_LX_CSP_SOURCES, currentSelfOrigin, isLxTargetAllowed, type LxCspSources } from '../lx/cspAllowList'
+import { isPublicHttpsTarget, LX_CSP_BLOCKED, upgradeLxMediaUrlToHttps } from '../../../shared/lxCspPolicy'
+import { LX_INVALID_RESPONSE, LX_NETWORK_ERROR, LX_REQUEST_TALLY } from '../lx/runtime/protocol'
+import { probeMediaPlayable, type MediaProbe } from '../mediaProbe'
+import { recordPlayback, redactMediaUrl } from '../playbackLog'
+import type { LxGlobalSourceRepository } from '../lx/globalSourceRepository'
 
 export interface LxUserProviderOptions {
   sourceRepository?: LxSourceRepository
   runtimeClientFactory?: () => LxRuntimeClient
   qualityStore?: Pick<PlaybackQualityPreferencesStore, 'lxQuality'>
+  /** Default sink for direct calls that do not supply a per-resolution context. */
   onSubAttempt?: (attempt: ProviderAttempt) => void
+  /**
+   * CSP source lists a returned media URL is checked against (H-01). Defaults to the build's
+   * emitted lists; only `media` is consulted here. Tests inject their own fixture origins.
+   */
+  cspSources?: LxCspSources
+  /** The origin `'self'` stands for; defaults to the document origin. */
+  selfOrigin?: string
+  /**
+   * Proves a promoted `https:` URL actually loads before committing to it. Defaults to a detached
+   * `<audio>` metadata probe; tests inject a stub.
+   */
+  mediaProbe?: MediaProbe
+  /**
+   * The registry of sources the Owner publishes for everybody. Its sources join the chain ahead of
+   * the user's own imports, in the Owner's order; the user's imports keep their own order and their
+   * own settings.
+   */
+  globalSourceRepository?: LxGlobalSourceRepository
+}
+
+/**
+ * Joins the published global sources and the user's own imports into one chain.
+ *
+ * The order is: the app's built-in source, then the published global sources in the Owner's order,
+ * then the user's own imports in the user's order. A user's import is never replaced or deleted by
+ * a published source.
+ *
+ * Two scripts with the same digest are the same script, so they are not run twice: the first
+ * occurrence in the chain wins. One exception: if the user has *disabled* their own copy of a
+ * script, that decision also suppresses the published copy of the same script — otherwise a user
+ * could not turn a source off while the Owner had it published.
+ */
+export function mergeLxSourceChain(
+  personal: readonly LxSourceRecord[],
+  global: readonly LxSourceRecord[],
+): LxSourceRecord[] {
+  const byPriority = (a: LxSourceRecord, b: LxSourceRecord): number =>
+    a.priority - b.priority || a.id.localeCompare(b.id)
+  const builtIns = personal.filter((source) => source.builtIn).sort(byPriority)
+  const imports = personal.filter((source) => !source.builtIn).sort(byPriority)
+  const published = [...global].sort(byPriority)
+
+  const disabledDigests = new Set(
+    personal.filter((source) => !source.builtIn && !source.enabled).map((source) => source.sha256),
+  )
+  const suppressed = new Set(
+    [...published.filter((source) => disabledDigests.has(source.sha256))].map((source) => source.sha256),
+  )
+
+  const seen = new Set<string>()
+  const chain: LxSourceRecord[] = []
+  for (const source of [...builtIns, ...published, ...imports]) {
+    if (suppressed.has(source.sha256)) continue
+    if (seen.has(source.sha256)) continue
+    seen.add(source.sha256)
+    chain.push(source)
+  }
+  return chain
+}
+
+// Read only the final host tally. Never copy the rejection text into a diagnostic event.
+const REQUEST_TALLY_PATTERN = /(?:^| )requests ok=(\d+) http_error=(\d+) blocked=(\d+) timeout=(\d+)$/u
+
+function readRequestTally(message: string) {
+  const match = REQUEST_TALLY_PATTERN.exec(message)
+  if (!match) return undefined
+  const counts = match.slice(1).map(Number)
+  if (!counts.every(Number.isSafeInteger)) return undefined
+  return { reqOk: counts[0]!, reqHttpErr: counts[1]!, reqBlocked: counts[2]!, reqTimeout: counts[3]! }
+}
+
+/**
+ * Turns the host's per-resolution request tally into a truthful failure code.
+ *
+ * The sandbox appends `requests ok=N http_error=N blocked=N timeout=N` to a failed `musicUrl`.
+ * `blocked` means no readable response at all (CORS, CSP or a transport refusal); `http_error`
+ * means the upstreams answered with 4xx/5xx; `ok > 0` with a failed resolution means they answered
+ * and the payload was unusable. With no tally at all (a script that failed before any request, or a
+ * mocked runtime) the honest answer is `unavailable` rather than a guess.
+ */
+export function classifyLxFailure(message: string, tally = readRequestTally(message)): ResolveFailureCode {
+  if (tally) {
+    if (tally.reqOk === 0) {
+      if (tally.reqTimeout > 0) return 'timeout'
+      if (tally.reqBlocked > 0) return 'transport_blocked'
+      if (tally.reqHttpErr > 0) return 'http_error'
+    }
+    return 'invalid_response'
+  }
+  if (message.includes(LX_REQUEST_TALLY)) return 'invalid_response'
+  return 'unavailable'
+}
+
+/** A refusal raised by the sandbox's `lx.request` CSP check, possibly rethrown by the script. */
+function isCspBlockedError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes(`${LX_CSP_BLOCKED}:`)
+}
+
+/** A sandbox refusal of an unplayable musicUrl result (`http:` media or custom headers, M-11). */
+function isInvalidResponseError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes(`${LX_INVALID_RESPONSE}:`) && !isCspBlockedError(err)
+}
+
+/** These host refusals have stable labels. Unknown detail stays inside the runtime. */
+function invalidResultReason(message: string) {
+  switch (message.replace(REQUEST_TALLY_PATTERN, '')) {
+    case `${LX_INVALID_RESPONSE}: Invalid media URL format`: return 'malformed_url'
+    case `${LX_INVALID_RESPONSE}: media URL needs custom request headers`: return 'custom_headers'
+    case `${LX_INVALID_RESPONSE}: plaintext http: media URL is not playable`: return 'plaintext'
+    default: return 'invalid_result'
+  }
+}
+
+/** A rejected host `fetch` behind `lx.request`, possibly rethrown by the script (task 41.7). */
+function isNetworkError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes(`${LX_NETWORK_ERROR}:`) && !isCspBlockedError(err)
+}
+
+function isTimeoutError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  const message = err.message.replace(REQUEST_TALLY_PATTERN, '').toLowerCase()
+  return message.includes('timeout') || message.includes('timed out')
 }
 
 const QUALITY_FALLBACK_TIERS: Record<LxQuality, readonly string[]> = {
@@ -112,6 +242,26 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
   const repository = options.sourceRepository ?? getDefaultLxSourceRepository()
   const runtimeClientFactory = options.runtimeClientFactory ?? (() => new LxRuntimeClient())
   const qualityStore = options.qualityStore ?? getDefaultPlaybackQualityPreferencesStore()
+  const cspSources = options.cspSources ?? BUILD_LX_CSP_SOURCES
+  const mediaProbe = options.mediaProbe ?? probeMediaPlayable
+  // Resolved per check, not here, so the default follows the document origin it runs under.
+  const mediaAllowed = (url: string): boolean => {
+    const parsed = new URL(url)
+    const effectiveSelfOrigin = options.selfOrigin ?? currentSelfOrigin()
+    return isLxTargetAllowed('media', parsed, cspSources, effectiveSelfOrigin)
+  }
+
+  // A private same-origin target may play, but its hostname does not belong in an export.
+  const diagnosticTarget = (raw: unknown): { target?: string } => {
+    if (typeof raw !== 'string') return {}
+    try {
+      const url = new URL(raw)
+      if (!isPublicHttpsTarget(url) || !mediaAllowed(url.href)) return {}
+      return { target: redactMediaUrl(url.href) }
+    } catch {
+      return {}
+    }
+  }
 
   return {
     id: 'lx',
@@ -120,22 +270,46 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
       return deriveLxCandidates(track).length > 0
     },
 
-    async resolve(track: Track, signal: AbortSignal): Promise<Playable | null> {
+    async resolve(track: Track, signal: AbortSignal, context): Promise<Playable | null> {
+      const onSubAttempt = context?.onSubAttempt ?? options.onSubAttempt
       if (signal.aborted) return null
 
       const candidates = deriveLxCandidates(track)
       if (candidates.length === 0) return null
 
-      const allSources = await repository.list()
-      const enabledSources: LxSourceRecord[] = allSources
-        .filter((s: LxSourceRecord) => s.enabled && (s.builtIn || allowsConfiguredSources()))
-        .sort((a: LxSourceRecord, b: LxSourceRecord) => a.priority - b.priority)
+      const storedPersonalSources = await repository.list()
+      // Once the site manages the default slot, a revoked or unavailable registry must never
+      // resurrect the old release snapshot from IndexedDB.
+      const personalSources = options.globalSourceRepository?.managesBundledSource
+        ? storedPersonalSources.filter(source => !source.builtIn)
+        : storedPersonalSources
+      // A published source is an enhancement, never a prerequisite. If the registry is unreachable
+      // or answers with something unusable, personal imports remain available. The managed default
+      // snapshot stays revoked until the site authorises it again. `try`/`catch` rather than `.catch()`: a synchronous
+      // throw from `list()` would escape before a promise handler was attached.
+      let globalSources: LxSourceRecord[] = []
+      if (options.globalSourceRepository) {
+        try {
+          globalSources = await options.globalSourceRepository.list()
+        } catch {
+          globalSources = []
+        }
+      }
+      const chain = mergeLxSourceChain(personalSources, globalSources)
+      // A published source is a third-party source like any other: it needs the user's consent to
+      // use configured sources, exactly as an imported one does.
+      const enabledSources: LxSourceRecord[] = chain.filter(
+        (s: LxSourceRecord) => s.enabled && (s.builtIn || allowsConfiguredSources()),
+      )
 
       if (enabledSources.length === 0 || signal.aborted) return null
 
       const client = runtimeClientFactory()
+      const abortRuntime = () => client.abort(signal.reason)
+      signal.addEventListener('abort', abortRuntime, { once: true })
 
       try {
+        if (signal.aborted) { abortRuntime(); return null }
         const preferredQuality = qualityStore.lxQuality()
         const fallbackTiers = QUALITY_FALLBACK_TIERS[preferredQuality] ?? QUALITY_FALLBACK_TIERS.standard
 
@@ -145,24 +319,35 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
           const sourceStart = Date.now()
           let sourceAttemptEmitted = false
           let lastErrorCode: ResolveFailureCode | undefined = undefined
+          /** Whether `lastErrorCode` came from a network-level `lx.request` failure (task 41.7). */
+          let lastErrorTransient = false
 
           let initedMeta: unknown = undefined
           try {
             const loadRes = await client.loadSource(source.script)
             initedMeta = loadRes.initedMeta
           } catch (err: unknown) {
-            const isTimeout =
-              err instanceof Error &&
-              (err.message.toLowerCase().includes('timeout') ||
-                err.message.toLowerCase().includes('timed out'))
-            const code: ResolveFailureCode = isTimeout ? 'timeout' : 'unavailable'
-            options.onSubAttempt?.({
+            // Registry deadlines abort the isolate before its own RPC timer expires. Preserve
+            // that typed reason instead of turning cancellation into a permanent source failure.
+            const reason = signal.aborted ? signal.reason ?? err : err
+            const code: ResolveFailureCode = reason instanceof ProviderResolveError
+              ? reason.code
+              : isTimeoutError(reason) ? 'timeout' : 'unavailable'
+            recordPlayback('lx.source.loadError', {
+              sourceId: source.id,
+              code,
+              aborted: signal.aborted,
+              stage: 'load', level: 'error', requestType: 'load',
+              ...readRequestTally(err instanceof Error ? err.message : ''),
+            })
+            onSubAttempt?.({
               providerId: 'lx',
               sourceId: source.id,
               sourceName: source.name,
               ok: false,
               latencyMs: Math.max(0, Date.now() - sourceStart),
               code,
+              ...(reason instanceof ProviderResolveError && reason.transient ? { transient: true as const } : {}),
             })
             continue
           }
@@ -216,10 +401,18 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
               // every `musicUrl` request outright.
               try {
                 const result = await client.callMusicUrl(candidate.source, musicInfo, tier)
+                if (signal.aborted) return null
 
                 // CRITICAL: Reject media URLs that require custom request headers
                 if (result?.requestHeaders && Object.keys(result.requestHeaders).length > 0) {
-                  options.onSubAttempt?.({
+                  recordPlayback('lx.resolve.detail', {
+                    sourceId: source.id,
+                    code: 'invalid_response',
+                    stage: 'media', level: 'error', requestType: 'musicUrl', tier,
+                    reason: 'custom_headers',
+                    ...diagnosticTarget(result.url),
+                  })
+                  onSubAttempt?.({
                     providerId: 'lx',
                     sourceId: source.id,
                     sourceName: source.name,
@@ -232,8 +425,21 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
                   continue
                 }
 
+                if (isPlayableMediaUrl(result?.url) && !mediaAllowed(result.url)) {
+                  // H-01: media-src would refuse this URL on the element. Refuse it here with the
+                  // specific code (recorded once for the source below) and keep looking: another
+                  // tier, candidate or source may return a listed origin.
+                  recordPlayback('lx.resolve.detail', {
+                    sourceId: source.id,
+                    code: 'csp_blocked',
+                    stage: 'media', level: 'error', requestType: 'musicUrl', tier,
+                  })
+                  lastErrorCode = 'csp_blocked'
+                  continue
+                }
+
                 if (isPlayableMediaUrl(result?.url)) {
-                  options.onSubAttempt?.({
+                  onSubAttempt?.({
                     providerId: 'lx',
                     sourceId: source.id,
                     sourceName: source.name,
@@ -248,10 +454,76 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
                 }
 
                 if (classifyMediaUrl(result?.url) === 'insecure') {
-                  // Well-formed but unplayable here. Record this source as failed with a precise
-                  // code and keep looking: another tier, another candidate or another source may
-                  // still return HTTPS media. This is the case the bundled sources actually hit.
-                  options.onSubAttempt?.({
+                  // A plaintext URL on a media host this deployment already trusts is worth exactly
+                  // one promotion attempt: the same signed path over TLS is what actually plays.
+                  // Verify it loads first, so a dead signature falls through to the next source
+                  // rather than stopping playback on a URL we only believed in.
+                  const promoted = upgradeLxMediaUrlToHttps(result?.url)
+                  if (promoted && mediaAllowed(promoted) && (await mediaProbe(promoted, signal))) {
+                    onSubAttempt?.({
+                      providerId: 'lx',
+                      sourceId: source.id,
+                      sourceName: source.name,
+                      ok: true,
+                      latencyMs: Math.max(0, Date.now() - sourceStart),
+                    })
+                    return {
+                      kind: 'audio',
+                      url: promoted,
+                      mimeType: inferMimeType(promoted),
+                    }
+                  }
+
+                  // Not promotable, or the promoted form did not load. Record the precise reason and
+                  // keep looking: another tier, another candidate or another source may still return
+                  // HTTPS media.
+                  recordPlayback('lx.resolve.detail', {
+                    sourceId: source.id,
+                    code: 'media_insecure',
+                    stage: 'media', level: 'error', requestType: 'musicUrl', tier,
+                    promoted: Boolean(promoted),
+                    allowed: promoted ? mediaAllowed(promoted) : false,
+                    ...diagnosticTarget(promoted),
+                  })
+                  onSubAttempt?.({
+                    providerId: 'lx',
+                    sourceId: source.id,
+                    sourceName: source.name,
+                    ok: false,
+                    latencyMs: Math.max(0, Date.now() - sourceStart),
+                    code: 'media_insecure',
+                  })
+                  sourceAttemptEmitted = true
+                  lastErrorCode = 'media_insecure'
+                  continue
+                }
+              } catch (err: unknown) {
+                const message = err instanceof Error ? err.message : ''
+                const tally = readRequestTally(message)
+                const hostDetails = { sourceId: source.id, stage: 'resolve', level: 'error', requestType: 'musicUrl', tier, ...tally }
+                if (signal.aborted) {
+                  // Emit before returning: the next quality tier's cancellation guard would
+                  // otherwise discard this source's timeout evidence entirely.
+                  const reason = signal.reason ?? err
+                  const code: ResolveFailureCode = lastErrorCode === 'csp_blocked'
+                    ? 'csp_blocked'
+                    : reason instanceof ProviderResolveError
+                      ? reason.code
+                      : isTimeoutError(reason) ? 'timeout' : 'unavailable'
+                  recordPlayback('lx.resolve.detail', { ...hostDetails, code, aborted: true })
+                  onSubAttempt?.({
+                    providerId: 'lx', sourceId: source.id, sourceName: source.name, ok: false,
+                    latencyMs: Math.max(0, Date.now() - sourceStart), code,
+                    ...(code !== 'csp_blocked' && reason instanceof ProviderResolveError && reason.transient ? { transient: true as const } : {}),
+                  })
+                  return null
+                }
+                if (isInvalidResponseError(err)) {
+                  // The sandbox refuses plaintext `http:` media and results requiring custom
+                  // request headers; preserve any earlier `csp_blocked` code for the same source.
+                  recordPlayback('lx.resolve.detail', { ...hostDetails, code: 'invalid_response', reason: invalidResultReason(message) })
+                  if (lastErrorCode === 'csp_blocked') continue
+                  onSubAttempt?.({
                     providerId: 'lx',
                     sourceId: source.id,
                     sourceName: source.name,
@@ -263,32 +535,47 @@ export function createLxUserProvider(options: LxUserProviderOptions = {}): Audio
                   lastErrorCode = 'invalid_response'
                   continue
                 }
-              } catch (err: unknown) {
-                const isTimeout =
-                  err instanceof Error &&
-                  (err.message.toLowerCase().includes('timeout') ||
-                    err.message.toLowerCase().includes('timed out'))
-                const code: ResolveFailureCode = isTimeout ? 'timeout' : 'unavailable'
-                lastErrorCode = code
+                const cspBlocked = isCspBlockedError(err)
+                const network = !cspBlocked && isNetworkError(err)
+                // A failure that carries the host's request tally says *why* it failed, so prefer
+                // that over the old binary "network or unavailable" split. A resolve-level timeout
+                // is still a timeout whatever the tally says.
+                const code: ResolveFailureCode = cspBlocked
+                  ? 'csp_blocked'
+                  : isTimeoutError(err)
+                    ? 'timeout'
+                    : message.includes(LX_REQUEST_TALLY)
+                      ? classifyLxFailure(message, tally)
+                      : 'unavailable'
+                recordPlayback('lx.resolve.detail', { ...hostDetails, code, transient: network })
+                // A policy refusal is the actionable outcome; a later generic failure of the
+                // same source does not overwrite it.
+                if (lastErrorCode !== 'csp_blocked') {
+                  lastErrorCode = code
+                  // A transient network drop may succeed on a retry; keep that on the attempt.
+                  lastErrorTransient = network
+                }
                 continue
               }
             }
           }
 
           if (!sourceAttemptEmitted) {
-            options.onSubAttempt?.({
+            onSubAttempt?.({
               providerId: 'lx',
               sourceId: source.id,
               sourceName: source.name,
               ok: false,
               latencyMs: Math.max(0, Date.now() - sourceStart),
               code: lastErrorCode ?? 'unavailable',
+              ...(lastErrorTransient && lastErrorCode === 'unavailable' ? { transient: true as const } : {}),
             })
           }
         }
 
         return null
       } finally {
+        signal.removeEventListener('abort', abortRuntime)
         try {
           await client.dispose()
         } catch {

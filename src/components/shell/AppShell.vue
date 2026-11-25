@@ -2,11 +2,12 @@
 import { onBeforeUnmount, watchEffect } from 'vue'
 import { isLocale, translate, type TranslationKey } from '../../i18n'
 import LiquidGlassCanvas from '../../features/liquid-glass/LiquidGlassCanvas.vue'
+import StudioGlassEnvironment from '../../features/liquid-glass/StudioGlassEnvironment.vue'
 import AccountMenu from '../../features/account/AccountMenu.vue'
 import { usePreferences } from '../../stores/preferences'
 
 const props = withDefaults(defineProps<{ legacy?: boolean }>(), { legacy: false })
-const { locale, lowPower, setLocale, visualStyle } = usePreferences()
+const { locale, lowPower, setLocale, visualStyle, studioBlur, studioGlassGray, studioEdge } = usePreferences()
 
 watchEffect(() => {
   document.documentElement.dataset.theme = visualStyle.value
@@ -28,7 +29,8 @@ function onLocaleChange(event: Event): void {
 
 <template>
   <div class="app-shell" :lang="locale">
-    <LiquidGlassCanvas v-if="visualStyle !== 'studio'" :low-power="lowPower" />
+    <LiquidGlassCanvas v-if="visualStyle === 'cinematic'" :low-power="lowPower" />
+    <StudioGlassEnvironment v-else-if="visualStyle === 'studio'" :blur-radius="studioBlur" :glass-gray="studioGlassGray" :edge="studioEdge" />
 
     <a class="app-shell__skip-link" href="#app-content">{{ text('a11y.skipToContent') }}</a>
 
@@ -62,6 +64,10 @@ function onLocaleChange(event: Event): void {
 </template>
 
 <style src="../../styles/tokens.css"></style>
+<style>
+@import "../../styles/glass.css";
+@import "../../styles/glass-accessibility.css";
+</style>
 
 <style scoped>
 .app-shell {

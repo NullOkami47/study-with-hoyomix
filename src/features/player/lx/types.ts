@@ -1,5 +1,6 @@
 export const LX_MAX_SCRIPT_BYTES = 512 * 1024
 export const LX_MAX_REMOTE_RESPONSE_BYTES = 512 * 1024
+export const LX_BUILTIN_ID = 'builtin-kulao-svip'
 
 export interface LxSourceRecord {
   id: string

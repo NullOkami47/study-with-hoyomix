@@ -1,11 +1,12 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { Log, LogLevel, Miniflare } from './miniflare-compat'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createAuthHandler } from '../auth/routes'
 import { createAdminHandler, type AdminEnv } from '../admin/routes'
-import { ChkszAdminSearchRateLimiter } from '../providers/chkszSearchProxy'
+import { CHKSZ_ADMIN_SEARCH_RATE_LIMIT_PER_MINUTE, ChkszAdminSearchRateLimiter } from '../providers/chkszSearchProxy'
+import worker from '../index'
 
 const ORIGIN = 'https://study.example'
 const NOW = 1_787_030_400_000
@@ -258,5 +259,36 @@ describe('Admin ChKSz search proxy (owner-key, bounded)', () => {
       return upstreamJson(upstreamSearchBody())
     }) as typeof fetch)
     expect((await hanging.fetch(searchRequest({ keyword: 'test' }, adminCookie))).status).toBe(504)
+  })
+  // Wave F exploration (task 21, design Property 8, M-06). Expected to FAIL on the unfixed tree:
+  // `worker.fetch` builds a new admin handler, and with it a new limiter, for every request.
+  it('M-06: limits limit + 1 admin searches sent through worker.fetch with 429 and Retry-After', async () => {
+    await enableOwnerFallback()
+    const userId = 'm06-admin'
+    await database.prepare(`
+      INSERT INTO users (id, display_name, role, created_at, updated_at)
+      VALUES (?, 'admin', 'admin', ?, ?)
+    `).bind(userId, Date.now(), Date.now()).run()
+    const issued = await createAuthHandler(env, { now: Date.now }).issueSession(userId)
+    const cookie = `__Host-session=${issued.token}`
+    let upstreamCalls = 0
+    vi.stubGlobal('fetch', async () => {
+      upstreamCalls += 1
+      return upstreamJson(upstreamSearchBody())
+    })
+    try {
+      const statuses: number[] = []
+      let last: Response | null = null
+      for (let attempt = 0; attempt <= CHKSZ_ADMIN_SEARCH_RATE_LIMIT_PER_MINUTE; attempt++) {
+        last = await worker.fetch(searchRequest({ keyword: `k${attempt}` }, cookie), env as never)
+        statuses.push(last.status)
+      }
+      expect(statuses.slice(0, -1).every((status) => status === 200), `statuses=${statuses.join(',')}`).toBe(true)
+      expect(last!.status, `statuses=${statuses.join(',')} upstreamCalls=${upstreamCalls}`).toBe(429)
+      expect(last!.headers.get('retry-after') ?? '').toMatch(/^[0-9]+$/)
+      expect(upstreamCalls).toBe(CHKSZ_ADMIN_SEARCH_RATE_LIMIT_PER_MINUTE)
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })

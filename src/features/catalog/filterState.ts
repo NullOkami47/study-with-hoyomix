@@ -6,7 +6,7 @@ import { safeLocalStorage, type SafeStorage } from '../../utils/safeStorage'
 
 export const CATALOG_FILTER_STORAGE_KEY_V2 = 'study-with-hoyomix.catalog-filters.v2'
 export const CATALOG_FILTER_STORAGE_KEY_V1 = 'study-with-hoyomix.catalog-filters.v1'
-export type MusicMode = TabId | null
+export type MusicMode = TabId | 'vocal' | null
 
 /**
  * Every game the catalogue knows, in top-bar order. A first visit selects all of
@@ -108,7 +108,7 @@ function validateSnapshot(value: unknown, relationIds: ReadonlySet<string>): Fil
   if (!isExactSnapshotShape(value)) return undefined
   if (typeof value.search !== 'string' || value.search.length > MAX_SEARCH_LENGTH || controlCharacters.test(value.search)) return undefined
   if (!isSelection(value.games, gameIds, gameIds.size)) return undefined
-  if (value.mode !== null && !tabIds.has(value.mode as TabId)) return undefined
+  if (value.mode !== null && value.mode !== 'vocal' && !tabIds.has(value.mode as TabId)) return undefined
   if (!isSelection(value.relationIds, relationIds, MAX_OPTION_LENGTH)) return undefined
 
   return {
@@ -245,7 +245,10 @@ export function createCatalogFilterState(tracks: Track[], storage: SafeStorage =
 
   const filteredTracks = computed(() => {
     const { mode, ...query } = currentCandidate()?.snapshot ?? initialSnapshot()
-    return repository.value.query({ ...query, tabs: mode ? [mode] : [] })
+    if (mode === 'vocal') {
+      return repository.value.query({ ...query, tabs: [], vocalStatus: 'vocal' })
+    }
+    return repository.value.query({ ...query, tabs: mode ? [mode] : [], vocalStatus: undefined })
   })
 
   function update(updateSnapshot: (snapshot: FilterSnapshot) => FilterSnapshot): void {
@@ -282,7 +285,7 @@ export function createCatalogFilterState(tracks: Track[], storage: SafeStorage =
       if (games.value.length === 1 && games.value[0] === game) return
       update((snapshot) => ({ ...snapshot, games: toggled(snapshot.games, game) }))
     },
-    setMode: (value) => { if (value === null || tabIds.has(value)) update((snapshot) => ({ ...snapshot, mode: value })) },
+    setMode: (value) => { if (value === null || value === 'vocal' || tabIds.has(value)) update((snapshot) => ({ ...snapshot, mode: value })) },
     toggleRelation: (relationId) => { if (relationOptionIds.has(relationId)) update((snapshot) => ({ ...snapshot, relationIds: toggled(snapshot.relationIds, relationId) })) },
   }
 }

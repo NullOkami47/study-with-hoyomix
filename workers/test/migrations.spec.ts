@@ -34,6 +34,11 @@ const REQUIRED_MIGRATIONS = [
   '0026_auth_provider_linuxdo.sql',
   '0027_background_metadata_and_overrides.sql',
   '0028_user_ui_preferences.sql',
+  '0029_community_chat.sql',
+  '0030_chat_retention.sql',
+  '0031_lx_global_sources.sql',
+  '0032_catalogue_discovery.sql',
+  '0033_catalogue_discovery_automation.sql',
 ]
 const REQUIRED_TABLES = [
   'account_deletion_events',
@@ -47,6 +52,13 @@ const REQUIRED_TABLES = [
   'catalog_reports',
   'catalog_revisions',
   'catalogue_aliases',
+  'catalogue_discovery_automation_cycles',
+  'catalogue_discovery_automation_rows',
+  'catalogue_discovery_automation_stages',
+  'catalogue_discovery_candidates',
+  'catalogue_discovery_locks',
+  'catalogue_discovery_runs',
+  'catalogue_discovery_sheet_operations',
   'catalogue_import_batches',
   'catalogue_import_changes',
   'catalogue_sources',
@@ -54,9 +66,14 @@ const REQUIRED_TABLES = [
   'catalogue_track_games',
   'catalogue_track_relations',
   'catalogue_tracks',
+  'chat_bans',
   'chat_message_versions',
   'chat_messages',
   'chat_reports',
+  'chat_request_receipts',
+  'chat_retention_pending',
+  'chat_retention_state',
+  'chat_send_state',
   'chksz_discovery_locks',
   'chksz_discovery_rate_events',
   'chksz_dynamic_discoveries',
@@ -65,6 +82,9 @@ const REQUIRED_TABLES = [
   'focus_sessions',
   'library_sync_state',
   'listening_history',
+  'lx_global_registry',
+  'lx_global_source_snapshots',
+  'lx_global_sources',
   'moderation_actions',
   'oauth_flows',
   'playlist_tracks',
@@ -90,20 +110,31 @@ const REQUIRED_EXPLICIT_INDEXES = [
   'idx_catalog_reports_reporter_status',
   'idx_catalog_reports_status_created',
   'idx_catalog_revisions_report',
+  'idx_catalogue_discovery_automation_cycles_started',
+  'idx_catalogue_discovery_automation_rows_created',
+  'idx_catalogue_discovery_automation_stages_status',
+  'idx_catalogue_discovery_runs_created',
+  'idx_catalogue_discovery_updated',
   'idx_catalogue_import_batches_active_snapshot',
   'idx_catalogue_import_changes_batch_decision',
   'idx_catalogue_sources_track',
   'idx_chat_message_versions_message_created',
   'idx_chat_messages_retention',
   'idx_chat_messages_room_created',
+  'idx_chat_messages_room_expiry',
+  'idx_chat_moderation_message',
+  'idx_chat_receipts_message',
+  'idx_chat_reports_message',
   'idx_chat_reports_pending_unique',
   'idx_chat_reports_status_created',
+  'idx_chat_versions_expiry',
   'idx_chksz_discovery_rate_events_created',
   'idx_chksz_dynamic_discoveries_status',
   'idx_favourites_user_created',
   'idx_filter_rules_enabled_kind',
   'idx_focus_sessions_user_ended',
   'idx_listening_history_user_played',
+  'idx_lx_global_sources_order',
   'idx_moderation_actions_target_created',
   'idx_oauth_flows_expiry',
   'idx_playlist_tracks_playlist_position',
@@ -141,11 +172,16 @@ const REQUIRED_FOREIGN_KEYS: Record<string, string[]> = {
   chat_message_versions: ['chat_messages', 'users'],
   chat_messages: ['users'],
   chat_reports: ['chat_messages', 'users', 'users'],
+  chat_retention_pending: ['chat_messages'],
+  chat_retention_state: [],
   favourites: ['users'],
   filter_rules: ['users', 'users'],
   focus_sessions: ['users'],
   listening_history: ['users'],
   library_sync_state: ['users'],
+  lx_global_sources: [],
+  lx_global_source_snapshots: ['lx_global_sources'],
+  lx_global_registry: [],
   moderation_actions: ['chat_messages', 'users', 'users'],
   playlist_tracks: ['playlists'],
   playlists: ['users', 'users'],
@@ -991,6 +1027,20 @@ describe('D1 migrations', () => {
     ).toBeNull()
   })
 
+  it('enforces retention state constraints and pending message cascade', async () => {
+    expect(await database.prepare("SELECT * FROM chat_retention_state WHERE room_id='global'").first()).toEqual({
+      room_id: 'global', message_count: 0, floor_created_at: null, floor_id: null,
+    })
+    await expectD1ConstraintFailure(database.prepare("UPDATE chat_retention_state SET message_count=-1 WHERE room_id='global'").run())
+    await expectD1ConstraintFailure(database.prepare("UPDATE chat_retention_state SET floor_created_at=1 WHERE room_id='global'").run())
+    await expectD1ConstraintFailure(database.prepare("INSERT INTO chat_retention_pending(message_id) VALUES('missing-message')").run())
+    await database.prepare("INSERT INTO chat_messages(id,user_id,author_display_name,content,created_at,expires_at) VALUES('retention-fk',NULL,'Deleted user','Fixture',0,1000)").run()
+    await database.prepare("INSERT INTO chat_retention_pending(message_id) VALUES('retention-fk')").run()
+    await database.prepare("DELETE FROM chat_messages WHERE id='retention-fk'").run()
+    expect(await database.prepare("SELECT * FROM chat_retention_pending WHERE message_id='retention-fk'").first()).toBeNull()
+    expect((await database.prepare('PRAGMA foreign_key_check').all()).results).toEqual([])
+  })
+
   it('uses integer UTC timestamps, explicit query indexes, and token hashes only', async () => {
     for (const table of REQUIRED_TABLES) {
       const columns = await database.prepare(`PRAGMA table_info(${table})`).all<TableInfoRow>()
@@ -1032,5 +1082,154 @@ describe('D1 migrations', () => {
         table,
       ).toEqual([...expectedTargets].sort())
     }
+  })
+})
+
+// 0031 has to be applicable to the database that is already in production, not only to an empty
+// one. That database is at 0030 with real rows in it: accounts, sessions, catalogue records,
+// backgrounds, provider settings. So the test applies the corpus *through 0030*, takes a full
+// dump of every table that existed before, applies 0031, and compares. A migration that rewrote or
+// dropped a row would fail here even if the fresh-database test stayed green.
+describe('D1 migration 0031 on an existing 0030 database', () => {
+  const miniflare = new Miniflare({
+    compatibilityDate: '2025-12-01',
+    modules: true,
+    script: 'export default { fetch() { return new Response("ok") } }',
+    d1Databases: { DB: 'study-with-hoyomix-upgrade-test' },
+    d1Persist: false,
+    log: new Log(LogLevel.NONE),
+  })
+
+  const ADDED_TABLES = ['lx_global_registry', 'lx_global_source_snapshots', 'lx_global_sources']
+  const PRE_EXISTING_TABLES = REQUIRED_TABLES.filter((name) => !ADDED_TABLES.includes(name)&&!name.startsWith('catalogue_discovery_'))
+
+  let database: TestDatabase
+
+  const dump = async (): Promise<Record<string, string[]>> => {
+    const snapshot: Record<string, string[]> = {}
+    for (const table of PRE_EXISTING_TABLES) {
+      const rows = await database.prepare(`SELECT * FROM ${table}`).all<Record<string, unknown>>()
+      snapshot[table] = (rows.results ?? []).map((row: Record<string, unknown>) => JSON.stringify(row)).sort()
+    }
+    return snapshot
+  }
+
+  beforeAll(async () => {
+    database = await miniflare.getD1Database('DB')
+    await applyPendingMigrations(
+      database,
+      REQUIRED_MIGRATIONS.filter((name) => name < '0031_lx_global_sources.sql'),
+    )
+  })
+
+  afterAll(async () => {
+    await miniflare.dispose()
+  })
+
+  it('leaves every pre-existing row exactly as it was', async () => {
+    const before = await dump()
+    // Something to lose: the migration corpus seeds provider settings, and an account plus a
+    // session are the rows a careless rebuild would take with it.
+    const now = Date.now()
+    await database
+      .prepare('UPDATE provider_health SET priority = 7 WHERE provider_key = ?')
+      .bind('chksz')
+      .run()
+    await database
+      .prepare(
+        `INSERT INTO users (id, display_name, role, created_at, updated_at)
+         VALUES ('upgrade-user', 'Upgrade', 'owner', ?, ?)`,
+      )
+      .bind(now, now)
+      .run()
+    const withRows = await dump()
+
+    await applyPendingMigrations(database, ['0031_lx_global_sources.sql'])
+
+    expect(await dump()).toEqual(withRows)
+    expect(Object.keys(before).length).toBe(PRE_EXISTING_TABLES.length)
+  })
+
+  it('creates the registry with its seed row and no dependency on a user account', async () => {
+    const registry = await database.prepare('SELECT id, revision, updated_at FROM lx_global_registry').all()
+    expect(registry.results).toEqual([{ id: 1, revision: 1, updated_at: 0 }])
+
+    const sources = await database.prepare('SELECT COUNT(*) AS n FROM lx_global_sources').all<{ n: number }>()
+    expect(sources.results[0]?.n).toBe(0)
+  })
+
+  it('enforces the foreign key from a snapshot to its source, and cascades the delete', async () => {
+    const now = Date.now()
+    await expectD1ConstraintFailure(
+      database
+        .prepare(
+          `INSERT INTO lx_global_source_snapshots (source_id, sha256, script, version, created_at, note)
+           VALUES ('missing', ?, 'var a = 1', NULL, ?, NULL)`,
+        )
+        .bind('a'.repeat(64), now)
+        .run(),
+    )
+
+    await database
+      .prepare(
+        `INSERT INTO lx_global_sources
+           (id, name, version, origin_url, active_sha256, enabled, priority, status,
+            required_origins, pending_origins, origin_kind, created_at, updated_at)
+         VALUES ('lxg_test', 'Test', NULL, 'https://example.test/a.js', ?, 1, 100, 'active',
+                 '[]', '[]', 'url', ?, ?)`,
+      )
+      .bind('a'.repeat(64), now, now)
+      .run()
+    await database
+      .prepare(
+        `INSERT INTO lx_global_source_snapshots (source_id, sha256, script, version, created_at, note)
+         VALUES ('lxg_test', ?, 'var a = 1', NULL, ?, 'initial import')`,
+      )
+      .bind('a'.repeat(64), now)
+      .run()
+
+    await database.prepare('DELETE FROM lx_global_sources WHERE id = ?').bind('lxg_test').run()
+    const remaining = await database.prepare('SELECT COUNT(*) AS n FROM lx_global_source_snapshots').all<{ n: number }>()
+    expect(remaining.results[0]?.n).toBe(0)
+  })
+
+  it('rejects a status, digest or script that the schema does not allow', async () => {
+    const now = Date.now()
+    const insert = (overrides: Record<string, unknown>) => {
+      const row = {
+        id: 'lxg_guard',
+        name: 'Guard',
+        version: null,
+        origin_url: 'https://example.test/a.js',
+        active_sha256: 'b'.repeat(64),
+        enabled: 1,
+        priority: 100,
+        status: 'active',
+        required_origins: '[]',
+        pending_origins: '[]',
+        origin_kind: 'url',
+        created_at: now,
+        updated_at: now,
+        ...overrides,
+      }
+      return database
+        .prepare(
+          `INSERT INTO lx_global_sources
+             (id, name, version, origin_url, active_sha256, enabled, priority, status,
+              required_origins, pending_origins, origin_kind, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          row.id, row.name, row.version, row.origin_url, row.active_sha256, row.enabled, row.priority,
+          row.status, row.required_origins, row.pending_origins, row.origin_kind, row.created_at, row.updated_at,
+        )
+        .run()
+    }
+
+    await expectD1ConstraintFailure(insert({ status: 'published' }))
+    await expectD1ConstraintFailure(insert({ active_sha256: 'short' }))
+    await expectD1ConstraintFailure(insert({ enabled: 2 }))
+    await expectD1ConstraintFailure(insert({ required_origins: 'not json' }))
+    await expectD1ConstraintFailure(insert({ origin_kind: 'r2' }))
   })
 })

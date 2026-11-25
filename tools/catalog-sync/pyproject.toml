@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "study-with-hoyomix-catalog-sync"
+version = "0.1.0"
+description = "Unauthenticated public metadata importer for the Study with HOYO-MiX review queue"
+requires-python = ">=3.10"
+dependencies = [
+  "ytmusicapi>=1.10,<2",
+  "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+  "PyYAML>=6,<7",
+]
+
+[project.scripts]
+catalog-sync = "catalog_sync.__main__:main"
+catalog-discover = "catalog_sync.discover_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["catalog_sync*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

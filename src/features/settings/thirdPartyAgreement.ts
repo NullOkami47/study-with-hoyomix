@@ -11,7 +11,7 @@ export const agreementCopy = {
     infoIntro: '使用 api.chksz.com 提供的網易雲音樂、QQ 音樂及酷狗音樂解析介面。請先前往網站註冊並登入，取得個人 API Key。目前的註冊資格以 ChKSz 官方網站公布的資訊為準，可能僅支援 LinuxDo 使用者。',
     infoPrivacy: '個人 API Key 預設只保留在目前頁面的記憶體，重新載入頁面即會清除；選擇記住時，會儲存在此裝置的瀏覽器儲存空間。解析已有來源的歌曲時會直接傳送至 ChKSz；動態搜尋歌曲時會透過本站必要的代理端點傳送至 ChKSz。個人 Key 不會同步到 Study with HOYO-MiX 帳戶。',
     paragraphs: [
-      '本協議適用於你主動設定的個人 ChKSz API Key 及自訂 LX 音樂源。本站提供配置與呼叫功能；第三方服務獨立營運，其名稱、內容與帳戶不代表本站與該服務、音樂平台或權利人有合作或授權關係。本站既有 Jellyfin、catalogue 與基本播放不以同意本協議為前提。',
+      '本協議適用於你主動設定的個人 ChKSz API Key 及自訂 LX 音樂源。本站提供配置與呼叫功能；第三方服務獨立營運，其名稱、內容與帳戶不代表本站與該服務、音樂平台或權利人有合作或授權關係。本站既有 catalogue 與基本播放不以同意本協議為前提。',
       '請確認你有權使用接口、帳戶及內容，並遵守所在地適用法律、版權要求、第三方服務條款與隱私政策。不得以這些功能規避付費、地區限制、版權保護或存取控制；請自行評估來源可信度，勿提供不必要的密碼、Cookie 或其他敏感資料。',
       'API Key、歌曲識別碼、查詢內容及播放請求可能直接或經本站必要代理傳送至第三方；第三方亦會取得建立網絡連線所需的資料。個人 ChKSz Key 預設只留在頁面記憶體，記住時存於本機瀏覽器，不同步至本站帳戶。靜態來源解析直接向 ChKSz 發送 Key，動態搜尋則經本站代理。自訂 LX 腳本存於本機 IndexedDB，其網絡請求依沙箱及本站安全政策執行。',
       '第三方的服務可能中斷、變更、收費或回傳錯誤、不安全或侵權內容。本站無法保證其可用性、準確性、安全性或隱私做法；請閱讀其政策並自行決定是否使用。個人 Key、自訂腳本與同意記錄只保留在目前裝置，同意不代表本站替第三方作出保證。',
@@ -24,7 +24,7 @@ export const agreementCopy = {
     infoIntro: '使用 api.chksz.com 提供的网易云音乐、QQ 音乐及酷狗音乐解析接口。请先前往网站注册并登录，取得个人 API Key。目前的注册资格以 ChKSz 官方网站公布的信息为准，可能仅支持 LinuxDo 用户。',
     infoPrivacy: '个人 API Key 默认只保留在当前页面的内存，重新加载页面即会清除；选择记住时，会保存在此设备的浏览器存储空间。解析已有来源的歌曲时会直接发送至 ChKSz；动态搜索歌曲时会经本站必要的代理端点发送至 ChKSz。个人 Key 不会同步到 Study with HOYO-MiX 账户。',
     paragraphs: [
-      '本协议适用于你主动设置的个人 ChKSz API Key 及自定义 LX 音乐源。本站提供配置与调用功能；第三方服务独立运营，其名称、内容及账户不表示本站与该服务、音乐平台或权利人有合作或授权关系。既有 Jellyfin、catalogue 及基本播放不要求同意本协议。',
+      '本协议适用于你主动设置的个人 ChKSz API Key 及自定义 LX 音乐源。本站提供配置与调用功能；第三方服务独立运营，其名称、内容及账户不表示本站与该服务、音乐平台或权利人有合作或授权关系。既有 catalogue 及基本播放不要求同意本协议。',
       '请确认你有权使用接口、账户及内容，遵守适用法律、版权要求、第三方服务条款与隐私政策。不得规避付费、地区限制、版权保护或访问控制。请判断来源可信度，勿提供不必要的密码、Cookie 等敏感信息。',
       'API Key、歌曲标识、查询内容及播放请求可能直接或经本站代理发送至第三方，第三方也会取得建立网络连接所需的数据。个人 Key 默认留在页面内存，记住时存于本机浏览器，不同步至本站账户。静态解析直接向 ChKSz 发送 Key，动态搜索经本站代理。自定义 LX 脚本存于本机 IndexedDB，其网络请求受沙箱及本站安全政策限制。',
       '第三方服务可能中断、变更、收费或返回错误、不安全或侵权内容。本站无法保证其可用性、准确性、安全性或隐私做法。请阅读其政策自行决定是否使用。同意记录只保留在当前设备，不代表本站为第三方作出保证。',
@@ -37,7 +37,7 @@ export const agreementCopy = {
     infoIntro: 'Uses the NetEase Cloud Music, QQ Music and Kugou resolution interfaces provided by api.chksz.com. Register and sign in there to obtain your personal API Key. Registration eligibility follows the current ChKSz website and may be limited to LinuxDo users.',
     infoPrivacy: 'Your personal API Key stays in page memory by default and is cleared on reload. Choosing remember stores it in this device’s browser storage. Existing track sources are resolved directly with ChKSz; dynamic discovery sends it through this site’s necessary proxy endpoint. Your personal Key is not synchronised to your Study with HOYO-MiX account.',
     paragraphs: [
-      'This agreement covers personal ChKSz API Keys and custom LX sources you deliberately configure. This site provides configuration and request facilities. Third parties operate independently; their names, content and accounts do not imply partnership or authorisation by this site, music platforms or rights holders. Existing Jellyfin, catalogue and basic playback do not require acceptance.',
+      'This agreement covers personal ChKSz API Keys and custom LX sources you deliberately configure. This site provides configuration and request facilities. Third parties operate independently; their names, content and accounts do not imply partnership or authorisation by this site, music platforms or rights holders. Existing catalogue and basic playback do not require acceptance.',
       'Ensure you are entitled to use the interfaces, accounts and content. Follow applicable law, copyright, third-party terms and privacy policies. Do not circumvent payment, regional restrictions, copyright protection or access controls. Assess each source and avoid unnecessary passwords, cookies or other sensitive information.',
       'API Keys, track identifiers, queries and playback requests may reach third parties directly or through this site’s necessary proxy. Third parties also receive connection data. Personal ChKSz Keys stay in page memory by default, or local browser storage when remembered, and are not synchronised to your account. Static resolution sends the Key directly to ChKSz; dynamic discovery uses this site’s proxy. Custom LX scripts reside in local IndexedDB and their network requests follow the sandbox and site security policy.',
       'Third-party services may fail, change, charge fees or return inaccurate, unsafe or infringing content. This site cannot guarantee their availability, accuracy, security or privacy practices. Read their policies and decide whether to use them. Consent receipts stay on this device and do not constitute a guarantee of a third party.',

@@ -1,4 +1,4 @@
-import type { CatalogQuery, GameId, TabId, Track } from './types'
+import type { CatalogQuery, GameId, TabId, Track, VocalStatus } from './types'
 
 type TrackIndex<Key extends string> = Map<Key, Set<string>>
 
@@ -37,6 +37,7 @@ export class CatalogRepository {
   private readonly gameIndex: TrackIndex<GameId> = new Map()
   private readonly relationIndex: TrackIndex<string> = new Map()
   private readonly tabIndex: TrackIndex<TabId> = new Map()
+  private readonly vocalIndex: TrackIndex<VocalStatus> = new Map()
   private readonly searchIndex = new Map<string, string>()
 
   constructor(tracks: Track[]) {
@@ -48,6 +49,7 @@ export class CatalogRepository {
         addToIndex(this.relationIndex, relationId, track.id)
       }
       for (const tab of track.tabs) addToIndex(this.tabIndex, tab, track.id)
+      if (track.vocalStatus) addToIndex(this.vocalIndex, track.vocalStatus, track.id)
 
       this.searchIndex.set(
         track.id,
@@ -64,6 +66,9 @@ export class CatalogRepository {
     intersect(candidateIds, matchingAny(this.gameIndex, query.games ?? []))
     intersect(candidateIds, matchingAny(this.relationIndex, query.relationIds ?? []))
     intersect(candidateIds, matchingAny(this.tabIndex, query.tabs ?? []))
+    if (query.vocalStatus !== undefined) {
+      intersect(candidateIds, this.vocalIndex.get(query.vocalStatus) ?? new Set())
+    }
 
     const search = normaliseSearchTerm(query.search ?? '')
     if (search.length > 0) {

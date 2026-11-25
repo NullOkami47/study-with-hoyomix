@@ -10,16 +10,20 @@ The combined application is distributed under the GNU General Public License,
 version 3. The complete licence is in LICENSE. No warranty is provided except
 as stated in that licence. Source and build configuration are supplied here.
 
-Modified version: Study with HOYO-MiX, public source edition, 2026-10-16.
-Changes include the HOYO-MiX study companion interface, player and provider
-integrations, focus features, account and Worker services, and removal of private
-configuration, operational data and third-party media from this distribution.
+Modified version: Study with HOYO-MiX, public source edition (synced 2026-11-25).
+Changes include the HOYO-MiX study companion interface, Liquid Glass Studio
+renderer and adaptive tiles, player recovery and crossfade/Smart Mix transitions,
+active multi-provider adapters (ChKSz, LX Music sandbox and global registry,
+GD Studio) with retired Jellyfin/Vkeys runtime paths, focus features, community
+chat with Durable Objects and D1 retention/moderation, catalogue discovery tools,
+and removal of private configuration, operational data and third-party media.
 This modified version is maintained by the Study with HOYO-MiX contributors.
 It is not the original StudyWithMiku release or an official HoYoverse product.
 
 Liquid Glass renderer adaptations retain the MIT copyright and permission notice
 for Charles Yin in src/features/liquid-glass/NOTICE.md. Additional dependency and
-licence notices are in docs/THIRD_PARTY_NOTICES.md and docs/licenses/.
+licence notices (including Acorn, OpenCC, QuickJS and Mediabunny) are in
+docs/THIRD_PARTY_NOTICES.md and docs/licenses/.
 
 HOYO-MiX and game names identify their respective rightsholders. The software
 licence grants no rights to third-party music, artwork, videos or trademarks.

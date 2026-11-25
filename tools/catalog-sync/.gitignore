@@ -1,0 +1,6 @@
+.test-work/
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/

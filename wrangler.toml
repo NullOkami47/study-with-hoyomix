@@ -21,5 +21,22 @@ class_name = "OnlinePresence"
 tag = "presence-v1"
 new_sqlite_classes = ["OnlinePresence"]
 
+[[durable_objects.bindings]]
+name = "CHAT"
+class_name = "ChatRoom"
+
+[[migrations]]
+tag = "community-chat-v1"
+new_sqlite_classes = ["ChatRoom"]
+
+[[ratelimits]]
+name = "AUTH_START_LIMITER"
+namespace_id = "20261027"
+simple = { limit = 20, period = 60 }
+
+# Optional hourly maintenance and discovery schedule for deployed Workers:
+# [triggers]
+# crons = ["17 * * * *"]
+
 [vars]
 PUBLIC_ORIGIN = "http://localhost:8787"

@@ -63,6 +63,7 @@ describe('account workspace preferences on D1', () => {
     method: 'PUT', body: JSON.stringify({ preferences }),
   }))
   const rowCount = () => database.prepare('SELECT COUNT(*) AS total FROM user_ui_preferences').first<number>('total')
+  const revisionOf = (etag: string) => Number(/^"(\d+)"$/u.exec(etag)?.[1] ?? Number.NaN)
 
   it('requires a live account session for both reads and writes', async () => {
     for (const token of [undefined, 'invalid-session']) {
@@ -204,7 +205,8 @@ describe('account workspace preferences on D1', () => {
       const { backgroundPlaybackMode, backgroundQualityMode, ...base } = PREFERENCES
       const legacy = await handler.fetch(request(tokenA, { method: 'PUT', body: JSON.stringify({ preferences: { ...base, lowPower: true, volume: .7 } }) }, true))
       expect(legacy.status).toBe(200)
-      expect(Number(legacy.headers.get('etag'))).toBeGreaterThan(Number(oldRevision))
+      // L-24: ETags are quoted strong tags, so the revision is read from inside the quotes.
+      expect(revisionOf(legacy.headers.get('etag')!)).toBeGreaterThan(revisionOf(oldRevision))
       const stale = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': oldRevision }, body: JSON.stringify({ preferences: PREFERENCES }) }))
       expect(stale.status).toBe(409)
     } finally { clock.mockRestore() }
@@ -213,7 +215,8 @@ describe('account workspace preferences on D1', () => {
   it('rejects stale writes and concurrent creation without overwriting either account', async () => {
     const initial = await handler.fetch(request(tokenA))
     const absent = initial.headers.get('etag')!
-    expect(absent).toBe('absent')
+    // L-24: the row-less state has the quoted entity tag `"absent"`.
+    expect(absent).toBe('"absent"')
     const first = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': absent }, body: JSON.stringify({ preferences: PREFERENCES }) }))
     expect(first.status).toBe(200)
     const stale = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': absent }, body: JSON.stringify({ preferences: { ...PREFERENCES, volume: .1 } }) }))
@@ -361,5 +364,80 @@ describe('account workspace preferences on D1', () => {
     expect((await handler.fetch(request(tokenA))).status).toBe(401)
     expect(await handler.fetch(request(tokenB)).then(response => response.json()))
       .toEqual({ preferences: { ...PREFERENCES, locale: 'en' } })
+  })
+
+  // Wave G exploration (task 25, L-24, design Property 16). RFC 9110 entity tags are quoted.
+  // The 428 for a missing If-Match stays behind an off flag in this release (D9), so it is not
+  // asserted here.
+  const QUOTED_STRONG_ETAG = /^"[0-9]+"$/u
+
+  it('L-24: emits a quoted strong ETag on GET and on a successful PUT', async () => {
+    const saved = await put(PREFERENCES)
+    expect(saved.status).toBe(200)
+    expect(saved.headers.get('etag')).toMatch(QUOTED_STRONG_ETAG)
+    const read = await handler.fetch(request(tokenA))
+    expect(read.status).toBe(200)
+    expect(read.headers.get('etag')).toMatch(QUOTED_STRONG_ETAG)
+  })
+
+  it('L-24: accepts a quoted If-Match that names the current revision', async () => {
+    expect((await put(PREFERENCES)).status).toBe(200)
+    const revision = await database.prepare('SELECT updated_at AS updatedAt FROM user_ui_preferences WHERE user_id = ?')
+      .bind('user-a').first<number>('updatedAt')
+    const response = await handler.fetch(request(tokenA, {
+      method: 'PUT', headers: { 'if-match': `"${revision}"` },
+      body: JSON.stringify({ preferences: { ...PREFERENCES, volume: 0.9 } }),
+    }))
+    expect(response.status).toBe(200)
+    expect(await handler.fetch(request(tokenA)).then(read => read.json()))
+      .toEqual({ preferences: { ...PREFERENCES, volume: 0.9 } })
+  })
+
+  // L-24 fix (27.1): bare values cached from older Workers still match; anything else is invalid.
+  it('L-24: accepts bare and quoted If-Match forms of the same revision and rejects other syntax', async () => {
+    const created = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': 'absent' }, body: JSON.stringify({ preferences: PREFERENCES }) }))
+    expect(created.status).toBe(200)
+    const bare = String(revisionOf(created.headers.get('etag')!))
+    const updated = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': bare }, body: JSON.stringify({ preferences: { ...PREFERENCES, volume: 0.2 } }) }))
+    expect(updated.status).toBe(200)
+    for (const invalid of ['*', '"1", "2"', '"12a"', 'W/"12a"', 'W/', 'W/ "1"', 'w/"1"', 'W/"1", W/"2"']) {
+      const response = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': invalid }, body: JSON.stringify({ preferences: PREFERENCES }) }))
+      expect(response.status, invalid).toBe(400)
+    }
+    expect(await handler.fetch(request(tokenA)).then(read => read.json())).toEqual({ preferences: { ...PREFERENCES, volume: 0.2 } })
+  })
+
+  // Issue I: Cloudflare weakens a strong ETag to W/"<n>" on compressed responses and the client
+  // (an already-installed PWA included) echoes it back. The same revision must match; a stale or
+  // malformed weak tag must not.
+  it('accepts a weak W/ tag that carries the current revision and rejects a stale or malformed one', async () => {
+    const created = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': 'absent' }, body: JSON.stringify({ preferences: PREFERENCES }) }))
+    expect(created.status).toBe(200)
+    const strong = created.headers.get('etag')!
+    const weak = await handler.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': `W/${strong}` }, body: JSON.stringify({ preferences: { ...PREFERENCES, volume: 0.3 } }) }))
+    expect(weak.status).toBe(200)
+    expect(await handler.fetch(request(tokenA)).then(read => read.json())).toEqual({ preferences: { ...PREFERENCES, volume: 0.3 } })
+    const strict = createAccountPreferencesHandler(env, { requireIfMatch: true })
+    const stale = await strict.fetch(request(tokenA, { method: 'PUT', headers: { 'if-match': `W/${strong}` }, body: JSON.stringify({ preferences: { ...PREFERENCES, volume: 0.9 } }) }))
+    expect([409, 412]).toContain(stale.status)
+    expect(await handler.fetch(request(tokenA)).then(read => read.json())).toEqual({ preferences: { ...PREFERENCES, volume: 0.3 } })
+  })  // D9: the strict rules ship behind an option that stays off in this release.
+  it('L-24: answers 428 without If-Match and 412 for a stale one only when the strict flag is on', async () => {
+    const strict = createAccountPreferencesHandler(env, { requireIfMatch: true })
+    const send = (ifMatch: string | null, volume: number) => strict.fetch(request(tokenA, {
+      method: 'PUT', ...(ifMatch === null ? {} : { headers: { 'if-match': ifMatch } }),
+      body: JSON.stringify({ preferences: { ...PREFERENCES, volume } }),
+    }))
+    const missing = await send(null, 0.1)
+    expect(missing.status).toBe(428)
+    expect(await missing.json()).toEqual({ error: 'precondition_required' })
+    expect(await rowCount()).toBe(0)
+    const first = await send('"absent"', 0.2)
+    expect(first.status).toBe(200)
+    expect((await send('"absent"', 0.3)).status).toBe(412)
+    expect((await send(first.headers.get('etag'), 0.4)).status).toBe(200)
+    expect(await handler.fetch(request(tokenA)).then(read => read.json())).toEqual({ preferences: { ...PREFERENCES, volume: 0.4 } })
+    // The default handler (flag off) still accepts a write without If-Match.
+    expect((await put({ ...PREFERENCES, volume: 0.5 })).status).toBe(200)
   })
 })

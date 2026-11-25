@@ -5,7 +5,6 @@ import {
   configuredGdStudioOrigin,
   configuredHuanyinMediaHostnames,
   configuredHuanyinOrigin,
-  configuredJellyfinOrigin,
   configuredLxMediaHostnames,
   configuredLxOrigin,
   configuredLxRequestKey,
@@ -16,6 +15,7 @@ import {
   readR2PublicConfig,
 } from '../providers/config'
 import type { ProviderEnv } from '../providers/config'
+import { createExactMediaUrlValidator, createResolverMediaUrlValidator } from '../providers/resolverMediaUrl'
 
 describe('Provider SSRF boundaries', () => {
   const minimalEnv = {
@@ -464,38 +464,6 @@ describe('Provider SSRF boundaries', () => {
     })
   })
 
-  describe('Jellyfin - configuredJellyfinOrigin', () => {
-    it('accepts valid HTTPS origin', () => {
-      const env = { ...minimalEnv, JELLYFIN_BASE_URL: 'https://jellyfin.example.com' } as ProviderEnv
-      expect(configuredJellyfinOrigin(env)).toBe('https://jellyfin.example.com')
-    })
-
-    it('rejects origin with pathname', () => {
-      const env = { ...minimalEnv, JELLYFIN_BASE_URL: 'https://jellyfin.example.com/web' } as ProviderEnv
-      expect(configuredJellyfinOrigin(env)).toBeNull()
-    })
-
-    it('rejects localhost', () => {
-      const env = { ...minimalEnv, JELLYFIN_BASE_URL: 'https://localhost' } as ProviderEnv
-      expect(configuredJellyfinOrigin(env)).toBeNull()
-    })
-
-    it('rejects private TLDs', () => {
-      const env = { ...minimalEnv, JELLYFIN_BASE_URL: 'https://jellyfin.internal' } as ProviderEnv
-      expect(configuredJellyfinOrigin(env)).toBeNull()
-    })
-
-    it('rejects port 8096 or any custom port', () => {
-      const env = { ...minimalEnv, JELLYFIN_BASE_URL: 'https://jellyfin.example.com:8096' } as ProviderEnv
-      expect(configuredJellyfinOrigin(env)).toBeNull()
-    })
-
-    it('rejects IP addresses', () => {
-      const env = { ...minimalEnv, JELLYFIN_BASE_URL: 'https://192.168.1.1' } as ProviderEnv
-      expect(configuredJellyfinOrigin(env)).toBeNull()
-    })
-  })
-
   describe('GD Studio - configuredGdStudioOrigin & configuredGdStudioMediaHostnames', () => {
     it('accepts valid HTTPS origin', () => {
       const env = { ...minimalEnv, GD_STUDIO_API_BASE_URL: 'https://music-api.gdstudio.xyz' } as ProviderEnv
@@ -590,6 +558,53 @@ describe('Provider SSRF boundaries', () => {
       // - !isPublicHostname(parsed.hostname)
       // - value !== parsed.origin && value !== `${parsed.origin}/`
       expect(true).toBe(true)
+    })
+  })
+
+  describe('Exact media hostname allowlist SSRF boundaries', () => {
+    it('does not expand additional resolver hostnames into wildcard suffixes', () => {
+      const validate = createResolverMediaUrlValidator({
+        configuredOrigin: 'https://resolver.example',
+        extraAllowedHostnames: ['cdn.example', '*.media.example'],
+      })
+      expect(validate('https://cdn.example/audio.mp3')?.hostname).toBe('cdn.example')
+      expect(validate('https://resolver.example/audio.mp3')?.hostname).toBe('resolver.example')
+      expect(validate('https://r1.googlevideo.com/audio.mp3')?.hostname).toBe('r1.googlevideo.com')
+      expect(validate('https://shard.media.example/audio.mp3')).toBeNull()
+      expect(validate('//shard.media.example/audio.mp3', new URL('https://cdn.example/start.mp3'))).toBeNull()
+    })
+
+    it('rejects wildcard patterns in an exact-host provider configuration', () => {
+      const valid = configuredGdStudioMediaHostnames({
+        ...minimalEnv,
+        GD_STUDIO_MEDIA_ALLOWED_HOSTNAMES: '*.music.126.net, cdn.example.org',
+      } as ProviderEnv)
+      expect(valid).toBeNull()
+    })
+
+    it('validates exact hosts and rejects sibling, apex, and off-policy redirects', () => {
+      const validate = createExactMediaUrlValidator(['m801.music.126.net', '*.music.126.net', '127.0.0.1'])
+      expect(validate('https://m801.music.126.net/audio.mp3')?.toString()).toBe('https://m801.music.126.net/audio.mp3')
+
+      for (const refused of [
+        'https://music.126.net/audio.mp3',
+        'https://music.126.net.evil.example/audio.mp3',
+        'https://m902.music.126.net/audio.mp3',
+        'https://m801.music.126.net:8443/audio.mp3',
+        'http://m801.music.126.net/audio.mp3',
+        'https://user@m801.music.126.net/audio.mp3',
+        'https://example.com/audio.mp3',
+        'https://service.internal/audio.mp3',
+        'https://127.0.0.1/audio.mp3',
+      ]) {
+        expect(validate(refused), refused).toBeNull()
+      }
+
+      const current = new URL('https://m801.music.126.net/start.mp3')
+      expect(validate('/next.mp3', current)?.toString()).toBe('https://m801.music.126.net/next.mp3')
+      expect(validate('https://m902.music.126.net/next.mp3', current)).toBeNull()
+      expect(validate('https://evil.example/next.mp3', current)).toBeNull()
+      expect(validate('//127.0.0.1/next.mp3', current)).toBeNull()
     })
   })
 })

@@ -38,7 +38,7 @@ describe('server-only Google Sheets', () => {
       expect(String(url)).toContain(
         'sheets.googleapis.com/v4/spreadsheets/test-workbook/values:batchGet',
       )
-      expect(init?.redirect).toBe('error')
+      expect(init?.redirect).toBe('manual')
       return Response.json(workbook())
     })
     const client = createGoogleSheetsClient(
@@ -119,4 +119,53 @@ describe('server-only Google Sheets', () => {
     ).rejects.toThrow('sheets_unavailable')
     expect(fetcher).not.toHaveBeenCalled()
   })
+  it.each(
+    (['oauth', 'sheets'] as const).flatMap((stage) =>
+      [301, 302, 303, 307, 308].map((status) => ({ stage, status })),
+    ),
+  )(
+    'cancels $stage HTTP $status without accepting its JSON or exposing its body',
+    async ({ stage, status }) => {
+      const cancel = vi.fn()
+      const token = {
+        access_token: 'synthetic-redirect-token',
+        expires_in: 3600,
+      }
+      // Valid success-shaped JSON must still be refused solely because of its status.
+      const redirect = new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                JSON.stringify(stage === 'oauth' ? token : workbook()),
+              ),
+            )
+            controller.close()
+          },
+          cancel,
+        }),
+        {
+          status,
+          headers: { location: 'https://sheets.googleapis.com/redirect-sink' },
+        },
+      )
+      const fetcher = vi.fn(async (input: string | URL | Request) =>
+        stage === 'sheets' && String(input).includes('oauth2')
+          ? Response.json(token)
+          : redirect,
+      )
+      const client = createGoogleSheetsClient(
+        {
+          CATALOGUE_SHEET_ID: `redirect-${stage}-${status}`,
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_EMAIL:
+            'redirect@test.iam.gserviceaccount.com',
+          GOOGLE_SHEETS_PRIVATE_KEY: pem,
+        },
+        { fetch: fetcher },
+      )
+      await expect(client.read()).rejects.toThrow(/^sheets_unavailable$/)
+      expect(fetcher).toHaveBeenCalledTimes(stage === 'oauth' ? 1 : 2)
+      expect(cancel).toHaveBeenCalledTimes(1)
+    },
+  )
 })

@@ -44,4 +44,5 @@ export interface CatalogQuery {
   games?: GameId[]
   relationIds?: string[]
   tabs?: TabId[]
+  vocalStatus?: VocalStatus
 }

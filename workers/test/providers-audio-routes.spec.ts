@@ -181,7 +181,7 @@ describe('same-origin soundtrack audio provider routes', () => {
         externalId: VIDEO_ID,
         nonce: NONCE,
         mimeType: 'audio/mp4',
-        expiresAt: 31_000,
+        expiresAt: 121_000,
       })
     },
   )
@@ -475,9 +475,9 @@ describe('same-origin soundtrack audio provider routes', () => {
         nonce: NONCE,
         validatedUrl: METING_MEDIA_URL,
         mimeType: 'audio/mpeg',
-        expiresAt: 31_000,
+        expiresAt: 121_000,
         ...overrides,
-      }, { headers: { 'cache-control': 'max-age=30' } }),
+      }, { headers: { 'cache-control': 'max-age=120' } }),
     )
 
     it('prepares one encoded ID-bound ticket without exposing either upstream URL', async () => {
@@ -513,7 +513,7 @@ describe('same-origin soundtrack audio provider routes', () => {
         nonce: NONCE,
         validatedUrl: METING_MEDIA_URL,
         mimeType: 'audio/mpeg',
-        expiresAt: 31_000,
+        expiresAt: 121_000,
       })
     })
 
@@ -556,7 +556,7 @@ describe('same-origin soundtrack audio provider routes', () => {
       expect(fetchImpl).not.toHaveBeenCalled()
     })
 
-    it('fails resolve closed when the 30-second ticket cannot be committed', async () => {
+    it('fails resolve closed when the 120-second ticket cannot be committed', async () => {
       const cache = new FakeCache()
       cache.failPut = new Error(`${METING_MEDIA_URL} must stay private`)
       const fetchImpl = vi.fn(async () => jsonResponse(metingMetadata())) as unknown as typeof fetch
@@ -785,114 +785,23 @@ describe('same-origin soundtrack audio provider routes', () => {
     })
   })
 
-  describe('Jellyfin audio provider route integration', () => {
-    const JELLYFIN_ITEM_ID = '1234abcda0d954293110f4d561b0f614'
-    const JELLYFIN_TOKEN = 'secret-jellyfin-token-xyz'
-    const JELLYFIN_USER_ID = '8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f'
-    const JELLYFIN_ENV = {
-      JELLYFIN_BASE_URL: 'https://jellyfin.example',
-      JELLYFIN_API_TOKEN: JELLYFIN_TOKEN,
-      JELLYFIN_USER_ID,
-    } as const
-
-    const createJellyfinHandler = async (
-      fetchImpl: typeof fetch,
-      cache = new FakeCache(),
-      envOverrides: Partial<ProviderEnv> = JELLYFIN_ENV,
-      now: () => number = () => 1_000,
-    ) => {
+  describe('Retired Jellyfin audio route', () => {
+    it('returns 404 not_found even with legacy credentials and seeded DB row', async () => {
+      await seedProvider('jellyfin', 1, 1)
       const { createProviderHandler } = await import('../providers/routes')
-      const env = providerEnv(envOverrides)
-      const handler = createProviderHandler(env, {
-        cache: cache as unknown as Pick<Cache, 'match' | 'put'>,
-        crypto: deterministicCrypto,
-        fetch: fetchImpl,
-        now,
-      })
-      return {
-        cache,
-        handler,
-        env,
-        fetch: (request: Request) => handler.fetch(request),
-      }
-    }
-
-    it('prepares one same-origin ticket and sends auth headers to upstream media fetch', async () => {
-      await seedProvider('jellyfin', 1, 1)
-      const cache = new FakeCache()
-      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-        const urlStr = String(input)
-        if (urlStr.includes('/Items/')) {
-          return jsonResponse({
-            Id: JELLYFIN_ITEM_ID,
-            Type: 'Audio',
-            MediaType: 'Audio',
-            Container: 'mp3',
-            MediaSources: [{ Id: JELLYFIN_ITEM_ID, Container: 'mp3', SupportsDirectPlay: true }],
-          })
-        }
-        return new Response(new Uint8Array([1, 2, 3]), {
-          status: 200,
-          headers: {
-            'content-type': 'audio/mpeg',
-            'content-length': '3',
-            'accept-ranges': 'bytes',
-          },
-        })
-      }) as unknown as typeof fetch
-
-      const created = await createJellyfinHandler(fetchImpl, cache)
-      const resolveRes = await created.fetch(new Request('https://study.example/api/providers/jellyfin/resolve', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', origin: 'https://study.example' },
-        body: JSON.stringify({ externalId: JELLYFIN_ITEM_ID }),
-      }))
-
-      expect(resolveRes.status).toBe(200)
-      const resolveBody = await resolveRes.json() as { mimeType: string; url: string }
-      expect(resolveBody.mimeType).toBe('audio/mpeg')
-      expect(resolveBody.url).toContain(`/api/providers/jellyfin/media/${JELLYFIN_ITEM_ID}/`)
-      expect(JSON.stringify(resolveBody)).not.toContain(JELLYFIN_TOKEN)
-      expect(JSON.stringify(resolveBody)).not.toContain('jellyfin.example')
-
-      // Serve media ticket
-      const mediaRes = await created.fetch(new Request(`https://study.example${resolveBody.url}`, {
-        method: 'GET',
-      }))
-      expect(mediaRes.status).toBe(200)
-      expect(mediaRes.headers.get('content-type')).toBe('audio/mpeg')
-      expect(mediaRes.headers.get('x-emby-token')).toBeNull()
-      expect(mediaRes.headers.get('authorization')).toBeNull()
-
-      // Upstream calls
-      expect(fetchImpl).toHaveBeenCalledTimes(2)
-      const [, mediaInit] = vi.mocked(fetchImpl).mock.calls[1]!
-      const mediaReqHeaders = new Headers(mediaInit?.headers)
-      // Jellyfin 12 accepts only the modern authorization form; the legacy header would 401.
-      expect(mediaReqHeaders.get('authorization')).toBe(`MediaBrowser Token="${JELLYFIN_TOKEN}"`)
-      expect(mediaReqHeaders.get('x-emby-token')).toBeNull()
-      expect(mediaReqHeaders.get('x-mediabrowser-token')).toBeNull()
-    })
-
-    it('rejects invalid external ID or unconfigured provider', async () => {
-      await seedProvider('jellyfin', 1, 1)
       const fetchImpl = vi.fn() as unknown as typeof fetch
-      const created = await createJellyfinHandler(fetchImpl)
-
-      const badId = await created.fetch(new Request('https://study.example/api/providers/jellyfin/resolve', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', origin: 'https://study.example' },
-        body: JSON.stringify({ externalId: 'not-a-uuid' }),
+      const handler = createProviderHandler(providerEnv({
+        JELLYFIN_BASE_URL: 'https://jellyfin.example',
+        JELLYFIN_API_TOKEN: 'secret-jellyfin-token-xyz',
+        JELLYFIN_USER_ID: '8f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f',
+      } as Partial<ProviderEnv>), { fetch: fetchImpl })
+      const response = await handler.fetch(new Request('https://study.example/api/providers/jellyfin/resolve', {
+        method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://study.example' },
+        body: JSON.stringify({ externalId: '6213b704a0d954293110f4d561b0f614' }),
       }))
-      expect(badId.status).toBe(400)
-
-      const unconfigured = await createJellyfinHandler(fetchImpl, new FakeCache(), {})
-      const unconfRes = await unconfigured.fetch(new Request('https://study.example/api/providers/jellyfin/resolve', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', origin: 'https://study.example' },
-        body: JSON.stringify({ externalId: JELLYFIN_ITEM_ID }),
-      }))
-      expect(unconfRes.status).toBe(503)
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({ error: 'not_found' })
+      expect(fetchImpl).not.toHaveBeenCalled()
     })
   })
 
@@ -1000,6 +909,73 @@ describe('same-origin soundtrack audio provider routes', () => {
       expect(mediaRes.status).toBe(200)
       expect(mediaRes.headers.get('content-type')).toBe('audio/mpeg')
     })
+
+    it('serves a Hi-Res FLAC the CDN mislabelled audio/mpeg (the reported 999 bug)', async () => {
+      // GD Studio lossless metadata returns a `.flac` path, so the ticket expects audio/flac, but
+      // the CDN labels the media response `audio/mpeg; charset=UTF-8` over a genuine `fLaC` body.
+      // Before the fix this reached the strict MIME guard and returned 502 invalid_response.
+      await seedProvider('gd-studio', 1, 3)
+      const cache = new FakeCache()
+      const flacBody = new Uint8Array([0x66, 0x4c, 0x61, 0x43, 0x00, 0x00, 0x00, 0x22])
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const urlStr = String(input)
+        if (urlStr.includes('api.php')) {
+          return jsonResponse({
+            url: 'https://m701.music.126.net/audio/2756018749.flac',
+            br: 999,
+            size: 18054862,
+          })
+        }
+        return new Response(flacBody, {
+          status: 200,
+          headers: {
+            'content-type': 'audio/mpeg; charset=UTF-8',
+            'content-length': String(flacBody.length),
+            'accept-ranges': 'bytes',
+          },
+        })
+      }) as unknown as typeof fetch
+
+      const created = await createGdStudioHandler(fetchImpl, cache)
+      const resolveRes = await created.fetch(new Request('https://study.example/api/providers/gd-studio/resolve', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://study.example' },
+        body: JSON.stringify({ externalId: 'netease:2756018749:999' }),
+      }))
+
+      expect(resolveRes.status).toBe(200)
+      const resolveBody = await resolveRes.json() as { mimeType: string; url: string }
+      expect(resolveBody.mimeType).toBe('audio/flac')
+
+      const mediaRes = await created.fetch(new Request(`https://study.example${resolveBody.url}`, {
+        method: 'GET',
+      }))
+      expect(mediaRes.status).toBe(200)
+      // Corrected to the container the bytes prove, and the audio bytes are preserved.
+      expect(mediaRes.headers.get('content-type')).toBe('audio/flac')
+      expect(new Uint8Array(await mediaRes.arrayBuffer())).toEqual(flacBody)
+    })
+  })
+
+  describe('retired Vkeys routes', () => {
+    it.each([
+      ['resolve', new Request('https://study.example/api/providers/vkeys/resolve', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://study.example' },
+        body: JSON.stringify({ externalId: 'sample-genshin-track' }),
+      })],
+      ['media', new Request(`https://study.example/api/providers/vkeys/media/sample-genshin-track/${NONCE}`)],
+    ])('does not serve a live %s route even with the legacy flag and row enabled', async (_label, request) => {
+      await seedProvider('vkeys', 1, 50)
+      const env = {
+        ...providerEnv(),
+        VKEYS_ENABLED: 'true',
+      } as ProviderEnv & { VKEYS_ENABLED: string }
+      const response = await (worker.fetch as (...args: unknown[]) => Promise<Response>)(request, env)
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({ error: 'not_found' })
+      expect(response.headers.get('cache-control')).toBe('no-store')
+    })
   })
 
   describe('HuanYin audio provider route integration', () => {
@@ -1062,3 +1038,4 @@ describe('same-origin soundtrack audio provider routes', () => {
     })
   })
 })
+

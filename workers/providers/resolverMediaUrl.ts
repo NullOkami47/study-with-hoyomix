@@ -19,7 +19,7 @@ export interface ResolverMediaUrlPolicyOptions {
   extraAllowedHostnames?: readonly string[]
 }
 
-const isPublicHostname = (hostname: string): boolean => {
+export const isPublicHostname = (hostname: string): boolean => {
   if (
     hostname !== hostname.toLowerCase() || hostname.length > 253 || hostname.endsWith('.') ||
     !hostname.includes('.') || hostname.includes(':') || hostname.startsWith('[') ||
@@ -27,7 +27,10 @@ const isPublicHostname = (hostname: string): boolean => {
   ) return false
   if (PRIVATE_HOST_SUFFIXES.some((suffix) =>
     hostname === suffix || hostname.endsWith(`.${suffix}`))) return false
-  return hostname.split('.').every((label) => DNS_LABEL.test(label))
+  const labels = hostname.split('.')
+  const last = labels[labels.length - 1] ?? ''
+  if (/^\d+$/.test(last) || /^0x[0-9a-f]+$/i.test(last)) return false
+  return labels.every((label) => DNS_LABEL.test(label))
 }
 
 const isGoogleVideoHostname = (hostname: string): boolean =>

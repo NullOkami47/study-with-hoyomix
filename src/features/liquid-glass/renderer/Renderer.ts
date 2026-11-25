@@ -33,15 +33,23 @@ function replaceCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
 
 export async function initialiseGlassRenderer(
   initialCanvas: HTMLCanvasElement,
+  signal?: AbortSignal,
 ): Promise<RendererInitialisation> {
+  if (signal?.aborted) return { canvas: initialCanvas, capability: 'css', renderer: null }
   const detected = detectGlassCapability()
   let canvas = initialCanvas
 
   if (detected === 'webgpu') {
     try {
-      const renderer = await WebGpuRenderer.create(canvas)
+      const renderer = await WebGpuRenderer.create(canvas, signal)
+      if (signal?.aborted) {
+        renderer.dispose()
+        return { canvas, capability: 'css', renderer: null }
+      }
       return { canvas, capability: renderer.capability, renderer }
     } catch {
+      // A departed visual style must not allocate a fallback renderer.
+      if (signal?.aborted) return { canvas, capability: 'css', renderer: null }
       // A canvas cannot switch context modes after a context has been created.
       // Always retry WebGL2 with a fresh element after any WebGPU failure.
       canvas = replaceCanvas(canvas)

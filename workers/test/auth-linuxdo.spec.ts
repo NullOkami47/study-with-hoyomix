@@ -154,15 +154,9 @@ describe('LINUX DO OIDC authentication', () => {
       expect(response.headers.get('set-cookie')).toContain('__Host-oauth=')
       expect(response.headers.get('set-cookie')).toContain('HttpOnly; Secure; SameSite=Lax; Path=/')
 
-      const persistedFlow = await database.prepare('SELECT state_hash, provider, intent, consumed_at FROM oauth_flows').first<{
-        state_hash: string
-        provider: string
-        intent: string
-        consumed_at: number | null
-      }>()
-      expect(persistedFlow).toMatchObject({ provider: 'linuxdo', intent: 'login', consumed_at: null })
-      expect(persistedFlow?.state_hash).toMatch(/^hmac-sha256:v1:[0-9a-f]{64}$/)
-      expect(persistedFlow?.state_hash).not.toContain(location.searchParams.get('state'))
+      // H-04 (Wave E): start writes nothing; the sealed cookie carries the flow and only the
+      // callback records the (hashed) state as consumed.
+      expect(await database.prepare('SELECT COUNT(*) AS count FROM oauth_flows').first('count')).toBe(0)
     })
   })
 
@@ -286,8 +280,9 @@ describe('LINUX DO OIDC authentication', () => {
         `/api/auth/linuxdo/callback?code=code&state=${location.searchParams.get('state')}`,
         `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
       ))
-      expect(response.status).toBe(401)
-      expect(await response.json()).toEqual({ error: 'oauth_callback_failed' })
+      // M-09 (deliberate): was 401 {"error":"oauth_callback_failed"}; the navigation now returns to the app.
+      expect(response.status).toBe(302)
+      expect(response.headers.get('location')).toBe(`${ORIGIN}/?auth_error=oauth_callback_failed`)
       expect(await database.prepare('SELECT COUNT(*) AS count FROM users').first<number>('count')).toBe(0)
     })
 
@@ -324,7 +319,7 @@ describe('LINUX DO OIDC authentication', () => {
         `/api/auth/linuxdo/callback?code=code&state=${location.searchParams.get('state')}`,
         `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
       ))
-      expect(response.status).toBe(401)
+      expect(response.status).toBe(302) // M-09 (deliberate): callback failures now redirect to /?auth_error=oauth_callback_failed (was 401 JSON)
     })
 
     it('rejects signing key when JWK use is enc (encryption key)', async () => {
@@ -359,8 +354,9 @@ describe('LINUX DO OIDC authentication', () => {
         `/api/auth/linuxdo/callback?code=code&state=${location.searchParams.get('state')}`,
         `__Host-oauth=${cookieValue(start, '__Host-oauth')}`,
       ))
-      expect(response.status).toBe(401)
-      expect(await response.json()).toEqual({ error: 'oauth_callback_failed' })
+      // M-09 (deliberate): was 401 {"error":"oauth_callback_failed"}.
+      expect(response.status).toBe(302)
+      expect(response.headers.get('location')).toBe(`${ORIGIN}/?auth_error=oauth_callback_failed`)
     })
 
     it('validates azp when multiple audiences are present in ID token', async () => {
@@ -631,7 +627,9 @@ describe('LINUX DO OIDC authentication', () => {
         `/api/auth/linuxdo/callback?code=code&state=${loc.searchParams.get('state')}`,
         `${sessionCookie}; ${oauthCookie}`,
       ))
-      expect(linkCallback.status).toBe(200)
+      // M-09 (deliberate): was 200 {"ok":true}; a link navigation now returns to the app.
+      expect(linkCallback.status).toBe(302)
+      expect(linkCallback.headers.get('location')).toBe(`${ORIGIN}/?account=linked`)
 
       // Verified 1 user with 2 identities
       const userCount = await database.prepare('SELECT COUNT(*) AS count FROM users').first<number>('count')

@@ -372,6 +372,62 @@ describe('LiquidGlassCanvas', () => {
     expect(webgpu.device.destroy).toHaveBeenCalledOnce()
   })
 
+  it('does not request a device or WebGL fallback when an adapter resolves after unmount', async () => {
+    installBrowserBoundaries()
+    const webgpu = createWebGpuBoundary()
+    const adapter = await webgpu.gpu.requestAdapter()
+    let resolveAdapter!: (value: typeof adapter) => void
+    webgpu.gpu.requestAdapter.mockImplementation(() => new Promise(resolve => { resolveAdapter = resolve }))
+    setGpu(webgpu.gpu)
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockImplementation(kind => (kind === 'webgpu' ? webgpu.context : null) as never)
+    const wrapper = mount(LiquidGlassCanvas, { props: { lowPower: false } })
+    wrapper.unmount()
+    const calls = getContext.mock.calls.length
+    resolveAdapter(adapter)
+    await flushPromises()
+    expect(adapter.requestDevice).not.toHaveBeenCalled()
+    expect(getContext).toHaveBeenCalledTimes(calls)
+  })
+
+  it('destroys a late device without creating a context or pipeline after unmount', async () => {
+    installBrowserBoundaries()
+    const webgpu = createWebGpuBoundary()
+    const adapter = await webgpu.gpu.requestAdapter()
+    let resolveDevice!: (value: typeof webgpu.device) => void
+    adapter.requestDevice.mockImplementation(() => new Promise(resolve => { resolveDevice = resolve }))
+    setGpu(webgpu.gpu)
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockImplementation(kind => (kind === 'webgpu' ? webgpu.context : null) as never)
+    const wrapper = mount(LiquidGlassCanvas, { props: { lowPower: false } })
+    await flushPromises()
+    expect(adapter.requestDevice).toHaveBeenCalledOnce()
+    wrapper.unmount()
+    const calls = getContext.mock.calls.length
+    resolveDevice(webgpu.device)
+    await flushPromises()
+    expect(getContext).toHaveBeenCalledTimes(calls)
+    expect(webgpu.device.createRenderPipeline).not.toHaveBeenCalled()
+    expect(webgpu.device.destroy).toHaveBeenCalledOnce()
+  })
+
+  it('does not fall back to WebGL when the adapter rejects after unmount', async () => {
+    installBrowserBoundaries()
+    const webgpu = createWebGpuBoundary()
+    let rejectAdapter!: (reason: Error) => void
+    webgpu.gpu.requestAdapter.mockImplementation(() => new Promise((_resolve, reject) => { rejectAdapter = reject }))
+    setGpu(webgpu.gpu)
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockImplementation(kind => (kind === 'webgpu' ? webgpu.context : null) as never)
+    const wrapper = mount(LiquidGlassCanvas, { props: { lowPower: false } })
+    wrapper.unmount()
+    const calls = getContext.mock.calls.length
+    rejectAdapter(new Error('Adapter unavailable'))
+    await flushPromises()
+    expect(getContext).toHaveBeenCalledTimes(calls)
+    expect(webgpu.device.createRenderPipeline).not.toHaveBeenCalled()
+  })
+
   it('continues WebGPU cleanup when buffer destruction throws', async () => {
     installBrowserBoundaries()
     const webgpu = createWebGpuBoundary({ throwBufferDestroy: true })
@@ -571,7 +627,8 @@ describe('LiquidGlassCanvas', () => {
     expect(dispose).toHaveBeenCalledOnce()
   })
 
-  it('is mounted by the real AppShell before the workspace-owned semantic main', async () => {
+  // Cinematic retains its pre-108 renderer; Studio uses a separate optical lifecycle.
+  it('is restored in Cinematic AppShell without changing the workspace-owned semantic main', async () => {
     installBrowserBoundaries()
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null)
 
@@ -581,12 +638,11 @@ describe('LiquidGlassCanvas', () => {
     await flushPromises()
 
     expect(wrapper.findAll('.liquid-glass')).toHaveLength(1)
+    expect(wrapper.findAll('canvas')).toHaveLength(1)
     expect(wrapper.findAll('header')).toHaveLength(0)
     expect(wrapper.findAll('h1')).toHaveLength(0)
     expect(wrapper.findAll('main')).toHaveLength(1)
     expect(wrapper.findAll('aside')).toHaveLength(1)
-    expect(wrapper.get('.liquid-glass').element.compareDocumentPosition(wrapper.get('main').element))
-      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
     wrapper.unmount()
   })
 

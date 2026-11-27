@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { selectPreloadPolicy } from './preloadPolicy'
+import { isNextTrackPreloadDue, NEXT_TRACK_PRELOAD_PROGRESS_RATIO, selectPreloadPolicy } from './preloadPolicy'
 
 describe('next-track preload policy', () => {
   it('disables preload while offline', () => {
@@ -13,8 +13,13 @@ describe('next-track preload policy', () => {
     expect(selectPreloadPolicy({ online: true, connection: { saveData: true } })).toBe('metadata')
   })
 
-  it.each(['slow-2g', '2g', '3g'])('uses metadata only on %s', (effectiveType) => {
+  it.each(['slow-2g', '2g'])('uses metadata only on %s', (effectiveType) => {
     expect(selectPreloadPolicy({ online: true, connection: { effectiveType, saveData: false } })).toBe('metadata')
+  })
+
+  it('allows native auto preload on 3g unless Save-Data is enabled', () => {
+    expect(selectPreloadPolicy({ online: true, connection: { effectiveType: '3g', saveData: false } })).toBe('auto')
+    expect(selectPreloadPolicy({ online: true, connection: { effectiveType: '3g', saveData: true } })).toBe('metadata')
   })
 
   it('allows native auto preload on 4g', () => {
@@ -34,5 +39,15 @@ describe('next-track preload policy', () => {
     expect(selectPreloadPolicy({ online: true, connection: { effectiveType: 'wifi', saveData: false } })).toBe('auto')
     expect(selectPreloadPolicy({ online: true, connection: { effectiveType: '5g', saveData: false } })).toBe('auto')
     expect(selectPreloadPolicy({ online: true, connection: { effectiveType: 'unknown', saveData: false } })).toBe('auto')
+  })
+
+  it('arms next-track preload once half of the current track has played', () => {
+    expect(NEXT_TRACK_PRELOAD_PROGRESS_RATIO).toBe(0.5)
+    expect(isNextTrackPreloadDue(10, 0)).toBe(false)
+    expect(isNextTrackPreloadDue(10, Number.NaN)).toBe(false)
+    expect(isNextTrackPreloadDue(Number.NaN, 200)).toBe(false)
+    expect(isNextTrackPreloadDue(119.9, 240)).toBe(false)
+    expect(isNextTrackPreloadDue(120, 240)).toBe(true)
+    expect(isNextTrackPreloadDue(180, 240)).toBe(true)
   })
 })

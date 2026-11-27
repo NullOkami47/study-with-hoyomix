@@ -1484,16 +1484,16 @@ describe('PlayerBar', () => {
     expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
     expect(resolvedTracks).toEqual(['a'])
 
-    // 2. Just outside lead window (remaining 61s > 60s): still not armed
-    active.element.currentTime = 179
+    // 2. Just before 50% (119s / 240s): still not armed
+    active.element.currentTime = 119
     await active.trigger('timeupdate')
     await flushPromises()
     expect(store.preparedNext.value).toBeNull()
     expect(wrapper.find('[data-audio-role="standby"]').exists()).toBe(false)
     expect(resolvedTracks).toEqual(['a'])
 
-    // 3. Inside lead window (remaining 15s <= 60s): armed with preload="auto" even without navigator.connection
-    active.element.currentTime = 225
+    // 3. At 50% (120s / 240s): armed with preload="auto" even without navigator.connection
+    active.element.currentTime = 120
     await active.trigger('timeupdate')
     await flushPromises()
     expect(store.preparedNext.value?.track).toBe(tracks[1])

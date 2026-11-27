@@ -555,4 +555,113 @@ describe('stalled media recovery with registered audio providers', () => {
     expect(lx.resolve).toHaveBeenCalledTimes(1)
     expect(gd.resolve).not.toHaveBeenCalled()
   })
+
+  it('triggers preload at 50% progress and times out a hung standby stream until a working provider loads', async () => {
+    const multiTracks = ['a', 'b'].map((id) => ({
+      id, title: id, aliases: {}, games: ['genshin'], relationIds: [], tabs: ['focus'], workGroupId: 'wg',
+      vocalStatus: 'instrumental', needsClassification: false,
+      sources: [
+        { provider: 'lx', externalId: `wy:${id}:320k` },
+        { provider: 'gd-studio', externalId: `netease:${id}:320` },
+        { provider: 'vkeys', externalId: id },
+      ],
+    }) as unknown as Track)
+    const lx: AudioProvider = { id: 'lx', canResolve: () => true, resolve: vi.fn(async (current) => audio(`lx-${current.id}`)) }
+    const gd: AudioProvider = { id: 'gd-studio', canResolve: () => true, resolve: vi.fn(async (current) => audio(`gd-${current.id}`)) }
+    const vkeys: AudioProvider = { id: 'vkeys', canResolve: () => true, resolve: vi.fn(async (current) => audio(`vkeys-${current.id}`)) }
+    const registry = new ProviderRegistry([
+      { provider: lx, enabled: true, priority: 1, timeoutMs: 30_000 },
+      { provider: gd, enabled: true, priority: 2, timeoutMs: 30_000 },
+      { provider: vkeys, enabled: true, priority: 3, timeoutMs: 30_000 },
+    ])
+    store = createPlaybackStore({ registry, storage })
+    store.reconcileUpcomingQueue(multiTracks)
+    wrapper = mount(PlayerBar, { props: { store } })
+    await store.playQueueIndex(0); await flush()
+    store.setPreloadPolicy('auto')
+    reportPosition(119); await flush()
+    expect(store.preparedNext.value).toBeNull()
+    expect(wrapper.find('audio[data-audio-role="standby"]').exists()).toBe(false)
+
+    // Reaching 50% (120s of 240s) arms preload with Provider 1 (lx)
+    reportPosition(120); await flush()
+    expect(store.preparedNext.value?.providerId).toBe('lx')
+    const standby1 = wrapper.get<HTMLAudioElement>('audio[data-audio-role="standby"]').element
+    Object.defineProperty(standby1, 'readyState', { configurable: true, value: HTMLMediaElement.HAVE_NOTHING })
+    Object.defineProperty(standby1, 'buffered', { configurable: true, value: { length: 0, start: () => 0, end: () => 0 } })
+    standby1.dispatchEvent(new Event('loadstart')); await flush()
+
+    // Provider 1 hangs for 12s without error -> watchdog rejects it and moves to Provider 2 (gd-studio)
+    await vi.advanceTimersByTimeAsync(12_000); await flush()
+    expect(store.preparedNext.value?.providerId).toBe('gd-studio')
+
+    // Provider 2 emits a media error -> falls through immediately to Provider 3 (vkeys)
+    const standby2 = wrapper.get<HTMLAudioElement>('audio[data-audio-role="standby"]').element
+    mediaError(standby2, 2); await flush()
+    expect(store.preparedNext.value?.providerId).toBe('vkeys')
+
+    // Provider 3 reaches loadedmetadata -> watchdog clears and stays ready until ended
+    const standby3 = wrapper.get<HTMLAudioElement>('audio[data-audio-role="standby"]').element
+    Object.defineProperty(standby3, 'readyState', { configurable: true, value: HTMLMediaElement.HAVE_METADATA })
+    Object.defineProperty(standby3, 'error', { configurable: true, value: null })
+    standby3.dispatchEvent(new Event('loadedmetadata')); await flush()
+    await vi.advanceTimersByTimeAsync(20_000); await flush()
+    expect(store.preparedNext.value?.providerId).toBe('vkeys')
+
+    // Track a ends -> standby3 (vkeys) is promoted
+    const first = active()
+    first.currentTime = 240
+    Object.defineProperty(first, 'ended', { configurable: true, value: true })
+    first.dispatchEvent(new Event('pause'))
+    first.dispatchEvent(new Event('ended')); await flush()
+    expect(store.currentTrack.value?.id).toBe('b')
+    expect(store.activeProviderId.value).toBe('vkeys')
+    expect(active()).toBe(standby3)
+    expect(lx.resolve).toHaveBeenCalledTimes(2)
+    expect(gd.resolve).toHaveBeenCalledTimes(1)
+    expect(vkeys.resolve).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps an in-flight standby fallback alive across end-of-track pause and promotes it on ended', async () => {
+    const gdDeferred = deferred<Playable | null>()
+    const { lx, gd } = await setup(
+      async (current) => audio(`lx-${current.id}`),
+      async () => gdDeferred.promise,
+    )
+    store.setPreloadPolicy('auto')
+    reportPosition(120); await flush()
+    expect(store.preparedNext.value?.providerId).toBe('lx')
+    const standby1 = wrapper.get<HTMLAudioElement>('audio[data-audio-role="standby"]').element
+    mediaError(standby1, 2); await flush()
+    expect(gd.resolve).toHaveBeenCalledTimes(1)
+
+    // Chromium fires paused (with ended = true) immediately before ended while gd fallback is in flight
+    const first = active()
+    first.currentTime = 240
+    Object.defineProperty(first, 'ended', { configurable: true, value: true })
+    first.dispatchEvent(new Event('pause'))
+    first.dispatchEvent(new Event('ended')); await flush()
+
+    gdDeferred.resolve(audio('gd-b')); await flush()
+    expect(store.currentTrack.value?.id).toBe('b')
+    expect(store.activeProviderId.value).toBe('gd-studio')
+    expect(store.playable.value).toEqual(audio('gd-b'))
+    expect(lx.resolve).toHaveBeenCalledTimes(2)
+    expect(gd.resolve).toHaveBeenCalledTimes(1)
+  })
+
+  it('immediately arms next-track preload when seeking past 50% without waiting for timeupdate', async () => {
+    const { lx } = await setup(async (current) => audio(`lx-${current.id}`))
+    store.setPreloadPolicy('auto')
+    reportPosition(20); await flush()
+    expect(store.preparedNext.value).toBeNull()
+
+    const slider = wrapper.get<HTMLInputElement>('input[data-player-seek]')
+    slider.element.value = '130'
+    await slider.trigger('input'); await flush()
+
+    expect(store.preparedNext.value?.track.id).toBe('b')
+    expect(store.preparedNext.value?.providerId).toBe('lx')
+    expect(lx.resolve).toHaveBeenCalledTimes(2)
+  })
 })

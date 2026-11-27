@@ -17,9 +17,9 @@ const pauseCalls = (element: HTMLAudioElement) => vi.mocked(HTMLMediaElement.pro
 function mediaAt(element: HTMLAudioElement, time: number, paused = false) {
   Object.defineProperties(element, {
     paused: {configurable: true, value: paused},
-    duration: {configurable: true, value: 460},
+    duration: {configurable: true, value: 800},
     readyState: {configurable: true, value: HTMLMediaElement.HAVE_FUTURE_DATA},
-    seekable: {configurable: true, value: {length: 1, start:()=>0, end:()=>460}},
+    seekable: {configurable: true, value: {length: 1, start:()=>0, end:()=>800}},
   })
   element.currentTime=time
   element.dispatchEvent(new Event('loadedmetadata'))

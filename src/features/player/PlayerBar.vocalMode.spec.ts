@@ -458,7 +458,11 @@ describe.each(['off', 'crossfade', 'smart'] as const)('Vocal PlayerBar with %s t
     expect(t.store.playbackGeneration.value).toBe(returnedGeneration)
     expect(t.active()).toBe(incoming)
     expect(t.store.status.value).toBe('playing')
-    // Readiness may prepare song-b; the adopted song-a is resolved exactly once.
+    // At 0.5 s / 30 s (< 50%), song-b is not preloaded yet; the adopted song-a is resolved once.
+    expect(t.lx.mock.calls.map(([track]) => track.id)).toEqual(['song-c', 'bgm', 'song-a'])
+    incoming.currentTime = 15
+    incoming.dispatchEvent(new Event('timeupdate'))
+    await flush()
     expect(t.lx.mock.calls.map(([track]) => track.id)).toEqual(['song-c', 'bgm', 'song-a', 'song-b'])
     expect(count(t.wrapper)).toBe('2')
   })

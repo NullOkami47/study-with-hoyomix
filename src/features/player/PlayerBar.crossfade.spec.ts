@@ -61,7 +61,7 @@ async function setup(buffered = 30) {
   await flush()
   const first = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]').element
   media(first)
-  first.currentTime = 10
+  first.currentTime = 15
   first.dispatchEvent(new Event('timeupdate'))
   await flush()
   const standby = wrapper.get<HTMLAudioElement>('[data-audio-role="standby"]').element

@@ -61,7 +61,7 @@ async function setup(mode: 'crossfade' | 'smart') {
   await flush()
   const active = wrapper.get<HTMLAudioElement>('[data-audio-role="active"]').element
   ready(active)
-  active.currentTime = 10
+  active.currentTime = 15
   active.dispatchEvent(new Event('timeupdate'))
   await flush()
   const standby = wrapper.get<HTMLAudioElement>('[data-audio-role="standby"]').element

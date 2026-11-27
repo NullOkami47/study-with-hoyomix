@@ -10,7 +10,7 @@ import type { Track } from '../catalog/types'
 import { resolveDisplayTitle } from '../catalog/displayTitle'
 import { usePreferences } from '../../stores/preferences'
 import { registerPlayerCommands, type PlaybackPauseLease, type PlayerCommands } from './commands'
-import { NEXT_TRACK_PRELOAD_LEAD_SECONDS, selectPreloadPolicy } from './preloadPolicy'
+import { isNextTrackPreloadDue, selectPreloadPolicy } from './preloadPolicy'
 import { inspectBuffer, waitForBuffer } from './bufferReadiness'
 import { boundedOverlapDuration, fadeGains, supportsNativeVolumeControl, transitionDuration } from './transitionEngine'
 import { planSmartMix, startPassiveEnergySampling, type EnergySample } from './smartMix'
@@ -88,9 +88,11 @@ const recoveryRetainedIndex = ref<number>()
 const prerollDeckIndex = ref<number>()
 const prerollRewindIndex = ref<number>()
 const PREROLL_LEAD_SECONDS = 1.2
+const STANDBY_LOAD_TIMEOUT_MS = 12_000
 let preroll: { index: number; element: HTMLAudioElement; preparationId: number; generation: number } | undefined
 let rejectedPrerollId: number | undefined
 let prerollTimer: ReturnType<typeof setTimeout> | undefined
+let standbyLoadWatchdog: { preparationId: number; src: string; timer: ReturnType<typeof setTimeout> } | undefined
 let backgroundHandoff: { index: number; element: HTMLAudioElement; preparationId: number; generation: number; trackId: string; reusePrepared: boolean } | undefined
 let backgroundStartedGeneration: number | undefined
 const expectedPrerollPauses = new WeakMap<HTMLAudioElement, { generation: number; src: string }>()
@@ -1483,11 +1485,53 @@ function onTransitionVisibility(): void {
   stopSampling()
 }
 
+function clearStandbyLoadWatchdog(): void {
+  if (standbyLoadWatchdog) {
+    clearTimeout(standbyLoadWatchdog.timer)
+    standbyLoadWatchdog = undefined
+  }
+}
+
+function armStandbyLoadWatchdog(index: number, element: HTMLAudioElement): void {
+  if (playerUnmounted || index === activeDeckIndex.value) return
+  const deck = audioDecks.value[index]
+  if (deck.preparationId === undefined || !deck.src || deck.preload !== 'auto' ||
+    element.error || element.readyState >= HTMLMediaElement.HAVE_METADATA || element.buffered.length > 0) return
+  const preparationId = deck.preparationId
+  const watchedSrc = deck.src
+  if (standbyLoadWatchdog?.preparationId === preparationId && standbyLoadWatchdog.src === watchedSrc) return
+  clearStandbyLoadWatchdog()
+  standbyLoadWatchdog = {
+    preparationId,
+    src: watchedSrc,
+    timer: setTimeout(() => {
+      if (standbyLoadWatchdog?.preparationId !== preparationId || standbyLoadWatchdog.src !== watchedSrc) return
+      standbyLoadWatchdog = undefined
+      if (playerUnmounted) return
+      const standbyIdx = standbyDeckIndex()
+      const currentDeck = audioDecks.value[standbyIdx]
+      const currentElement = deckElement(standbyIdx)
+      if (currentDeck.preparationId !== preparationId || currentDeck.src !== watchedSrc ||
+        props.store.preparedNext.value?.id !== preparationId || props.store.preloadPolicy.value !== 'auto' ||
+        props.store.playbackIntent.value !== 'playing' ||
+        ['paused', 'error', 'idle', 'ended'].includes(props.store.status.value)) return
+      if (currentElement && (currentElement.readyState >= HTMLMediaElement.HAVE_METADATA || currentElement.buffered.length > 0)) return
+      recordPlayback('preparation.media-timeout', { preparationId })
+      props.store.rejectNextPreparation(preparationId)
+    }, STANDBY_LOAD_TIMEOUT_MS),
+  }
+}
+
 function assignDeck(index: number, deck: AudioDeck, preserveElement = false): void {
   if (preroll?.index === index && (deck.preparationId !== preroll.preparationId || deck.src !== audioDecks.value[index].src)) cancelPreroll()
   if (prerollRewindIndex.value === index && (deck.src !== audioDecks.value[index].src || deck.generation !== audioDecks.value[index].generation)) prerollRewindIndex.value = undefined
   const outgoing = audioDecks.value[index]
-  if (!preserveElement && outgoing.src && (outgoing.src !== deck.src || outgoing.trackId !== deck.trackId)) {
+  if (outgoing.preparationId !== undefined && standbyLoadWatchdog?.preparationId === outgoing.preparationId &&
+    (deck.preparationId !== outgoing.preparationId || deck.src !== outgoing.src)) {
+    clearStandbyLoadWatchdog()
+  }
+  const replacingSource = !preserveElement && Boolean(outgoing.src) && (outgoing.src !== deck.src || outgoing.trackId !== deck.trackId)
+  if (replacingSource && !deck.src) {
     const element = deckElement(index)
     if (element) {
       pauseAudio(element, 'release-source')
@@ -1503,12 +1547,28 @@ function assignDeck(index: number, deck: AudioDeck, preserveElement = false): vo
   // would not restore the attribute removed above. Restore only when absent
   // or different; an eligible preloaded deck keeps its native source intact.
   const element = deckElement(index)
-  if (deck.src && element && element.getAttribute('src') !== deck.src) writeAudioSource(element, deck.src, 'assign-deck')
+  if (deck.src && element && (replacingSource || element.getAttribute('src') !== deck.src)) {
+    if (replacingSource) pauseAudio(element, 'assign-deck')
+    element.preload = deck.preload
+    writeAudioSource(element, deck.src, 'assign-deck')
+    if (replacingSource) loadAudio(element, 'assign-deck')
+  }
+  if (deck.src && deck.preparationId !== undefined && index !== activeDeckIndex.value && deck.preload === 'auto') {
+    if (element) armStandbyLoadWatchdog(index, element)
+    else void nextTick(() => {
+      const mounted = deckElement(index)
+      if (mounted && index !== activeDeckIndex.value) armStandbyLoadWatchdog(index, mounted)
+    })
+  }
 }
 
 function clearDeck(index: number): void {
   const element = deckElement(index)
   if (element) { networkErrorSources.delete(element); expectedPrerollPauses.delete(element) }
+  if (audioDecks.value[index].preparationId !== undefined &&
+    standbyLoadWatchdog?.preparationId === audioDecks.value[index].preparationId) {
+    clearStandbyLoadWatchdog()
+  }
   assignDeck(index, emptyDeck())
 }
 
@@ -1650,9 +1710,10 @@ function syncPreparedDeck(): void {
   // A preparation for the following song must not evict the autoplay fallback or the
   // still-buffered prepared element before the handover has established progress.
   if (audioDecks.value[standbyIndex].retained) return
-  // Only a lead-window arm or an explicit transition resolves the standby URL.
+  // Only a preload-window arm or an explicit transition resolves the standby URL.
   // Assign it while the preparation's transient ticket is still fresh.
   if (prepared?.armed && isPreparationFresh(prepared)) {
+    if (props.store.preloadPolicy.value !== 'auto') clearStandbyLoadWatchdog()
     assignDeck(standbyIndex, {
       generation: prepared.generation,
       mimeType: prepared.playable.mimeType,
@@ -1663,6 +1724,7 @@ function syncPreparedDeck(): void {
     })
     return
   }
+  clearStandbyLoadWatchdog()
   // A retained previous element belongs to the handover check, which releases it.
   if (audioDecks.value[standbyIndex].retained) return
   if (props.store.preloadPolicy.value === 'none') {
@@ -1770,6 +1832,7 @@ function syncActiveDeck(): void {
       deck.preparationId === handoff.id && deck.trackId === trackId && deck.src === playable.url)
     : -1
   if (promotedIndex >= 0) {
+    if (standbyLoadWatchdog?.preparationId === handoff?.id) clearStandbyLoadWatchdog()
     const previousActive = activeDeckIndex.value
     const warmed = preroll?.index === promotedIndex && preroll.preparationId === handoff?.id ? preroll : undefined
     preroll = undefined
@@ -1862,10 +1925,24 @@ function activeDeckEvent(index: number, event: Event): boolean {
     event.currentTarget === deckElement(index)
 }
 
+function onDeckLoadStart(index: number, event: Event): void {
+  if (activeDeckEvent(index, event)) return
+  if (event.currentTarget === deckElement(index) && event.currentTarget instanceof HTMLAudioElement) {
+    armStandbyLoadWatchdog(index, event.currentTarget)
+  }
+}
+
 function onDeckPresentation(index: number, event: Event): void {
   observePreparation(index)
   if (!activeDeckEvent(index, event)) {
-    if (event.currentTarget === deckElement(index) && ['canplay', 'progress', 'loadedmetadata'].includes(event.type)) maybePreroll()
+    if (event.currentTarget === deckElement(index) && event.currentTarget instanceof HTMLAudioElement &&
+      ['canplay', 'progress', 'loadedmetadata'].includes(event.type)) {
+      if ((event.currentTarget.readyState >= HTMLMediaElement.HAVE_METADATA || event.currentTarget.buffered.length > 0) &&
+        standbyLoadWatchdog?.preparationId === audioDecks.value[index].preparationId) {
+        clearStandbyLoadWatchdog()
+      }
+      maybePreroll()
+    }
     return
   }
   if (prerollRewindIndex.value === index && !completePrerollRewind(index, event.type === 'seeked')) return
@@ -1979,6 +2056,14 @@ function onDeckState(index: number, event: Event, state: PlaybackMediaState): vo
       return
     }
     if (state === 'playing' && event.currentTarget instanceof HTMLAudioElement) pauseAudio(event.currentTarget, 'inactive-playing')
+    if (event.currentTarget === deckElement(index) && event.currentTarget instanceof HTMLAudioElement &&
+      audioDecks.value[index].preparationId !== undefined) {
+      if (state === 'ready' && standbyLoadWatchdog?.preparationId === audioDecks.value[index].preparationId) {
+        clearStandbyLoadWatchdog()
+      } else if (state === 'buffering') {
+        armStandbyLoadWatchdog(index, event.currentTarget)
+      }
+    }
     return
   }
   if (state === 'playing' && props.store.playbackIntent.value !== 'playing') {
@@ -2039,6 +2124,7 @@ function onDeckError(index: number, event: Event): void {
   }
   if (!activeDeckEvent(index, event)) {
     if (mediaError && preparationId !== undefined && event.currentTarget === deckElement(index)) {
+      if (standbyLoadWatchdog?.preparationId === preparationId) clearStandbyLoadWatchdog()
       props.store.rejectNextPreparation(preparationId)
       recordPlayback('preparation.media-failed', { preparationId })
     }
@@ -2220,7 +2306,7 @@ function updateMediaPresentation(element: HTMLAudioElement, allowTransition = tr
 }
 
 /**
- * Ask the store to prepare the next track once the active track is inside the preload lead window.
+ * Ask the store to prepare the next track once the active track has played half of its duration.
  *
  * Driven from media progress rather than from the track change, because the resolved media URL
  * carries a ticket with a 120 second lifetime: resolving at the start of a multi-minute track would
@@ -2229,8 +2315,7 @@ function updateMediaPresentation(element: HTMLAudioElement, allowTransition = tr
  */
 function armNextTrackIfDue(): void {
   if (manualPreparation !== undefined || overlap.value) return
-  if (duration.value <= 0) return
-  if (duration.value - currentTime.value > NEXT_TRACK_PRELOAD_LEAD_SECONDS) return
+  if (!isNextTrackPreloadDue(currentTime.value, duration.value)) return
   void props.store.armNextPreparation()
 }
 
@@ -2281,6 +2366,7 @@ const mediaPresentationHandlers = computed(() => {
       retireMediaRecovery()
       props.store.reportProgress?.(nearest, generation, true)
       updateMediaPresentation(element, false)
+      armNextTrackIfDue()
     } catch {
       // A source may lose seekability between metadata and this user command.
       // Do not fabricate elapsed time or treat an unavailable seek as provider failure.
@@ -2637,6 +2723,7 @@ onBeforeUnmount(() => {
   uninstallAutoResumeListeners()
   cancelAutoResume('unmount')
   clearPlaybackStall()
+  clearStandbyLoadWatchdog()
   clearHandoverWatchdog()
   handover = undefined
   if (resumeSeekTimer !== undefined) clearTimeout(resumeSeekTimer)
@@ -2770,6 +2857,7 @@ onBeforeUnmount(() => {
           v-audio-source="deck.src || undefined"
           :type="deck.mimeType"
           @loadedmetadata="onDeckPresentation(deckIndex, $event)"
+          @loadstart="onDeckLoadStart(deckIndex, $event)"
           @durationchange="onDeckPresentation(deckIndex, $event)"
           @timeupdate="onDeckPresentation(deckIndex, $event)"
           @progress="onDeckPresentation(deckIndex, $event)"

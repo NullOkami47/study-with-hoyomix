@@ -545,12 +545,22 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
    * The (track, generation) the armed preparation was last attempted for.
    *
    * Media progress fires several times a second, so without this a preparation that keeps failing
-   * would be retried on every tick for the whole lead window. One attempt per track per playback
-   * generation starts the resolver chain. A later media-load failure can advance to a remaining
-   * provider once; progress never restarts a failed provider. Keying on the generation means a track change
-   * or a manual provider switch naturally re-arms.
+   * would be retried on every tick for the whole preload window. One attempt per track per playback
+   * generation starts the resolver chain. A later media-load failure or interruption resumes from
+   * the remaining untried providers until one loads or all eligible providers are exhausted;
+   * progress never restarts an already-failed provider. Keying on the generation means a track
+   * change or a manual provider switch naturally re-arms.
    */
-  let armedAttempt: { trackId: string; generation: number; mediaFailedProviders: Set<string> } | undefined
+  interface ArmedPreparationState {
+    trackId: string
+    generation: number
+    failedProviders: Set<string>
+    /** True once every eligible provider (or strict manual override) has failed, or the result is non-audio. */
+    exhausted: boolean
+    /** True when standby media failed/timed out or fallback was interrupted while untried providers remain. */
+    awaitingFallback: boolean
+  }
+  let armedAttempt: ArmedPreparationState | undefined
 
   const currentTrack = (): Track | undefined => queue.value[currentIndex.value]
   const currentTrackRef = computed(currentTrack)
@@ -620,15 +630,23 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
     const attempt = armedAttempt
     if (!preparation.armed || !attempt || attempt.trackId !== preparation.track.id ||
       attempt.generation !== playbackGeneration.value || preparation.generation !== playbackGeneration.value ||
-      nextPreparationTrack() !== preparation.track || sourceOverride.value !== undefined ||
-      playbackIntent.value !== 'playing' || status.value === 'paused' || preloadPolicy.value !== 'auto' || disposed) return
-    // A successful resolve is not a playable source until its media loads. Try each remaining
-    // automatic provider once, without retrying failed providers on every progress event.
-    attempt.mediaFailedProviders.add(preparation.providerId)
+      disposed) return
+    // A successful resolve is not a playable source until its media loads. Record failed
+    // providers unconditionally so a pause/seek never forgets them, then try remaining automatic
+    // providers until one loads or all are exhausted.
+    attempt.failedProviders.add(preparation.providerId)
     for (const previous of preparation.attempts ?? []) {
-      if (!previous.ok && previous.sourceId === undefined) attempt.mediaFailedProviders.add(previous.providerId)
+      if (!previous.ok && previous.sourceId === undefined) attempt.failedProviders.add(previous.providerId)
     }
-    const promise = prepareNextTrack(preparation.track, [...attempt.mediaFailedProviders], true)
+    if (sourceOverride.value !== undefined) {
+      attempt.exhausted = true
+      attempt.awaitingFallback = false
+      return
+    }
+    attempt.awaitingFallback = true
+    if (nextPreparationTrack() !== preparation.track || playbackIntent.value !== 'playing' ||
+      ['paused', 'error', 'idle', 'ended'].includes(status.value) || preloadPolicy.value !== 'auto') return
+    const promise = prepareNextTrack(preparation.track, [...attempt.failedProviders], true)
     const pending = { track: preparation.track, promise }
     pendingPreparation = pending
     void promise.finally(() => { if (pendingPreparation === pending) pendingPreparation = undefined })
@@ -758,35 +776,65 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
     }
   }
 
-  /** Resolve only inside the lead window or an explicit transition, using the eligible chain. */
+  /** Resolve only inside the preload window or an explicit transition, using the eligible chain. */
   async function prepareNextTrack(
     track: Track, failedMediaProviders: readonly string[] = [], requirePlaying = false,
   ): Promise<void> {
     const identity = ++preloadRequest
     const generation = playbackGeneration.value
     const startedAt = Date.now()
+    let currentProviderStartedAt = startedAt
     const controller = new AbortController()
     preloadController = controller
     if (requirePlaying) preloadMediaFallbackController = controller
     preparedNext.value = null
     preparationSelections.clear()
     const selectionRevision = queueSelectionRevision
-    const stillRelevant = () => !requirePlaying || (!disposed && selectionRevision === queueSelectionRevision && playbackIntent.value === 'playing' && status.value !== 'paused' &&
+    const advancingToTrack = () =>
+      pendingQueueSelection?.track === track &&
+      pendingQueueSelection.generation === generation &&
+      playbackIntent.value === 'playing'
+    const stillRelevant = () => !requirePlaying || (!disposed &&
+      (selectionRevision === queueSelectionRevision || advancingToTrack()) &&
+      playbackIntent.value === 'playing' && status.value !== 'paused' &&
       generation === playbackGeneration.value && nextPreparationTrack() === track &&
       preloadPolicy.value === 'auto' && sourceOverride.value === undefined)
+    const currentAttemptState = () =>
+      armedAttempt?.trackId === track.id && armedAttempt.generation === generation ? armedAttempt : undefined
+    const recordFailedSummaries = (items: readonly ProviderAttempt[]) => {
+      const state = currentAttemptState()
+      if (!state) return
+      for (const item of items) {
+        if (!item.ok && item.sourceId === undefined) state.failedProviders.add(item.providerId)
+      }
+    }
     const observedAttempts: ProviderAttempt[] = []
     const observe = (attempt: ProviderAttempt) => {
       observedAttempts.push(attempt)
       recordAttempt('preparation.attempt', attempt, { trackId: track.id, speculative: false })
+      if (!attempt.ok && attempt.sourceId === undefined) {
+        currentProviderStartedAt = Date.now()
+      }
     }
     try {
       const registry = options.loadRegistry ? registryLoaded(await options.loadRegistry()) : staticRegistry
-      if (controller.signal.aborted || identity !== preloadRequest || !stillRelevant()) return
+      if (controller.signal.aborted || identity !== preloadRequest || !stillRelevant()) {
+        const state = currentAttemptState()
+        if (requirePlaying && state && !state.exhausted) state.awaitingFallback = true
+        return
+      }
 
       const selection = preparationSelectionFor(track, registry)
       const candidates = selection.providerIds.filter(id => !failedMediaProviders.includes(id))
       const targetProvider = candidates[0]
-      if (!targetProvider) return
+      if (!targetProvider) {
+        const state = currentAttemptState()
+        if (state) {
+          state.exhausted = true
+          state.awaitingFallback = false
+        }
+        return
+      }
 
       const activeIds = registry.enabled().map(({ provider }) => provider.id)
       const strictProvider = selection.sourceOverride
@@ -803,7 +851,13 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
         excludeProviderIds,
         onAttempt: observe,
       })
-      if (controller.signal.aborted || identity !== preloadRequest || !stillRelevant() || !registryIsCurrent(registry, track)) return
+      recordFailedSummaries(observedAttempts)
+      if (controller.signal.aborted || identity !== preloadRequest || !stillRelevant() || !registryIsCurrent(registry, track)) {
+        const state = currentAttemptState()
+        if (requirePlaying && state && !state.exhausted) state.awaitingFallback = true
+        return
+      }
+      recordFailedSummaries(result.attempts)
       if (observedAttempts.length === 0) {
         for (const attempt of result.attempts) recordAttempt('preparation.attempt', attempt, { trackId: track.id, speculative: false })
       }
@@ -820,17 +874,43 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
         const matches = strictProvider ? result.providerId === strictProvider : providerIndex >= 0 &&
           (providerIndex === 0 || (summaries.length === providerIndex + 1 && summaries.every((attempt, i) =>
             attempt.providerId === candidates[i] && attempt.ok === (i === providerIndex))))
-        if (!matches) return
+        if (!matches) {
+          const state = currentAttemptState()
+          if (state) {
+            state.exhausted = true
+            state.awaitingFallback = false
+          }
+          return
+        }
+        const state = currentAttemptState()
+        if (state) state.awaitingFallback = false
         preparationSelections.set(identity, { selection })
         preparedNext.value = {
           id: identity, track, providerId: result.providerId, playable: result.playable, generation,
-          // Start time is conservative even if registry/provider resolution was slow.
-          preparedAt: startedAt, selectionKey: key, armed: true,
+          // Track when the winning provider began resolving so earlier failed providers do not
+          // prematurely age out the fresh ticket.
+          preparedAt: currentProviderStartedAt, selectionKey: key, armed: true,
           attempts: observedAttempts.length ? [...observedAttempts] : [...result.attempts],
+        }
+      } else {
+        const state = currentAttemptState()
+        if (state) {
+          state.exhausted = true
+          state.awaitingFallback = false
         }
       }
     } catch {
+      recordFailedSummaries(observedAttempts)
       recordPlayback('preparation.failed', { trackId: track.id, cancelled: controller.signal.aborted })
+      const state = currentAttemptState()
+      if (!controller.signal.aborted && identity === preloadRequest && stillRelevant()) {
+        if (state) {
+          state.exhausted = true
+          state.awaitingFallback = false
+        }
+      } else if (requirePlaying && state && !state.exhausted) {
+        state.awaitingFallback = true
+      }
     } finally {
       if (preloadController === controller) preloadController = undefined
       if (preloadMediaFallbackController === controller) preloadMediaFallbackController = undefined
@@ -850,13 +930,18 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
     const stillCurrent = () => !disposed && generation === playbackGeneration.value &&
       queue.value[index] === track && !filteredHistoryIds.value.has(track.id) &&
       preloadPolicy.value === 'auto' && request === preloadRequest
+    let expiredExisting = false
     const reuse = async (preparation: TrackPreparation): Promise<boolean> => {
+      const ageMs = Date.now() - preparationResolvedAt(preparation)
       const valid = hasHandoverTicketMargin(preparationResolvedAt(preparation), Date.now(), preparation.playable.expiresAt) &&
         await preparationCanBeReused(preparation, track)
       if (!stillCurrent()) return false
       if (valid && preparedNext.value?.id === preparation.id) {
         if (!preparedNext.value.armed) preparedNext.value = { ...preparation, armed: true }
         return true
+      }
+      if (ageMs >= 1_000 && preparation.track === track && preparation.generation === generation) {
+        expiredExisting = true
       }
       if (preparedNext.value?.id === preparation.id) {
         preparationSelections.delete(preparation.id)
@@ -876,9 +961,30 @@ export function createPlaybackStore(options: PlaybackStoreOptions = {}): Playbac
       if (existing && await reuse(existing)) return
       if (!stillCurrent()) return
     }
-    if (armedAttempt?.trackId === track.id && armedAttempt.generation === generation) return
+    if (armedAttempt?.trackId === track.id && armedAttempt.generation === generation) {
+      if (expiredExisting && !armedAttempt.exhausted) {
+        armedAttempt.awaitingFallback = true
+      }
+      if (armedAttempt.exhausted || !armedAttempt.awaitingFallback) return
+      if (playbackIntent.value !== 'playing' ||
+        ['paused', 'error', 'idle', 'ended'].includes(status.value) ||
+        sourceOverride.value !== undefined) return
+      preloadController?.abort()
+      const failed = [...armedAttempt.failedProviders]
+      const promise = prepareNextTrack(track, failed, failed.length > 0)
+      const pending = { track, promise }
+      pendingPreparation = pending
+      try { await promise } finally { if (pendingPreparation === pending) pendingPreparation = undefined }
+      return
+    }
     preloadController?.abort()
-    armedAttempt = { trackId: track.id, generation, mediaFailedProviders: new Set() }
+    armedAttempt = {
+      trackId: track.id,
+      generation,
+      failedProviders: new Set(),
+      exhausted: false,
+      awaitingFallback: false,
+    }
     const promise = prepareNextTrack(track)
     const pending = { track, promise }
     pendingPreparation = pending

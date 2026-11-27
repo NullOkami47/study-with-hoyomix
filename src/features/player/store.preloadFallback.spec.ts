@@ -4,7 +4,12 @@ import type { Track } from '../catalog/types'
 import { ProviderRegistry, type ProviderRegistration } from './providers/registry'
 import { ProviderResolveError, type AudioProvider, type Playable, type ProviderResolveContext } from './providers/types'
 import { resolveTrack } from './resolver'
-import { createPlaybackStore, type PlaybackStore } from './store'
+import {
+  createPlaybackStore,
+  HANDOVER_TICKET_MARGIN_MS,
+  MEDIA_TICKET_TTL_MS,
+  type PlaybackStore,
+} from './store'
 
 const stores: PlaybackStore[] = []
 const tracks = ['a', 'b', 'c'].map((id): Track => ({
@@ -479,6 +484,173 @@ describe('armed preparation follows the automatic resolver fallback chain', () =
     await Promise.all([firstNext, previous, finalNext])
     expect(store.currentTrack.value).toBe(tracks[2])
     expect(store.currentIndex.value).toBe(2)
+  })
+
+  it('keeps falling back across 4 providers (resolve + standby media failures) until 1 succeeds, then stops cleanly when exhausted', async () => {
+    const multiTracks: Track[] = ['a', 'b'].map((id) => ({
+      id, title: id, aliases: {}, games: [], relationIds: [], tabs: [], workGroupId: 'test',
+      needsClassification: false, vocalStatus: 'instrumental',
+      sources: [
+        { provider: 'lx', externalId: `wy:${id}` },
+        { provider: 'chksz', externalId: `netease-${id}` },
+        { provider: 'vkeys', externalId: id },
+      ],
+    }))
+    const lxResolve = vi.fn(async (track: Track): Promise<Playable | null> =>
+      track.id === 'a' ? audio('lx', track, 1) : null)
+    const gdResolve = vi.fn(async (track: Track): Promise<Playable | null> =>
+      audio('gd-studio', track, gdResolve.mock.calls.length))
+    const vkeysResolve = vi.fn(async (track: Track): Promise<Playable | null> =>
+      audio('vkeys', track, vkeysResolve.mock.calls.length))
+    const chkszResolve = vi.fn(async (track: Track): Promise<Playable | null> =>
+      audio('chksz', track, chkszResolve.mock.calls.length))
+    const registry = new ProviderRegistry([
+      { provider: { id: 'lx', canResolve: () => true, resolve: lxResolve }, enabled: true, priority: 1, timeoutMs: 1000 },
+      { provider: { id: 'gd-studio', canResolve: () => true, resolve: gdResolve }, enabled: true, priority: 2, timeoutMs: 1000 },
+      { provider: { id: 'vkeys', canResolve: () => true, resolve: vkeysResolve }, enabled: true, priority: 3, timeoutMs: 1000 },
+      { provider: { id: 'chksz', canResolve: () => true, resolve: chkszResolve }, enabled: true, priority: 4, timeoutMs: 1000 },
+    ])
+    const store = createPlaybackStore({
+      registry, resolve: resolveTrack,
+      storage: { getItem: (key) => key === 'hoyomix-player-shuffle-v1' ? 'false' : null, setItem: () => {} },
+    })
+    stores.push(store)
+    store.reconcileUpcomingQueue(multiTracks)
+    await store.playQueueIndex(0)
+    store.setPreloadPolicy('auto')
+    await store.armNextPreparation()
+    // Provider 1 (lx) failed resolve -> Provider 2 (gd-studio) prepared
+    expect(store.preparedNext.value?.providerId).toBe('gd-studio')
+    // Provider 2 fails standby media -> Provider 3 (vkeys) prepared
+    store.rejectNextPreparation(store.preparedNext.value!.id)
+    await flushPromises()
+    expect(store.preparedNext.value?.providerId).toBe('vkeys')
+    // Provider 3 fails standby media -> Provider 4 (chksz) prepared
+    store.rejectNextPreparation(store.preparedNext.value!.id)
+    await flushPromises()
+    expect(store.preparedNext.value?.providerId).toBe('chksz')
+    const prepared = store.preparedNext.value!
+    await store.next()
+    expect(store.preloadHandoff.value?.id).toBe(prepared.id)
+    expect(store.activeProviderId.value).toBe('chksz')
+    expect(callsFor(lxResolve, 'b')).toBe(1)
+    expect(callsFor(gdResolve, 'b')).toBe(1)
+    expect(callsFor(vkeysResolve, 'b')).toBe(1)
+    expect(callsFor(chkszResolve, 'b')).toBe(1)
+  })
+
+  it('resumes fallback from untried providers after seek or pause/resume interrupts standby fallback', async () => {
+    const { store, gdResolve, lxResolve, loadRegistry, registry } = await setup({ gdNextSucceeds: true })
+    const thirdResolve = vi.fn(async (track: Track) => audio('vkeys', track, 1))
+    loadRegistry.mockResolvedValue(new ProviderRegistry([
+      ...registry().enabled(),
+      { provider: { id: 'vkeys', canResolve: () => true, resolve: thirdResolve }, enabled: true, priority: 15, timeoutMs: 1000 },
+    ]))
+    await store.play()
+    await store.armNextPreparation()
+    expect(store.preparedNext.value?.providerId).toBe('gd-studio')
+    // Standby media fails while paused -> queued for fallback instead of permanently locked
+    store.pause()
+    store.rejectNextPreparation(store.preparedNext.value!.id)
+    await flushPromises()
+    expect(lxResolve).not.toHaveBeenCalled()
+    expect(store.preparedNext.value).toBeNull()
+    // Resuming playback and firing progress resumes from lx without retrying gd-studio
+    await store.play()
+    store.reportMediaState('playing', store.playbackGeneration.value)
+    await store.armNextPreparation()
+    expect(store.preparedNext.value?.providerId).toBe('lx')
+    expect(callsFor(gdResolve, 'b')).toBe(1)
+    expect(callsFor(lxResolve, 'b')).toBe(1)
+    // Now seek interrupts an in-flight vkeys fallback after lx standby media fails
+    let finishVkeys!: (value: Playable) => void
+    thirdResolve.mockImplementationOnce(() => new Promise<Playable>((resolve) => { finishVkeys = resolve }))
+    store.rejectNextPreparation(store.preparedNext.value!.id)
+    await flushPromises()
+    store.reportProgress(80, store.playbackGeneration.value, true)
+    finishVkeys(audio('vkeys', tracks[1]!, 99))
+    await flushPromises()
+    expect(store.preparedNext.value).toBeNull()
+    // Subsequent progress resumes vkeys without retrying gd-studio or lx
+    thirdResolve.mockImplementationOnce(async (track: Track) => audio('vkeys', track, 2))
+    await store.armNextPreparation()
+    expect(store.preparedNext.value?.providerId).toBe('vkeys')
+    expect(store.preparedNext.value?.playable.url).toContain('call=2')
+    expect(callsFor(gdResolve, 'b')).toBe(1)
+    expect(callsFor(lxResolve, 'b')).toBe(1)
+    expect(callsFor(thirdResolve, 'b')).toBe(2)
+  })
+
+  it('does not let a slow failing first provider age out the fallback provider ticket', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-06T00:00:00Z'))
+    const { store, gdResolve, lxResolve } = await setup()
+    let failGd!: (reason: Error) => void
+    gdResolve.mockImplementationOnce(() => new Promise((_resolve, reject) => { failGd = reject }))
+    const arming = store.armNextPreparation()
+    await flushPromises()
+    // First provider takes 55 s before failing
+    vi.setSystemTime(Date.now() + 55_000)
+    failGd(new ProviderResolveError('timeout'))
+    await arming
+    const prepared = store.preparedNext.value
+    expect(prepared?.providerId).toBe('lx')
+    // 60 s after fallback resolved (115 s since chain started, but only 60 s since lx began),
+    // lx's fresh 120 s ticket still has 60 s (> 30 s margin) left and is promoted without re-resolving.
+    vi.setSystemTime(Date.now() + 60_000)
+    await store.next()
+    expect(store.preloadHandoff.value?.id).toBe(prepared?.id)
+    expect(callsFor(gdResolve, 'b')).toBe(1)
+    expect(callsFor(lxResolve, 'b')).toBe(1)
+  })
+
+  it('re-prepares a stale >90s preparation on progress without retrying earlier failed providers', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-26T00:00:00Z'))
+    const { store, gdResolve, lxResolve } = await setup({ gdNextSucceeds: false })
+    await store.playQueueIndex(0)
+    store.reportMediaState('playing', store.playbackGeneration.value)
+    await store.armNextPreparation()
+    const firstPrepared = store.preparedNext.value!
+    expect(firstPrepared.providerId).toBe('lx')
+
+    // Exceed the 90 s handover ticket margin while a >3 min track continues playing past 50%.
+    vi.setSystemTime(Date.now() + (MEDIA_TICKET_TTL_MS - HANDOVER_TICKET_MARGIN_MS) + 1)
+    await store.armNextPreparation()
+    const refreshed = store.preparedNext.value!
+    expect(refreshed.providerId).toBe('lx')
+    expect(refreshed.id).not.toBe(firstPrepared.id)
+    // Failed gd-studio stays excluded, while lx is refreshed once.
+    expect(callsFor(gdResolve, 'b')).toBe(1)
+    expect(callsFor(lxResolve, 'b')).toBe(2)
+
+    await store.next()
+    expect(store.preloadHandoff.value?.id).toBe(refreshed.id)
+    expect(callsFor(lxResolve, 'b')).toBe(2)
+  })
+
+  it('awaits and promotes an in-flight media fallback when advancing to that track', async () => {
+    const { store, gdResolve, lxResolve } = await setup({ gdNextSucceeds: true })
+    await store.playQueueIndex(0)
+    store.reportMediaState('playing', store.playbackGeneration.value)
+    await store.armNextPreparation()
+    expect(store.preparedNext.value?.providerId).toBe('gd-studio')
+
+    let finishLx!: (value: Playable) => void
+    lxResolve.mockImplementationOnce(() => new Promise<Playable>((resolve) => { finishLx = resolve }))
+    store.rejectNextPreparation(store.preparedNext.value!.id)
+    await flushPromises()
+    expect(callsFor(lxResolve, 'b')).toBe(1)
+
+    const nextCall = store.next()
+    await flushPromises()
+    finishLx(audio('lx', tracks[1]!, 1))
+    await nextCall
+    expect(store.currentTrack.value).toBe(tracks[1])
+    expect(store.preloadHandoff.value?.providerId).toBe('lx')
+    expect(store.activeProviderId.value).toBe('lx')
+    expect(callsFor(gdResolve, 'b')).toBe(1)
+    expect(callsFor(lxResolve, 'b')).toBe(1)
   })
 
 })
